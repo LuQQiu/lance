@@ -16,7 +16,7 @@ use arrow::ffi::FFI_ArrowSchema;
 use arrow::ffi_stream::FFI_ArrowArrayStream;
 use arrow_schema::Schema;
 use jni::{
-    objects::JObject,
+    objects::{JString, JObject},
     sys::{jint, jlong},
     JNIEnv,
 };
@@ -93,6 +93,21 @@ pub extern "system" fn Java_com_lancedb_lance_Fragment_countRowsNative(
             -1
         }
     }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Fragment_createNative(
+    mut _env: JNIEnv,
+    _obj: JObject,
+    _dataset_uri: JString,
+    _arrow_stream_memory_address: jlong,
+    _fragement_id: JObject,
+    _max_rows_per_file: JObject, // Optional<Integer>
+    _max_rows_per_group: JObject, // Optional<Integer>
+    _max_bytes_per_file: JObject, // Optional<Long>
+    _mode: JObject,  // Optional<String>
+) -> jint {
+    1
 }
 
 #[no_mangle]

@@ -16,6 +16,7 @@
         <maven.compiler.source>11</maven.compiler.source>
         <maven.compiler.target>11</maven.compiler.target>
         <arrow.version>15.0.0</arrow.version>
+        <rust.plugin.release>false</rust.plugin.release>
     </properties>
 
     <dependencies>
@@ -52,6 +53,15 @@
         </dependency>
     </dependencies>
 
+    <profiles>
+        <profile>
+            <id>release</id>
+            <properties>
+                <rust.plugin.release>true</rust.plugin.release>
+            </properties>
+        </profile>
+    </profiles>
+
     <build>
         <plugins>
             <plugin>
@@ -87,7 +97,7 @@
                         </goals>
                         <configuration>
                             <path>lance-jni</path>
-<!--                            <release>true</release>-->
+                            <release>${rust.plugin.release}</release>
                             <copyTo>src/main/resources/nativelib</copyTo>
                             <copyWithPlatformDir>true</copyWithPlatformDir>
                         </configuration>

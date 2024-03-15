@@ -14,8 +14,6 @@
 
 package com.lancedb.lance;
 
-import java.util.HashMap;
-import java.util.Map;
 import java.util.Optional;
 
 /**
@@ -45,20 +43,25 @@ public class WriteParams {
     this.mode = mode;
   }
 
-  /**
-   * Create a map of the key-value pair of write params.
-   *
-   * @return a map of write params
-   */
-  public Map<String, Object> toMap() {
-    Map<String, Object> params = new HashMap<>();
-    maxRowsPerFile.ifPresent(value -> params.put("max_rows_per_file", value));
-    maxRowsPerGroup.ifPresent(value -> params.put("max_rows_per_group", value));
-    maxBytesPerFile.ifPresent(value -> params.put("max_bytes_per_file", value));
-    mode.ifPresent(value -> params.put("mode", value.toString()));
-    return params;
+  public Optional<Integer> getMaxRowsPerFile() {
+    return maxRowsPerFile;
   }
 
+  public Optional<Integer> getMaxRowsPerGroup() {
+    return maxRowsPerGroup;
+  }
+
+  public Optional<Long> getMaxBytesPerFile() {
+    return maxBytesPerFile;
+  }
+
+  /** Retrieves the write mode as a string. */
+  public Optional<String> getMode() {
+    if (mode.isPresent()) {
+      return Optional.of(mode.get().toString());
+    }
+    return Optional.empty();
+  }
 
   /**
    * A builder of WriteParams.

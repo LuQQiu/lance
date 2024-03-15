@@ -13,13 +13,15 @@
 // limitations under the License.
 
 use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
-use jni::objects::{JMap, JObject, JString};
+use jni::objects::{JObject, JString};
 use jni::sys::{jint, jlong};
 use jni::JNIEnv;
 use lance::dataset::{WriteMode, WriteParams};
 use lazy_static::lazy_static;
 use snafu::{location, Location};
 use traits::IntoJava;
+
+use crate::ffi::JNIEnvExt;
 
 #[macro_export]
 macro_rules! ok_or_throw {
@@ -53,7 +55,7 @@ mod ffi;
 mod fragment;
 mod traits;
 
-use self::traits::{FromJString, JMapExt};
+use self::traits::FromJString;
 use crate::blocking_dataset::BlockingDataset;
 pub use error::{Error, Result};
 
@@ -65,18 +67,22 @@ lazy_static! {
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_writeWithFfiStream<'local>(
+pub extern "system" fn Java_com_lancedb_lance_Dataset_writeNative<'local>(
     mut env: JNIEnv<'local>,
     _obj: JObject,
-    arrow_array_stream_addr: jlong,
+    arrow_stream_memory_address: jlong,
     path: JString,
-    params: JObject,
+    max_rows_per_file: JObject, // Optional<Integer>
+    max_rows_per_group: JObject, // Optional<Integer>
+    max_bytes_per_file: JObject, // Optional<Long>
+    mode: JObject,  // Optional<String>
 ) -> JObject<'local> {
     let path_str: String = ok_or_throw!(env, path.extract(&mut env));
 
-    let write_params = ok_or_throw!(env, extract_write_params(&mut env, &params));
+    let write_params = ok_or_throw!(env, get_write_params(&mut env, &max_rows_per_file,
+        &max_rows_per_group, &max_bytes_per_file, &mode));
 
-    let stream_ptr = arrow_array_stream_addr as *mut FFI_ArrowArrayStream;
+    let stream_ptr = arrow_stream_memory_address as *mut FFI_ArrowArrayStream;
     let reader = ok_or_throw!(
         env,
         unsafe { ArrowArrayStreamReader::from_raw(stream_ptr) }.map_err(|e| Error::Arrow {
@@ -92,18 +98,19 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_writeWithFfiStream<'local>
     dataset.into_java(&mut env)
 }
 
-pub fn extract_write_params(env: &mut JNIEnv, params: &JObject) -> Result<WriteParams> {
-    let params_map = JMap::from_env(env, params)?;
-
+pub fn get_write_params(env: &mut JNIEnv, max_rows_per_file: &JObject, max_rows_per_group: &JObject, max_bytes_per_file: &JObject, mode: &JObject) -> Result<WriteParams> {
     let mut write_params = WriteParams::default();
 
-    if let Some(max_rows) = params_map.get_i32(env, "max_row_per_file")? {
+    if let Some(max_rows) = env.get_int_opt(&max_rows_per_file)? {
+        write_params.max_rows_per_file = max_rows as usize;
+    }
+    if let Some(max_rows) = env.get_int_opt(&max_rows_per_group)? {
         write_params.max_rows_per_group = max_rows as usize;
     }
-    if let Some(max_bytes) = params_map.get_i64(env, "max_bytes_per_file")? {
+    if let Some(max_bytes) = env.get_long_opt(&max_bytes_per_file)? {
         write_params.max_bytes_per_file = max_bytes as usize;
     }
-    if let Some(mode) = params_map.get_string(env, "mode")? {
+    if let Some(mode) = env.get_string_opt(&mode)? {
         write_params.mode = WriteMode::try_from(mode.as_str())?;
     }
     Ok(write_params)

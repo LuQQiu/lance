@@ -19,7 +19,7 @@ import java.io.Closeable;
 import java.io.IOException;
 import java.util.Arrays;
 import java.util.List;
-import java.util.Map;
+import java.util.Optional;
 import java.util.stream.Collectors;
 import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.memory.BufferAllocator;
@@ -42,11 +42,14 @@ public class Dataset implements Closeable {
   private Dataset() {}
 
   public static Dataset write(ArrowArrayStream stream, String path, WriteParams params) {
-    return writeWithFfiStream(stream.memoryAddress(), path, params.toMap());
+    return writeNative(stream.memoryAddress(), path, params.getMaxRowsPerFile(), 
+        params.getMaxRowsPerGroup(), params.getMaxBytesPerFile(), params.getMode());
   }
 
-  private static native Dataset writeWithFfiStream(
-      long arrowStreamMemoryAddress, String path, Map<String, Object> params);
+  private static native Dataset writeNative(
+      long arrowStreamMemoryAddress, String path, Optional<Integer> maxRowsPerFile, 
+      Optional<Integer> maxRowsPerGroup, Optional<Long> maxBytesPerFile,
+      Optional<String> mode);
 
   /**
    * Open a dataset from the specified path.

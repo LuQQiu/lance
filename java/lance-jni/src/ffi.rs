@@ -24,8 +24,18 @@ pub trait JNIEnvExt {
 
     /// Get Option<Vec<String>> from Java Optional<List<String>>.
     fn get_strings_opt(&mut self, obj: &JObject) -> Result<Option<Vec<String>>>;
+
+    /// Get Option<i32> from Java Optional<Integer>.
+    fn get_int_opt(&mut self, obj: &JObject) -> Result<Option<i32>>;
+
+    /// Get Option<i64> from Java Optional<Long>.
+    fn get_long_opt(&mut self, obj: &JObject) -> Result<Option<i64>>;
+
+    /// Get Option<String> from Java Optional<String>.
+    fn get_string_opt(&mut self, obj: &JObject) -> Result<Option<String>>;
 }
 
+// TODO(lu) Consolidate
 impl JNIEnvExt for JNIEnv<'_> {
     fn get_strings(&mut self, obj: &JObject) -> Result<Vec<String>> {
         let list = self.get_list(obj)?;
@@ -50,6 +60,53 @@ impl JNIEnvExt for JNIEnv<'_> {
             let inner = self.call_method(obj, "get", "()Ljava/util/List;", &[])?;
             let inner_obj = inner.l()?;
             Ok(Some(self.get_strings(&inner_obj)?))
+        }
+    }
+
+    fn get_int_opt(&mut self, obj: &JObject) -> Result<Option<i32>> {
+        if obj.is_null() {
+            return Ok(None);
+        }
+        let is_present = self.call_method(obj, "isPresent", "()Z", &[])?;
+        if is_present.z()? {
+            let value = self.call_method(obj, "get", "()Ljava/lang/Integer;", &[])?;
+            let value_obj = value.l()?;
+            let int_value = self.call_method(value_obj, "intValue", "()I", &[])?.i()?;
+            Ok(Some(int_value))
+        } else {
+            Ok(None)
+        }
+    }
+
+       /// Get Option<i64> from Java Optional<Long>.
+    fn get_long_opt(&mut self, obj: &JObject) -> Result<Option<i64>> {
+        if obj.is_null() {
+            return Ok(None);
+        }
+        let is_present = self.call_method(obj, "isPresent", "()Z", &[])?;
+        if is_present.z()? {
+            let value = self.call_method(obj, "get", "()Ljava/lang/Long;", &[])?;
+            let value_obj = value.l()?;
+            let long_value = self.call_method(value_obj, "longValue", "()J", &[])?.j()?;
+            Ok(Some(long_value))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Get Option<String> from Java Optional<String>.
+    fn get_string_opt(&mut self, obj: &JObject) -> Result<Option<String>> {
+        if obj.is_null() {
+            return Ok(None);
+        }
+        let is_present = self.call_method(obj, "isPresent", "()Z", &[])?;
+        if is_present.z()? {
+            let value = self.call_method(obj, "get", "()Ljava/lang/String;", &[])?;
+            let value_obj = value.l()?;
+            let string_value = self.get_string(&JString::from(value_obj))?.into();
+            Ok(Some(string_value))
+        } else {
+            Ok(None)
         }
     }
 }
