@@ -15,14 +15,23 @@
 package com.lancedb.lance;
 
 import io.questdb.jar.jni.JarJniLoader;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.Closeable;
 import java.io.IOException;
+import java.nio.channels.Channels;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
 import java.util.stream.Collectors;
 import org.apache.arrow.c.ArrowArrayStream;
+import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
+import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.ipc.ArrowStreamReader;
+import org.apache.arrow.vector.ipc.ArrowStreamWriter;
+import org.apache.arrow.vector.types.pojo.Schema;
 
 /**
  * Class representing a Lance dataset, interfacing with the native lance library. This class
@@ -40,6 +49,37 @@ public class Dataset implements Closeable {
   BufferAllocator allocator;
 
   private Dataset() {}
+
+  /**
+   * Creates an empty dataset.
+   *
+   * @param path dataset uri
+   * @param schema dataset schema
+   * @param params write params
+   * @return Dataset
+   */
+  public static Dataset createEmptyDataSet(String path, Schema schema,
+      WriteParams params) {
+    // TODO(lu) move createEmptyDataset into rust lance with c.ArrowSchema
+    try (RootAllocator allocator = new RootAllocator();
+         VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+      ByteArrayOutputStream schemaOnlyOutStream = new ByteArrayOutputStream();
+      try (ArrowStreamWriter writer = new ArrowStreamWriter(root, null,
+          Channels.newChannel(schemaOnlyOutStream))) {
+        writer.start();
+        writer.end();
+      }
+      ByteArrayInputStream schemaOnlyInStream
+          = new ByteArrayInputStream(schemaOnlyOutStream.toByteArray());
+      try (ArrowStreamReader reader = new ArrowStreamReader(schemaOnlyInStream, allocator);
+           ArrowArrayStream arrowStream = ArrowArrayStream.allocateNew(allocator)) {
+        Data.exportArrayStream(allocator, reader, arrowStream);
+        return Dataset.write(arrowStream, path, params);
+      }
+    } catch (IOException e) {
+      throw new RuntimeException(e);
+    }
+  }
 
   /**
    * Write a dataset to the specified path.
