@@ -86,14 +86,12 @@ public class SparkCatalogTest {
         RowFactory.create("102", "2015-01-01", "2015-01-01T13:51:40.417052Z"),
         RowFactory.create("103", "2015-01-01", "2015-01-01T13:51:40.519832Z")
     ), schema);
-
-    String tableLocation = "file://" + tempDir.resolve("db/lance_table").toString();
-    spark.sql("CREATE TABLE IF NOT EXISTS dev.db.lance_table (" +
-        "id STRING, " +
+    String tableName = "dev.db.lance_table";
+    spark.sql("CREATE TABLE IF NOT EXISTS " + tableName +
+        "(id STRING, " +
         "creation_date STRING, " +
         "last_update_time STRING) " +
-        "USING lance " +
-        "LOCATION '" + tableLocation + "'");
+        "USING lance");
 
     data.write().format("lance").mode("append").saveAsTable("dev.db.lance_table");
     spark.table("dev.db.lance_table").show();

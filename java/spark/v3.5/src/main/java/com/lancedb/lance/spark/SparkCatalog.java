@@ -49,8 +49,10 @@ public class SparkCatalog implements TableCatalog {
   public Table loadTable(Identifier identifier) throws NoSuchTableException {
     String tablePath = warehouse.resolve(identifier.name()).toString();
     try {
-      Dataset dataset = Dataset.open(tablePath, new RootAllocator()); // is it the correct way to check if dataset exists?
+      Dataset.open(tablePath, new RootAllocator());
     } catch (RuntimeException | IOException e) {
+      // TODO(lu) Lance::Error::DatasetNotFound => Lance Java Error
+      // Other Error remains RuntimeException
       throw new NoSuchTableException(identifier);
     }
     return new SparkTable(identifier.name());
@@ -59,6 +61,8 @@ public class SparkCatalog implements TableCatalog {
   @Override
   public Table createTable(Identifier identifier, StructType structType,
       Transform[] transforms, Map<String, String> map)
+      // How to create table with schema, without writing to it
+      
       throws TableAlreadyExistsException, NoSuchNamespaceException {
         // identifier name lance_table namespace db
         // structType
