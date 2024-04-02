@@ -20,6 +20,9 @@ import com.lancedb.lance.spark.source.SparkTable;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.Map;
+import org.apache.arrow.c.ArrowSchema;
+import org.apache.arrow.c.Data;
+import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.apache.spark.sql.catalyst.analysis.NoSuchNamespaceException;
@@ -47,12 +50,15 @@ public class SparkCatalog implements TableCatalog {
   @Override
   public Table loadTable(Identifier identifier) throws NoSuchTableException {
     String datasetUri = warehouse.resolve(identifier.name()).toString();
-    try {
-      Dataset.open(datasetUri, new RootAllocator()).close();
+    try (BufferAllocator allocator = new RootAllocator();
+         Dataset dataset = Dataset.open(datasetUri, allocator);
+         ArrowSchema ffiArrowSchema = ArrowSchema.allocateNew(allocator)) {
+      dataset.fillSchema(ffiArrowSchema);
+      return new SparkTable(identifier.name(), SparkSchemaUtils.convert(
+          Data.importSchema(allocator, ffiArrowSchema, null)));
     } catch (RuntimeException | IOException e) {
       throw new NoSuchTableException(identifier);
     }
-    return new SparkTable(identifier.name());
   }
 
   @Override
@@ -60,8 +66,9 @@ public class SparkCatalog implements TableCatalog {
       Transform[] transforms, Map<String, String> map) {
     String datasetUri = warehouse.resolve(identifier.name()).toString();
     Schema arrowSchema  = SparkSchemaUtils.convert(structType);
-    Dataset.createEmptyDataSet(datasetUri, arrowSchema, new WriteParams.Builder().build()).close();
-    return new SparkTable(identifier.name());
+    Dataset.createEmptyDataSet(datasetUri, arrowSchema,
+        new WriteParams.Builder().build()).close();
+    return new SparkTable(identifier.name(), structType);
   }
 
   @Override

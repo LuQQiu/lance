@@ -25,6 +25,7 @@ import java.util.List;
 import java.util.Optional;
 import java.util.stream.Collectors;
 import org.apache.arrow.c.ArrowArrayStream;
+import org.apache.arrow.c.ArrowSchema;
 import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
@@ -142,6 +143,12 @@ public class Dataset implements Closeable {
   }
 
   private native int[] getFragmentsIds();
+
+  public void fillSchema(ArrowSchema ffiArrowSchema) {
+    importFfiSchema(ffiArrowSchema.memoryAddress());
+  }
+
+  private native void importFfiSchema(long arrowSchemaMemoryAddress);
 
   /**
    * Closes this dataset and releases any system resources associated with it. If the dataset is

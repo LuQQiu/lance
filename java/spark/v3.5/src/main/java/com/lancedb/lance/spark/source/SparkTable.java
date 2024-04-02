@@ -14,6 +14,7 @@
 
 package com.lancedb.lance.spark.source;
 
+import com.google.common.collect.ImmutableSet;
 import java.util.Set;
 import org.apache.spark.sql.connector.catalog.SupportsRead;
 import org.apache.spark.sql.connector.catalog.SupportsWrite;
@@ -29,9 +30,16 @@ import org.apache.spark.sql.util.CaseInsensitiveStringMap;
 */
 public class SparkTable implements SupportsRead, SupportsWrite {
   private final String name;
+  private final StructType schema;
+  private static final Set<TableCapability> CAPABILITIES =
+      ImmutableSet.of(
+          TableCapability.BATCH_READ,
+          TableCapability.BATCH_WRITE,
+          TableCapability.STREAMING_WRITE);
 
-  public SparkTable(String name) {
+  public SparkTable(String name, StructType schema) {
     this.name = name;
+    this.schema = schema;
   }
 
   @Override
@@ -46,16 +54,16 @@ public class SparkTable implements SupportsRead, SupportsWrite {
 
   @Override
   public String name() {
-    return name;
+    return this.name;
   }
 
   @Override
   public StructType schema() {
-    return null;
+    return this.schema;
   }
 
   @Override
   public Set<TableCapability> capabilities() {
-    return null;
+    return CAPABILITIES;
   }
 }
