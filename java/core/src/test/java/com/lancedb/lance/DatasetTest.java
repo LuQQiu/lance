@@ -25,6 +25,7 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.Arrays;
 import org.apache.arrow.c.ArrowArrayStream;
+import org.apache.arrow.c.ArrowSchema;
 import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
@@ -88,11 +89,18 @@ public class DatasetTest {
       assertEquals(1, fragments.size());
       assertEquals(0, fragments.get(0).getFragmentId());
       assertEquals(9, fragments.get(0).countRows());
+
+      try (ArrowSchema ffiArrowSchema = ArrowSchema.allocateNew(allocator)) {
+        dataset.fillSchema(ffiArrowSchema);
+        Schema expectedSchema = Data.importSchema(allocator, ffiArrowSchema, null);
+        Schema originalSchema = reader.getVectorSchemaRoot().getSchema();
+        assertEquals(expectedSchema, originalSchema, "The schemas should match.");
+      }
     }
   }
 
   @Test
-  void testCreateEmptyDataset() throws IOException {
+  void testCreateEmptyDataset() {
     Path datasetPath = tempDir.resolve("new_empty_dataset");
     Schema schema = new Schema(Arrays.asList(
         new Field("id", new FieldType(false, new ArrowType.Int(32, true), null), null),
@@ -100,10 +108,11 @@ public class DatasetTest {
     ));
     dataset = Dataset.createEmptyDataSet(datasetPath.toString(), schema, new WriteParams.Builder().build());
     assertEquals(0, dataset.countRows());
-    try (RootAllocator allocator = new RootAllocator()) {
-      Dataset datasetRead = Dataset.open(datasetPath.toString(), allocator);
-      assertEquals(0, datasetRead.countRows());
-    };
+    try (RootAllocator allocator = new RootAllocator();
+         ArrowSchema ffiArrowSchema = ArrowSchema.allocateNew(allocator)) {
+      dataset.fillSchema(ffiArrowSchema);
+      assertEquals(schema, Data.importSchema(allocator, ffiArrowSchema, null));
+    }
     var fragments = dataset.getFragments();
     assertEquals(0, fragments.size());
   }

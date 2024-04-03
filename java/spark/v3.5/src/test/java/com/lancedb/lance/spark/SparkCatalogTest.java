@@ -67,13 +67,10 @@ public class SparkCatalogTest {
   public void testSparkInsert() {
     String tableName = "dev.db.lance_insert_table";
     spark.sql("CREATE TABLE " + tableName + " (id INT, data STRING) USING lance");
-    // Workflow: loadTable -> SparkTable -> [Gap]SparkTable.getSchema
-    // -> [Gap] SparkTable.partitioning() returns no partition. empty Transform[]
-    // -> [Gap] SparkTable.capabilities() returns capabilities e.g. batch read/write/streaming write
+    // Workflow: loadTable
     // -> [Gap] SparkTable.newWriteBuilder -> BatchWrite -> lance append
     spark.sql("INSERT INTO " + tableName + " VALUES (1, 'a'), (2, 'b')");
-    // Workflow: loadTable -> SparkTable -> [Gap]SparkTable.getSchema
-    // -> [Gap] SparkTable.capabilities() -> [Gap]SparkTable.newScanBuilder()
+    // Workflow: loadTable
     // -> [Gap] SparkScanBuilder.pushAggregation().build()
     // -> [Gap] LocalScan.readSchema() -> [Gap] LocalScan.rows[]
     spark.sql("SELECT * FROM " + tableName).show();
