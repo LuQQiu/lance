@@ -19,6 +19,7 @@ import com.lancedb.lance.WriteParams;
 import com.lancedb.lance.spark.source.SparkTable;
 import java.io.IOException;
 import java.nio.file.Path;
+import java.time.ZoneId;
 import java.util.Map;
 import org.apache.arrow.c.ArrowSchema;
 import org.apache.arrow.c.Data;
@@ -34,6 +35,7 @@ import org.apache.spark.sql.connector.catalog.TableCatalog;
 import org.apache.spark.sql.connector.catalog.TableChange;
 import org.apache.spark.sql.connector.expressions.Transform;
 import org.apache.spark.sql.types.StructType;
+import org.apache.spark.sql.util.ArrowUtils;
 import org.apache.spark.sql.util.CaseInsensitiveStringMap;
 
 /**
@@ -54,7 +56,7 @@ public class SparkCatalog implements TableCatalog {
          Dataset dataset = Dataset.open(datasetUri, allocator);
          ArrowSchema ffiArrowSchema = ArrowSchema.allocateNew(allocator)) {
       dataset.fillSchema(ffiArrowSchema);
-      return new SparkTable(identifier.name(), SparkSchemaUtils.convert(
+      return new SparkTable(identifier.name(), ArrowUtils.fromArrowSchema(
           Data.importSchema(allocator, ffiArrowSchema, null)));
     } catch (RuntimeException | IOException e) {
       throw new NoSuchTableException(identifier);
@@ -65,8 +67,9 @@ public class SparkCatalog implements TableCatalog {
   public Table createTable(Identifier identifier, StructType structType,
       Transform[] transforms, Map<String, String> map) {
     String datasetUri = warehouse.resolve(identifier.name()).toString();
-    Schema arrowSchema  = SparkSchemaUtils.convert(structType);
-    Dataset.createEmptyDataSet(datasetUri, arrowSchema,
+    Schema arrowSchema = ArrowUtils.toArrowSchema(
+        structType, ZoneId.systemDefault().getId(), true, false);
+    Dataset.createEmptyDataset(datasetUri, arrowSchema,
         new WriteParams.Builder().build()).close();
     return new SparkTable(identifier.name(), structType);
   }

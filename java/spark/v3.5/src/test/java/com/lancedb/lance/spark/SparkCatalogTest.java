@@ -85,6 +85,7 @@ public class SparkCatalogTest {
     // Same as create + insert
     data.writeTo(tableName).using("lance").create();
     spark.table(tableName).show();
+    // Add check manifest created
   }
 
   @Test
