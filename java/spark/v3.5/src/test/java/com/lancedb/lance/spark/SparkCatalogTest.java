@@ -29,6 +29,7 @@ import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import java.nio.file.Path;
+import java.util.concurrent.TimeoutException;
 
 public class SparkCatalogTest {
   @TempDir
@@ -54,22 +55,23 @@ public class SparkCatalogTest {
   }
 
   @Test
-  public void testSparkCreate() {
+  public void testCreate() {
     String tableName = "dev.db.lance_create_table";
     // Workflow: loadTable with NoSuchTable -> createTable -> loadTable
-    spark.sql("CREATE TABLE " + tableName + " (id INT, data STRING) USING lance");
+    createTable(tableName);
     // Workflow: [Gap] dropTable
     // spark.sql("DROP TABLE " + tableName);
   }
 
   @Test
   @Disabled
-  public void testSparkInsert() {
+  public void testInsert() {
     String tableName = "dev.db.lance_insert_table";
-    spark.sql("CREATE TABLE " + tableName + " (id INT, data STRING) USING lance");
+    createTable(tableName);
     // Workflow: loadTable
     // -> [Gap] SparkTable.newWriteBuilder -> BatchWrite -> lance append
-    spark.sql("INSERT INTO " + tableName + " VALUES (1, 'a'), (2, 'b')");
+    spark.sql("INSERT INTO " + tableName
+        + " VALUES ('100', '2015-01-01', '2015-01-01T13:51:39.340396Z'), ('101', '2015-01-01', '2015-01-01T12:14:58.597216Z')");
     // Workflow: loadTable
     // -> [Gap] SparkScanBuilder.pushAggregation().build()
     // -> [Gap] LocalScan.readSchema() -> [Gap] LocalScan.rows[]
@@ -79,7 +81,7 @@ public class SparkCatalogTest {
 
   @Test
   @Disabled
-  public void testSparkDataFrameCreate() throws TableAlreadyExistsException {
+  public void testBatchWriteTable() throws TableAlreadyExistsException {
     Dataset<Row> data = createSparkDataFrame();
     String tableName = "dev.db.lance_df_table";
     // Same as create + insert
@@ -90,17 +92,31 @@ public class SparkCatalogTest {
 
   @Test
   @Disabled
-  public void testSparkDataFrameAppend() throws NoSuchTableException {
+  public void testBatchAppendTable() throws NoSuchTableException {
     Dataset<Row> data = createSparkDataFrame();
     String tableName = "dev.db.lance_df_append_table";
-    spark.sql("CREATE TABLE IF NOT EXISTS " + tableName +
-        "(id STRING, " +
-        "creation_date STRING, " +
-        "last_update_time STRING) " +
-        "USING lance");
-
+    createTable(tableName);
     // Same as insert
     data.writeTo(tableName).append();
+    spark.table(tableName).show();
+  }
+
+  @Test
+  @Disabled
+  public void testStreamingWriteTable() throws NoSuchTableException, TimeoutException {
+    Dataset<Row> data = createSparkDataFrame();
+    String tableName = "dev.db.lance_streaming_table";
+    data.writeStream().format("lance").outputMode("append").toTable(tableName);
+    spark.table(tableName).show();
+  }
+
+  @Test
+  @Disabled
+  public void testStreamingAppendTable() throws NoSuchTableException, TimeoutException {
+    Dataset<Row> data = createSparkDataFrame();
+    String tableName = "dev.db.lance_streaming_append_table";
+    createTable(tableName);
+    data.writeStream().format("lance").outputMode("append").toTable(tableName);
     spark.table(tableName).show();
   }
 
@@ -116,5 +132,13 @@ public class SparkCatalogTest {
         RowFactory.create("102", "2015-01-01", "2015-01-01T13:51:40.417052Z"),
         RowFactory.create("103", "2015-01-01", "2015-01-01T13:51:40.519832Z")
     ), schema);
+  }
+
+  private void createTable(String tableName) {
+    spark.sql("CREATE TABLE IF NOT EXISTS " + tableName +
+        "(id STRING, " +
+        "creation_date STRING, " +
+        "last_update_time STRING) " +
+        "USING lance");
   }
 }

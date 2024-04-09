@@ -106,15 +106,17 @@ public class DatasetTest {
         new Field("id", new FieldType(false, new ArrowType.Int(32, true), null), null),
         new Field("data", new FieldType(false, new ArrowType.Utf8(), null), null)
     ));
-    dataset = Dataset.createEmptyDataset(datasetPath.toString(), schema, new WriteParams.Builder().build());
-    assertEquals(0, dataset.countRows());
-    try (RootAllocator allocator = new RootAllocator();
-         ArrowSchema ffiArrowSchema = ArrowSchema.allocateNew(allocator)) {
-      dataset.fillSchema(ffiArrowSchema);
-      assertEquals(schema, Data.importSchema(allocator, ffiArrowSchema, null));
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      dataset = Dataset.createEmptyDataset(allocator, datasetPath.toString(),
+          schema, new WriteParams.Builder().build());
+      assertEquals(0, dataset.countRows());
+      try (ArrowSchema ffiArrowSchema = ArrowSchema.allocateNew(allocator)) {
+        dataset.fillSchema(ffiArrowSchema);
+        assertEquals(schema, Data.importSchema(allocator, ffiArrowSchema, null));
+      }
+      var fragments = dataset.getFragments();
+      assertEquals(0, fragments.size());
     }
-    var fragments = dataset.getFragments();
-    assertEquals(0, fragments.size());
   }
 
   @Test

@@ -12,9 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use arrow::ffi::FFI_ArrowSchema;
+use arrow::array::{RecordBatch, StructArray};
+use arrow::datatypes::DataType;
+use arrow::datatypes::Schema;
+use arrow::ffi::{from_ffi_and_data_type, FFI_ArrowArray, FFI_ArrowSchema};
 use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
-use arrow_schema::Schema;
 use jni::{
     objects::{JObject, JString},
     sys::{jint, jlong},
@@ -29,7 +31,7 @@ use crate::{
     blocking_dataset::{BlockingDataset, NATIVE_DATASET},
     error::{Error, Result},
     ffi::JNIEnvExt,
-    traits::FromJString,
+    traits::{FromJString, SingleRecordBatchReader},
     utils::extract_write_params,
     RT,
 };
@@ -74,9 +76,64 @@ impl FragmentScanner {
         Ok((&schema).into())
     }
 }
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Fragment_createWithFfiArray(
+    mut env: JNIEnv,
+    _obj: JObject,
+    dataset_uri: JString,
+    arrow_array_addr: jlong,
+    arrow_schema_addr: jlong,
+    fragment_id: JObject,        // Optional<Integer>
+    max_rows_per_file: JObject,  // Optional<Integer>
+    max_rows_per_group: JObject, // Optional<Integer>
+    max_bytes_per_file: JObject, // Optional<Long>
+    mode: JObject,               // Optional<String>
+) -> jint {
+    // let path_str: String = ok_or_throw_with_return!(env, dataset_uri.extract(&mut env), -1);
+    // let arrow_schema_ptr = arrow_schema_addr as *mut FFI_ArrowSchema;
+    // let schema = ok_or_throw_with_return!(
+    //     env,
+    //     unsafe {
+    //         Schema::try_from(&*arrow_schema_ptr).map_err(|e| Error::Arrow {
+    //             message: e.to_string(),
+    //             location: location!(),
+    //         })
+    //     },
+    //     -1
+    // );
+    // let data_type_for_import = DataType::Struct(schema.fields.clone());
+
+    // let arrow_array_ptr = arrow_array_addr as *mut FFI_ArrowArray;
+    // // This involves move, but i fell it's safe
+    // let ffi_arrow_array = unsafe { FFI_ArrowArray::from_raw(arrow_array_ptr) };
+    // let imported_array = ok_or_throw_with_return!(
+    //     env,
+    //     unsafe {
+    //         from_ffi_and_data_type(ffi_arrow_array, data_type_for_import).map_err(|e| {
+    //             Error::Arrow {
+    //                 message: e.to_string(),
+    //                 location: location!(),
+    //             }
+    //         })
+    //     },
+    //     -1
+    // );
+    // ok_or_throw_with_return!(
+    //     env,
+    //     imported_array.validate_full().map_err(|e| Error::Arrow {
+    //         message: e.to_string(),
+    //         location: location!(),
+    //     }),
+    //     -1
+    // );
+    // let imported_batch = RecordBatch::from(StructArray::from(imported_array));
+    // let batch_schema = imported_batch.schema().clone();
+    // let reader = SingleRecordBatchReader::new(Some(imported_batch), batch_schema);
+    0
+}
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Fragment_createNative(
+pub extern "system" fn Java_com_lancedb_lance_Fragment_createWithFfiStream(
     mut env: JNIEnv,
     _obj: JObject,
     dataset_uri: JString,

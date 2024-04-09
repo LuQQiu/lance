@@ -42,7 +42,13 @@ import org.apache.spark.sql.util.CaseInsensitiveStringMap;
  * Lance Spark Catalog.
  */
 public class SparkCatalog implements TableCatalog {
+  private static final BufferAllocator rootAllocator = new RootAllocator(Long.MAX_VALUE);
   private Path warehouse = null;
+
+  static BufferAllocator newChildAllocator(String name, long initialReservation,
+      long maxAllocation) {
+    return rootAllocator.newChildAllocator(name, initialReservation, maxAllocation);
+  }
 
   @Override
   public Identifier[] listTables(String[] strings) throws NoSuchNamespaceException {
@@ -52,12 +58,14 @@ public class SparkCatalog implements TableCatalog {
   @Override
   public Table loadTable(Identifier identifier) throws NoSuchTableException {
     String datasetUri = warehouse.resolve(identifier.name()).toString();
-    try (BufferAllocator allocator = new RootAllocator();
-         Dataset dataset = Dataset.open(datasetUri, allocator);
-         ArrowSchema ffiArrowSchema = ArrowSchema.allocateNew(allocator)) {
+    try (BufferAllocator allocator = newChildAllocator(
+        "load table reader for Lance", 0, Long.MAX_VALUE);
+        Dataset dataset = Dataset.open(datasetUri, allocator);
+        ArrowSchema ffiArrowSchema = ArrowSchema.allocateNew(allocator)) {
       dataset.fillSchema(ffiArrowSchema);
-      return new SparkTable(identifier.name(), ArrowUtils.fromArrowSchema(
-          Data.importSchema(allocator, ffiArrowSchema, null)));
+      Schema arrowSchema = Data.importSchema(allocator, ffiArrowSchema, null);
+      return new SparkTable(datasetUri, arrowSchema, identifier.name(), ArrowUtils.fromArrowSchema(
+          arrowSchema));
     } catch (RuntimeException | IOException e) {
       throw new NoSuchTableException(identifier);
     }
@@ -69,9 +77,12 @@ public class SparkCatalog implements TableCatalog {
     String datasetUri = warehouse.resolve(identifier.name()).toString();
     Schema arrowSchema = ArrowUtils.toArrowSchema(
         structType, ZoneId.systemDefault().getId(), true, false);
-    Dataset.createEmptyDataset(datasetUri, arrowSchema,
-        new WriteParams.Builder().build()).close();
-    return new SparkTable(identifier.name(), structType);
+    try (BufferAllocator allocator = newChildAllocator(
+        "create table loader for Lance", 0, Long.MAX_VALUE)) {
+      Dataset.createEmptyDataset(allocator, datasetUri, arrowSchema,
+          new WriteParams.Builder().build()).close();
+      return new SparkTable(datasetUri, arrowSchema, identifier.name(), structType);
+    }
   }
 
   @Override

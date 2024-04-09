@@ -18,9 +18,11 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 
 import java.io.IOException;
 import java.net.URISyntaxException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.Arrays;
 import java.util.Optional;
 
 import org.apache.arrow.c.ArrowArrayStream;
@@ -28,8 +30,16 @@ import org.apache.arrow.c.Data;
 import org.apache.arrow.dataset.scanner.ScanOptions;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.IntVector;
+import org.apache.arrow.vector.VarCharVector;
+import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.VectorUnloader;
 import org.apache.arrow.vector.ipc.ArrowFileReader;
 import org.apache.arrow.vector.ipc.SeekableReadChannel;
+import org.apache.arrow.vector.types.pojo.ArrowType;
+import org.apache.arrow.vector.types.pojo.Field;
+import org.apache.arrow.vector.types.pojo.FieldType;
+import org.apache.arrow.vector.types.pojo.Schema;
 import org.apache.arrow.vector.util.ByteArrayReadableSeekableByteChannel;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -79,7 +89,7 @@ public class FragmentTest {
   }
 
   @Test
-  void testFragementCreate() throws IOException, URISyntaxException {
+  void testFragmentCreateFfiStream() throws IOException, URISyntaxException {
     Path path = Paths.get(DatasetTest.class.getResource("/random_access.arrow").toURI());
     try (BufferAllocator allocator = new RootAllocator();
         ArrowFileReader reader =
@@ -93,6 +103,34 @@ public class FragmentTest {
       int fragmentId = 1;
       FragmentMetadata fragmentMeta = Fragment.create(datasetPath.toString(), arrowStream, Optional.of(fragmentId), new WriteParams.Builder().build());
       assertEquals(fragmentId, fragmentMeta.getFragementId());
+    }
+  }
+
+  @Test
+  void testFragmentCreateFfiArray() throws IOException, URISyntaxException {
+    try (RootAllocator allocator = new RootAllocator(Integer.MAX_VALUE)) {
+      Schema schema = new Schema(Arrays.asList(
+              new Field("name", FieldType.nullable(new ArrowType.Utf8()), null),
+              new Field("age", FieldType.nullable(new ArrowType.Int(32, true)), null)
+      ));
+
+      try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+        root.allocateNew();
+
+        VarCharVector nameVector = (VarCharVector) root.getVector("name");
+        IntVector ageVector = (IntVector) root.getVector("age");
+        nameVector.setSafe(0, "John Doe".getBytes(StandardCharsets.UTF_8));
+        ageVector.setSafe(0, 30);
+        nameVector.setSafe(1, "Jane Doe".getBytes(StandardCharsets.UTF_8));
+        ageVector.setSafe(1, 25);
+
+        root.setRowCount(2);
+        Path datasetPath = tempDir.resolve("new_fragment_array");
+        int fragmentId = 1;
+        FragmentMetadata fragmentMeta = Fragment.create(datasetPath.toString(),
+            allocator, root, Optional.of(fragmentId), new WriteParams.Builder().build());
+        assertEquals(fragmentId, fragmentMeta.getFragementId());
+      }
     }
   }
 }

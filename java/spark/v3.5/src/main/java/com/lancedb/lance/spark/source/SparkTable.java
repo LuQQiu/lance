@@ -16,6 +16,7 @@ package com.lancedb.lance.spark.source;
 
 import com.google.common.collect.ImmutableSet;
 import java.util.Set;
+import org.apache.arrow.vector.types.pojo.Schema;
 import org.apache.spark.sql.connector.catalog.SupportsRead;
 import org.apache.spark.sql.connector.catalog.SupportsWrite;
 import org.apache.spark.sql.connector.catalog.TableCapability;
@@ -29,17 +30,31 @@ import org.apache.spark.sql.util.CaseInsensitiveStringMap;
  * Lance Spark Table.
 */
 public class SparkTable implements SupportsRead, SupportsWrite {
-  private final String name;
-  private final StructType schema;
   private static final Set<TableCapability> CAPABILITIES =
       ImmutableSet.of(
-          TableCapability.BATCH_READ,
-          TableCapability.BATCH_WRITE,
-          TableCapability.STREAMING_WRITE);
+          TableCapability.BATCH_WRITE);
 
-  public SparkTable(String name, StructType schema) {
-    this.name = name;
-    this.schema = schema;
+  // Lance parameters
+  private final String datasetUri;
+  private final Schema arrowSchema;
+  // Spark parameters
+  private final String tableName;
+  private final StructType sparkSchema;
+
+  /**
+   * Creates a spark table.
+   *
+   * @param datasetUri the lance dataset uri
+   * @param arrowSchema arrow schema
+   * @param tableName table name
+   * @param sparkSchema spark struct type
+   */
+  public SparkTable(String datasetUri, Schema arrowSchema,
+      String tableName, StructType sparkSchema) {
+    this.datasetUri = datasetUri;
+    this.arrowSchema = arrowSchema;
+    this.tableName = tableName;
+    this.sparkSchema = sparkSchema;
   }
 
   @Override
@@ -48,18 +63,18 @@ public class SparkTable implements SupportsRead, SupportsWrite {
   }
 
   @Override
-  public WriteBuilder newWriteBuilder(LogicalWriteInfo logicalWriteInfo) {
-    return null;
+  public WriteBuilder newWriteBuilder(LogicalWriteInfo info) {
+    return new SparkWriteBuilder(datasetUri, arrowSchema, info);
   }
 
   @Override
   public String name() {
-    return this.name;
+    return this.tableName;
   }
 
   @Override
   public StructType schema() {
-    return this.schema;
+    return this.sparkSchema;
   }
 
   @Override

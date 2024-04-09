@@ -43,7 +43,7 @@ pub enum Error {
     InvalidArgument { message: String },
     #[snafu(display("IO error: {}, location: {}", message, location))]
     IO { message: String, location: Location },
-    #[snafu(display("Arrow error: {}", message))]
+    #[snafu(display("Arrow error: {}, location: {}", message, location))]
     Arrow { message: String, location: Location },
     #[snafu(display("Index error: {}, location", message))]
     Index { message: String, location: Location },

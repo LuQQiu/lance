@@ -59,11 +59,10 @@ public class Dataset implements Closeable {
    * @param params write params
    * @return Dataset
    */
-  public static Dataset createEmptyDataset(String path, Schema schema,
+  public static Dataset createEmptyDataset(BufferAllocator allocator, String path, Schema schema,
       WriteParams params) {
     // TODO(lu) move createEmptyDataset into rust lance with c.ArrowSchema
-    try (RootAllocator allocator = new RootAllocator();
-         VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+    try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
       ByteArrayOutputStream schemaOnlyOutStream = new ByteArrayOutputStream();
       try (ArrowStreamWriter writer = new ArrowStreamWriter(root, null,
           Channels.newChannel(schemaOnlyOutStream))) {
