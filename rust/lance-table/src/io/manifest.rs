@@ -210,6 +210,7 @@ impl ManifestProvider for ManifestDescribing {
 #[cfg(test)]
 mod test {
     use arrow_array::{Int32Array, RecordBatch};
+    use object_store::aws::AwsCredentialProvider;
     use std::collections::HashMap;
 
     use crate::format::SelfDescribingFileReader;
@@ -220,6 +221,75 @@ mod test {
     use tokio::io::AsyncWriteExt;
 
     use super::*;
+    use aws_sdk_dynamodb::{
+        config::{Region},
+        types::AttributeValue,
+        Client,
+    };
+    use aws_config::load_from_env;
+    use aws_sdk_dynamodb::Error as DynamoError;
+
+    #[tokio::test]
+    async fn test_dynamo_db() {
+        let table_name = "lu_test_table";
+        let base_uri = "test1/sample_table2.lance";
+        let region = "us-east-1";  // specify your region
+
+        // Load configuration from environment variables
+        let config = load_from_env().await;
+
+        // Build the DynamoDB client using the loaded configuration
+        let client = Client::new(&config);
+
+        // Perform the query and delete operation
+        match async {
+            let query_response = client
+                .query()
+                .table_name(table_name)
+                .key_condition_expression("base_uri = :base_uri")
+                .expression_attribute_values(":base_uri", AttributeValue::S(base_uri.to_string()))
+                .send()
+                .await;
+
+            match query_response {
+                Ok(response) => {
+                    let items = response.items.unwrap_or_default();
+
+                    for item in items {
+                        if let Some(AttributeValue::N(version)) = item.get("version") {
+                            let delete_response = client
+                                .delete_item()
+                                .table_name(table_name)
+                                .key("base_uri", AttributeValue::S(base_uri.to_string()))
+                                .key("version", AttributeValue::N(version.clone()))
+                                .send()
+                                .await;
+
+                            if let Err(e) = delete_response {
+                                // Log detailed error for delete operation
+                                println!("Failed to delete item: {:?}", e);
+                                return Err(DynamoError::from(e)); // Convert to DynamoError
+                            }
+                        }
+                    }
+                    Ok::<_, DynamoError>(())
+                }
+                Err(e) => {
+                    // Log detailed error for query operation
+                    println!("Failed to query DynamoDB: {:?}", e);
+                    Err(DynamoError::from(e)) // Convert to DynamoError
+                }
+            }
+        }.await {
+            Ok(_) => println!("Successfully deleted items for {}", base_uri),
+            Err(e) => {
+                println!("Error: {}", e);
+                panic!("Failed to delete items: {}", e);
+            }
+        }
+    }
+
+
 
     async fn test_roundtrip_manifest(prefix_size: usize, manifest_min_size: usize) {
         let store = ObjectStore::memory();
