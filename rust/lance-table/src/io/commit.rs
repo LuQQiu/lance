@@ -455,6 +455,14 @@ pub trait CommitHandler: Debug + Send + Sync {
         manifest_writer: ManifestWriter,
         naming_scheme: ManifestNamingScheme,
     ) -> std::result::Result<(), CommitError>;
+
+    /// Delete the manifest information from the commit handler
+    async fn delete(
+        &self,
+        base_path: &Path,
+    ) ->  Result<()> {
+        Ok(())
+    }
 }
 
 async fn default_resolve_version(
@@ -876,6 +884,12 @@ impl Default for CommitConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn test_dynamo_db() {
+        let commit_handler = commit_handler_from_url("s3+ddb://lu-dev-test/test1?ddbTableName=lu_test_table", &None).await.unwrap();
+        commit_handler.delete(&Path::from("test1/sample_table.lance")).await.unwrap();
+    }
 
     #[test]
     fn test_manifest_naming_scheme() {
