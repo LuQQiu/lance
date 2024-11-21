@@ -117,11 +117,7 @@ mod test {
             DataType::Int32,
             false,
         )]));
-        RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(Int32Array::from_iter_values(values))],
-        )
-        .unwrap()
+        RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from_iter_values(values))]).unwrap()
     }
 
     #[tokio::test]
@@ -161,7 +157,8 @@ mod test {
             .unwrap();
         assert!(!dataset.manifest().uses_move_stable_row_ids());
 
-        // Trying to append without stable row ids should fail.
+        // Trying to append without stable row ids should pass (a warning is emitted) but should not
+        // affect the move_stable_row_ids setting.
         let write_params = WriteParams {
             enable_move_stable_row_ids: true,
             mode: WriteMode::Append,
@@ -169,11 +166,10 @@ mod test {
         };
         let reader =
             RecordBatchIterator::new(vec![batch.clone()].into_iter().map(Ok), batch.schema());
-        let result = Dataset::write(reader, tmp_path, Some(write_params)).await;
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(),
-                Error::NotSupported { source, .. }
-                    if source.to_string().contains("Cannot enable stable row ids on existing dataset")));
+        let dataset = Dataset::write(reader, tmp_path, Some(write_params))
+            .await
+            .unwrap();
+        assert!(!dataset.manifest().uses_move_stable_row_ids());
     }
 
     #[tokio::test]

@@ -19,7 +19,8 @@ use std::collections::HashMap;
 
 use crate::buffer::LanceBuffer;
 use crate::data::{
-    DataBlock, DictionaryDataBlock, FixedWidthDataBlock, NullableDataBlock, VariableWidthBlock,
+    BlockInfo, DataBlock, DictionaryDataBlock, FixedWidthDataBlock, NullableDataBlock,
+    VariableWidthBlock,
 };
 use crate::decoder::LogicalPageDecoder;
 use crate::encodings::logical::primitive::PrimitiveFieldDecoder;
@@ -194,11 +195,13 @@ impl PrimitivePageDecoder for DictionaryPageDecoder {
             data: LanceBuffer::from(bytes_buffer),
             offsets: LanceBuffer::from(offsets_buffer),
             num_values: num_rows,
+            block_info: BlockInfo::new(),
         });
         if let Some(nulls) = null_buffer {
             Ok(DataBlock::Nullable(NullableDataBlock {
                 data: Box::new(string_data),
                 nulls: LanceBuffer::from(nulls),
+                block_info: BlockInfo::new(),
             }))
         } else {
             Ok(string_data)
@@ -237,7 +240,6 @@ impl ArrayEncoder for AlreadyDictionaryEncoder {
             panic!("Expected dictionary type");
         };
 
-        println!("Before");
         let dict_data = match data {
             DataBlock::Dictionary(dict_data) => dict_data,
             DataBlock::AllNull(all_null) => {
@@ -251,13 +253,13 @@ impl ArrayEncoder for AlreadyDictionaryEncoder {
                         bits_per_value: key_type.byte_width() as u64 * 8,
                         data: LanceBuffer::Borrowed(indices.buffers()[0].clone()),
                         num_values: all_null.num_values,
+                        block_info: BlockInfo::new(),
                     },
                     dictionary: Box::new(DataBlock::from_array(values)),
                 }
             }
             _ => panic!("Expected dictionary data"),
         };
-        println!("After");
         let num_dictionary_items = dict_data.dictionary.num_values() as u32;
 
         let encoded_indices = self.indices_encoder.encode(
@@ -412,8 +414,9 @@ pub mod tests {
     use arrow_schema::{DataType, Field};
     use std::{collections::HashMap, sync::Arc, vec};
 
-    use crate::testing::{
-        check_round_trip_encoding_of_data, check_round_trip_encoding_random, TestCases,
+    use crate::{
+        testing::{check_round_trip_encoding_of_data, check_round_trip_encoding_random, TestCases},
+        version::LanceFileVersion,
     };
 
     use super::encode_dict_indices_and_items;
@@ -445,25 +448,25 @@ pub mod tests {
     #[test_log::test(tokio::test)]
     async fn test_utf8() {
         let field = Field::new("", DataType::Utf8, false);
-        check_round_trip_encoding_random(field, HashMap::new()).await;
+        check_round_trip_encoding_random(field, LanceFileVersion::V2_0).await;
     }
 
     #[test_log::test(tokio::test)]
     async fn test_binary() {
         let field = Field::new("", DataType::Binary, false);
-        check_round_trip_encoding_random(field, HashMap::new()).await;
+        check_round_trip_encoding_random(field, LanceFileVersion::V2_0).await;
     }
 
     #[test_log::test(tokio::test)]
     async fn test_large_binary() {
         let field = Field::new("", DataType::LargeBinary, true);
-        check_round_trip_encoding_random(field, HashMap::new()).await;
+        check_round_trip_encoding_random(field, LanceFileVersion::V2_0).await;
     }
 
     #[test_log::test(tokio::test)]
     async fn test_large_utf8() {
         let field = Field::new("", DataType::LargeUtf8, true);
-        check_round_trip_encoding_random(field, HashMap::new()).await;
+        check_round_trip_encoding_random(field, LanceFileVersion::V2_0).await;
     }
 
     #[test_log::test(tokio::test)]
@@ -569,6 +572,6 @@ pub mod tests {
             DataType::Dictionary(Box::new(DataType::UInt16), Box::new(DataType::Utf8)),
             false,
         );
-        check_round_trip_encoding_random(dict_field, HashMap::new()).await;
+        check_round_trip_encoding_random(dict_field, LanceFileVersion::V2_0).await;
     }
 }

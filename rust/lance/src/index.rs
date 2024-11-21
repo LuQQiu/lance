@@ -13,6 +13,7 @@ use futures::{stream, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_file::reader::FileReader;
 use lance_file::v2;
+use lance_file::v2::reader::FileReaderOptions;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::pb::index::Implementation;
 use lance_index::scalar::expression::{
@@ -41,7 +42,7 @@ use lance_table::format::Index as IndexMetadata;
 use lance_table::format::{Fragment, SelfDescribingFileReader};
 use lance_table::io::manifest::read_manifest_indexes;
 use roaring::RoaringBitmap;
-use scalar::{build_inverted_index, detect_scalar_index_type};
+use scalar::{build_inverted_index, detect_scalar_index_type, inverted_index_details};
 use serde_json::json;
 use snafu::{location, Location};
 use tracing::instrument;
@@ -172,6 +173,11 @@ async fn open_index_proto(reader: &dyn Reader) -> Result<pb::Index> {
     Ok(proto)
 }
 
+fn vector_index_details() -> prost_types::Any {
+    let details = lance_table::format::pb::VectorIndexDetails::default();
+    prost_types::Any::from_msg(&details).unwrap()
+}
+
 #[async_trait]
 impl DatasetIndexExt for Dataset {
     #[instrument(skip_all)]
@@ -222,13 +228,13 @@ impl DatasetIndexExt for Dataset {
         }
 
         let index_id = Uuid::new_v4();
-        match (index_type, params.index_name()) {
+        let index_details: prost_types::Any = match (index_type, params.index_name()) {
             (
                 IndexType::Bitmap | IndexType::BTree | IndexType::Inverted | IndexType::LabelList,
                 LANCE_SCALAR_INDEX,
             ) => {
                 let params = ScalarIndexParams::new(index_type.try_into()?);
-                build_scalar_index(self, column, &index_id.to_string(), &params).await?;
+                build_scalar_index(self, column, &index_id.to_string(), &params).await?
             }
             (IndexType::Scalar, LANCE_SCALAR_INDEX) => {
                 // Guess the index type
@@ -239,7 +245,7 @@ impl DatasetIndexExt for Dataset {
                         message: "Scalar index type must take a ScalarIndexParams".to_string(),
                         location: location!(),
                     })?;
-                build_scalar_index(self, column, &index_id.to_string(), params).await?;
+                build_scalar_index(self, column, &index_id.to_string(), params).await?
             }
             (IndexType::Inverted, _) => {
                 // Inverted index params.
@@ -252,6 +258,7 @@ impl DatasetIndexExt for Dataset {
                     })?;
 
                 build_inverted_index(self, column, &index_id.to_string(), inverted_params).await?;
+                inverted_index_details()
             }
             (IndexType::Vector, LANCE_VECTOR_INDEX) => {
                 // Vector index params.
@@ -265,6 +272,7 @@ impl DatasetIndexExt for Dataset {
 
                 build_vector_index(self, column, &index_name, &index_id.to_string(), vec_params)
                     .await?;
+                vector_index_details()
             }
             // Can't use if let Some(...) here because it's not stable yet.
             // TODO: fix after https://github.com/rust-lang/rust/issues/51114
@@ -281,7 +289,7 @@ impl DatasetIndexExt for Dataset {
                     .expect("already checked")
                     .clone()
                     .to_vector()
-                    // this should never happen beause we control the registration
+                    // this should never happen because we control the registration
                     // if this fails, the registration logic has a bug
                     .ok_or(Error::Internal {
                         message: "unable to cast index extension to vector".to_string(),
@@ -290,6 +298,7 @@ impl DatasetIndexExt for Dataset {
 
                 ext.create_index(self, column, &index_id.to_string(), params)
                     .await?;
+                vector_index_details()
             }
             (index_type, index_name) => {
                 return Err(Error::Index {
@@ -299,7 +308,7 @@ impl DatasetIndexExt for Dataset {
                     location: location!(),
                 });
             }
-        }
+        };
 
         let new_idx = IndexMetadata {
             uuid: index_id,
@@ -307,6 +316,7 @@ impl DatasetIndexExt for Dataset {
             fields: vec![field.id],
             dataset_version: self.manifest.version,
             fragment_bitmap: Some(self.get_fragments().iter().map(|f| f.id() as u32).collect()),
+            index_details: Some(index_details),
         };
         let transaction = Transaction::new(
             self.manifest.version,
@@ -314,6 +324,7 @@ impl DatasetIndexExt for Dataset {
                 new_indices: vec![new_idx],
                 removed_indices: vec![],
             },
+            /*blobs_op= */ None,
             None,
         );
 
@@ -370,12 +381,16 @@ impl DatasetIndexExt for Dataset {
             });
         };
 
+        // TODO: We will need some way to determine the index details here.  Perhaps
+        // we can load the index itself and get the details that way.
+
         let new_idx = IndexMetadata {
             uuid: index_id,
             name: index_name.to_string(),
             fields: vec![field.id],
             dataset_version: self.manifest.version,
             fragment_bitmap: Some(self.get_fragments().iter().map(|f| f.id() as u32).collect()),
+            index_details: None,
         };
 
         let transaction = Transaction::new(
@@ -384,6 +399,7 @@ impl DatasetIndexExt for Dataset {
                 new_indices: vec![new_idx],
                 removed_indices: vec![],
             },
+            /*blobs_op= */ None,
             None,
         );
 
@@ -451,13 +467,14 @@ impl DatasetIndexExt for Dataset {
                 new_frag_ids |= removed_idx.fragment_bitmap.as_ref().unwrap();
             }
 
-            let last_idx = deltas.last().expect("Delte indices should not be empty");
+            let last_idx = deltas.last().expect("Delta indices should not be empty");
             let new_idx = IndexMetadata {
                 uuid: new_id,
                 name: last_idx.name.clone(), // Keep the same name
                 fields: last_idx.fields.clone(),
                 dataset_version: self.manifest.version,
                 fragment_bitmap: Some(new_frag_ids),
+                index_details: last_idx.index_details.clone(),
             };
             removed_indices.extend(removed.iter().map(|&idx| idx.clone()));
             if deltas.len() > removed.len() {
@@ -480,6 +497,7 @@ impl DatasetIndexExt for Dataset {
                 new_indices,
                 removed_indices,
             },
+            /*blobs_op= */ None,
             None,
         );
 
@@ -529,17 +547,26 @@ impl DatasetIndexExt for Dataset {
             .collect::<Result<Vec<_>>>()?;
 
         let index_type = indices[0].index_type().to_string();
-        let unindexed_fragments = self.unindexed_fragments(index_name).await?;
-        let mut num_unindexed_rows = 0;
-        for f in unindexed_fragments.iter() {
-            num_unindexed_rows += f.num_rows().ok_or(Error::Index {
-                message: format!("fragment {} has no rows", f.id),
-                location: location!(),
-            })?;
-        }
-        let num_unindexed_fragments = unindexed_fragments.len();
-        let num_indexed_fragments = self.fragments().len() - num_unindexed_fragments;
-        let num_indexed_rows = self.count_rows(None).await? - num_unindexed_rows;
+
+        let indexed_fragments_per_delta = self.indexed_fragments(index_name).await?;
+        let num_indexed_rows_per_delta = self.indexed_fragments(index_name).await?
+        .iter()
+        .map(|frags| {
+            frags.iter().map(|f| f.num_rows().expect("Fragment should have row counts, please upgrade lance and trigger a single right to fix this")).sum::<usize>()
+        })
+        .collect::<Vec<_>>();
+
+        let num_indexed_fragments = indexed_fragments_per_delta
+            .clone()
+            .into_iter()
+            .flatten()
+            .map(|f| f.id)
+            .collect::<HashSet<_>>()
+            .len();
+
+        let num_unindexed_fragments = self.fragments().len() - num_indexed_fragments;
+        let num_indexed_rows = num_indexed_rows_per_delta.iter().last().unwrap();
+        let num_unindexed_rows = self.count_rows(None).await? - num_indexed_rows;
 
         let stats = json!({
             "index_type": index_type,
@@ -550,6 +577,7 @@ impl DatasetIndexExt for Dataset {
             "num_indexed_rows": num_indexed_rows,
             "num_unindexed_fragments": num_unindexed_fragments,
             "num_unindexed_rows": num_unindexed_rows,
+            "num_indexed_rows_per_delta": num_indexed_rows_per_delta,
         });
 
         serde_json::to_string(&stats).map_err(|e| Error::Index {
@@ -575,6 +603,9 @@ pub trait DatasetIndexInternalExt: DatasetIndexExt {
 
     /// Return the fragments that are not covered by any of the deltas of the index.
     async fn unindexed_fragments(&self, idx_name: &str) -> Result<Vec<Fragment>>;
+
+    /// Return the fragments that are covered by each of the deltas of the index.
+    async fn indexed_fragments(&self, idx_name: &str) -> Result<Vec<Vec<Fragment>>>;
 }
 
 #[async_trait]
@@ -612,7 +643,12 @@ impl DatasetIndexInternalExt for Dataset {
             return Ok(index);
         }
 
-        let index = crate::index::scalar::open_scalar_index(self, column, uuid).await?;
+        let index_meta = self.load_index(uuid).await?.ok_or_else(|| Error::Index {
+            message: format!("Index with id {} does not exist", uuid),
+            location: location!(),
+        })?;
+
+        let index = crate::index::scalar::open_scalar_index(self, column, &index_meta).await?;
         self.session.index_cache.insert_scalar(uuid, index.clone());
         Ok(index)
     }
@@ -680,6 +716,7 @@ impl DatasetIndexInternalExt for Dataset {
                     None,
                     Default::default(),
                     &self.session.file_metadata_cache,
+                    FileReaderOptions::default(),
                 )
                 .await?;
                 let index_metadata = reader
@@ -777,11 +814,19 @@ impl DatasetIndexInternalExt for Dataset {
         Ok(index)
     }
 
+    #[instrument(level = "trace", skip_all)]
     async fn scalar_index_info(&self) -> Result<ScalarIndexInfo> {
         let indices = self.load_indices().await?;
         let schema = self.schema();
         let mut indexed_fields = Vec::new();
-        for index in indices.iter().filter(|idx| idx.fields.len() == 1) {
+        for index in indices.iter().filter(|idx| {
+            let idx_schema = schema.project_by_ids(idx.fields.as_slice(), true);
+            let is_vector_index = idx_schema
+                .fields
+                .iter()
+                .any(|f| matches!(f.data_type(), DataType::FixedSizeList(_, _)));
+            idx.fields.len() == 1 && !is_vector_index
+        }) {
             let field = index.fields[0];
             let field = schema.field_by_id(field).ok_or_else(|| Error::Internal {
                 message: format!(
@@ -795,8 +840,9 @@ impl DatasetIndexInternalExt for Dataset {
                     Box::<LabelListQueryParser>::default() as Box<dyn ScalarQueryParser>
                 }
                 DataType::Utf8 | DataType::LargeUtf8 => {
-                    let uuid = index.uuid.to_string();
-                    let index_type = detect_scalar_index_type(self, &field.name, &uuid).await?;
+                    let index_type =
+                        detect_scalar_index_type(self, index, &field.name, self.session.as_ref())
+                            .await?;
                     // Inverted index can't be used for filtering
                     if matches!(index_type, ScalarIndexType::Inverted) {
                         continue;
@@ -829,6 +875,26 @@ impl DatasetIndexInternalExt for Dataset {
             .filter(|f| !total_fragment_bitmap.contains(f.id as u32))
             .cloned()
             .collect())
+    }
+
+    async fn indexed_fragments(&self, name: &str) -> Result<Vec<Vec<Fragment>>> {
+        let indices = self.load_indices_by_name(name).await?;
+        indices
+            .iter()
+            .map(|index| {
+                let fragment_bitmap = index.fragment_bitmap.as_ref().ok_or(Error::Index {
+                    message: "Please upgrade lance to 0.8+ to use this function".to_string(),
+                    location: location!(),
+                })?;
+                let mut indexed_frags = Vec::with_capacity(fragment_bitmap.len() as usize);
+                for frag in self.fragments().iter() {
+                    if fragment_bitmap.contains(frag.id as u32) {
+                        indexed_frags.push(frag.clone());
+                    }
+                }
+                Ok(indexed_frags)
+            })
+            .collect()
     }
 }
 

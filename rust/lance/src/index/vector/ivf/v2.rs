@@ -22,10 +22,10 @@ use deepsize::DeepSizeOf;
 use futures::prelude::stream::{self, StreamExt, TryStreamExt};
 use lance_arrow::RecordBatchExt;
 use lance_core::cache::FileMetadataCache;
-use lance_core::utils::tokio::get_num_compute_intensive_cpus;
+use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::{Error, Result};
-use lance_encoding::decoder::{DecoderMiddlewareChain, FilterExpression};
-use lance_file::v2::reader::FileReader;
+use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
+use lance_file::v2::reader::{FileReader, FileReaderOptions};
 use lance_index::vector::flat::index::{FlatIndex, FlatQuantizer};
 use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::ivf::storage::IvfModel;
@@ -128,8 +128,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
                 .open_file(&index_dir.child(uuid.as_str()).child(INDEX_FILE_NAME))
                 .await?,
             None,
-            Arc::<DecoderMiddlewareChain>::default(),
+            Arc::<DecoderPlugins>::default(),
             &file_metadata_cache,
+            FileReaderOptions::default(),
         )
         .await?;
         let index_metadata: IndexMetadata = serde_json::from_str(
@@ -180,8 +181,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
                 )
                 .await?,
             None,
-            Arc::<DecoderMiddlewareChain>::default(),
+            Arc::<DecoderPlugins>::default(),
             &file_metadata_cache,
+            FileReaderOptions::default(),
         )
         .await?;
         let storage = IvfQuantizationStorage::try_new(storage_reader).await?;
@@ -434,14 +436,17 @@ impl<S: IvfSubIndex + fmt::Debug + 'static, Q: Quantization + fmt::Debug + 'stat
     ) -> Result<RecordBatch> {
         let part_entry = self.load_partition(partition_id, true).await?;
         pre_filter.wait_for_ready().await?;
-
         let query = self.preprocess_query(partition_id, query)?;
-        let param = (&query).into();
-        let refine_factor = query.refine_factor.unwrap_or(1) as usize;
-        let k = query.k * refine_factor;
-        part_entry
-            .index
-            .search(query.key, k, param, &part_entry.storage, pre_filter)
+
+        spawn_cpu(move || {
+            let param = (&query).into();
+            let refine_factor = query.refine_factor.unwrap_or(1) as usize;
+            let k = query.k * refine_factor;
+            part_entry
+                .index
+                .search(query.key, k, param, &part_entry.storage, pre_filter)
+        })
+        .await
     }
 
     fn is_loadable(&self) -> bool {
@@ -624,7 +629,7 @@ mod tests {
             &vectors,
             query.as_primitive::<Float32Type>().values(),
             k,
-            DistanceType::L2,
+            params.metric_type,
         );
         let gt_set = gt.iter().map(|r| r.1).collect::<HashSet<_>>();
 
@@ -654,8 +659,8 @@ mod tests {
 
     #[rstest]
     #[case(4, DistanceType::L2, 0.9)]
-    #[case(4, DistanceType::Cosine, 0.6)]
-    #[case(4, DistanceType::Dot, 0.2)]
+    #[case(4, DistanceType::Cosine, 0.9)]
+    #[case(4, DistanceType::Dot, 0.9)]
     #[tokio::test]
     async fn test_build_ivf_pq(
         #[case] nlist: usize,
@@ -665,6 +670,42 @@ mod tests {
         let ivf_params = IvfBuildParams::new(nlist);
         let pq_params = PQBuildParams::default();
         let params = VectorIndexParams::with_ivf_pq_params(distance_type, ivf_params, pq_params);
+        test_index(params, nlist, recall_requirement).await;
+    }
+
+    #[rstest]
+    #[case(4, DistanceType::L2, 0.9)]
+    #[case(4, DistanceType::Cosine, 0.9)]
+    #[case(4, DistanceType::Dot, 0.9)]
+    #[tokio::test]
+    async fn test_build_ivf_pq_v3(
+        #[case] nlist: usize,
+        #[case] distance_type: DistanceType,
+        #[case] recall_requirement: f32,
+    ) {
+        let ivf_params = IvfBuildParams::new(nlist);
+        let pq_params = PQBuildParams::default();
+        let params = VectorIndexParams::with_ivf_pq_params(distance_type, ivf_params, pq_params)
+            .version(crate::index::vector::IndexFileVersion::V3)
+            .clone();
+        test_index(params, nlist, recall_requirement).await;
+    }
+
+    #[rstest]
+    #[case(4, DistanceType::L2, 0.9)]
+    #[case(4, DistanceType::Cosine, 0.9)]
+    #[case(4, DistanceType::Dot, 0.8)]
+    #[tokio::test]
+    async fn test_build_ivf_pq_4bit(
+        #[case] nlist: usize,
+        #[case] distance_type: DistanceType,
+        #[case] recall_requirement: f32,
+    ) {
+        let ivf_params = IvfBuildParams::new(nlist);
+        let pq_params = PQBuildParams::new(32, 4);
+        let params = VectorIndexParams::with_ivf_pq_params(distance_type, ivf_params, pq_params)
+            .version(crate::index::vector::IndexFileVersion::V3)
+            .clone();
         test_index(params, nlist, recall_requirement).await;
     }
 
@@ -692,8 +733,8 @@ mod tests {
 
     #[rstest]
     #[case(4, DistanceType::L2, 0.9)]
-    #[case(4, DistanceType::Cosine, 0.6)]
-    #[case(4, DistanceType::Dot, 0.2)]
+    #[case(4, DistanceType::Cosine, 0.9)]
+    #[case(4, DistanceType::Dot, 0.9)]
     #[tokio::test]
     async fn test_create_ivf_hnsw_pq(
         #[case] nlist: usize,
@@ -702,6 +743,28 @@ mod tests {
     ) {
         let ivf_params = IvfBuildParams::new(nlist);
         let pq_params = PQBuildParams::default();
+        let hnsw_params = HnswBuildParams::default();
+        let params = VectorIndexParams::with_ivf_hnsw_pq_params(
+            distance_type,
+            ivf_params,
+            hnsw_params,
+            pq_params,
+        );
+        test_index(params, nlist, recall_requirement).await;
+    }
+
+    #[rstest]
+    #[case(4, DistanceType::L2, 0.9)]
+    #[case(4, DistanceType::Cosine, 0.9)]
+    #[case(4, DistanceType::Dot, 0.8)]
+    #[tokio::test]
+    async fn test_create_ivf_hnsw_pq_4bit(
+        #[case] nlist: usize,
+        #[case] distance_type: DistanceType,
+        #[case] recall_requirement: f32,
+    ) {
+        let ivf_params = IvfBuildParams::new(nlist);
+        let pq_params = PQBuildParams::new(32, 4);
         let hnsw_params = HnswBuildParams::default();
         let params = VectorIndexParams::with_ivf_hnsw_pq_params(
             distance_type,

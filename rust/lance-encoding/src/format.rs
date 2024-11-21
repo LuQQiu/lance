@@ -18,16 +18,26 @@ use pb::{
     array_encoding::ArrayEncoding as ArrayEncodingEnum,
     buffer::BufferType,
     nullable::{AllNull, NoNull, Nullability, SomeNull},
-    ArrayEncoding, Binary, Bitpacked, BitpackedForNonNeg, Dictionary, FixedSizeBinary,
-    FixedSizeList, Flat, Fsst, Nullable, PackedStruct,
+    page_layout::Layout,
+    AllNullLayout, ArrayEncoding, Binary, BinaryMiniBlock, Bitpack2, Bitpacked, BitpackedForNonNeg,
+    Dictionary, FixedSizeBinary, FixedSizeList, Flat, Fsst, FsstMiniBlock, MiniBlockLayout,
+    Nullable, PackedStruct, PageLayout,
 };
 
-use crate::encodings::physical::block_compress::CompressionScheme;
+use crate::encodings::physical::block_compress::CompressionConfig;
+
+use self::pb::Constant;
 
 // Utility functions for creating complex protobuf objects
 pub struct ProtobufUtils {}
 
 impl ProtobufUtils {
+    pub fn constant(value: Vec<u8>, num_values: u64) -> ArrayEncoding {
+        ArrayEncoding {
+            array_encoding: Some(ArrayEncodingEnum::Constant(Constant { value, num_values })),
+        }
+    }
+
     pub fn basic_all_null_encoding() -> ArrayEncoding {
         ArrayEncoding {
             array_encoding: Some(ArrayEncodingEnum::Nullable(Box::new(Nullable {
@@ -63,7 +73,7 @@ impl ProtobufUtils {
     pub fn flat_encoding(
         bits_per_value: u64,
         buffer_index: u32,
-        compression: Option<CompressionScheme>,
+        compression: Option<CompressionConfig>,
     ) -> ArrayEncoding {
         ArrayEncoding {
             array_encoding: Some(ArrayEncodingEnum::Flat(Flat {
@@ -72,8 +82,9 @@ impl ProtobufUtils {
                     buffer_index,
                     buffer_type: BufferType::Page as i32,
                 }),
-                compression: compression.map(|compression_scheme| pb::Compression {
-                    scheme: compression_scheme.to_string(),
+                compression: compression.map(|compression_config| pb::Compression {
+                    scheme: compression_config.scheme.to_string(),
+                    level: compression_config.level,
                 }),
             })),
         }
@@ -112,6 +123,31 @@ impl ProtobufUtils {
                 }),
                 uncompressed_bits_per_value,
             })),
+        }
+    }
+    pub fn bitpack2(uncompressed_bits_per_value: u64) -> ArrayEncoding {
+        ArrayEncoding {
+            array_encoding: Some(ArrayEncodingEnum::Bitpack2(Bitpack2 {
+                uncompressed_bits_per_value,
+            })),
+        }
+    }
+
+    pub fn binary_miniblock() -> ArrayEncoding {
+        ArrayEncoding {
+            array_encoding: Some(ArrayEncodingEnum::BinaryMiniBlock(BinaryMiniBlock {})),
+        }
+    }
+
+    // Construct a `FsstMiniBlock` ArrayEncoding, the inner `binary_mini_block` encoding is actually
+    // not used and `FsstMiniBlockDecompressor` constructs a `binary_mini_block` in a `hard-coded` fashion.
+    // This can be an optimization later.
+    pub fn fsst_mini_block(data: ArrayEncoding, symbol_table: Vec<u8>) -> ArrayEncoding {
+        ArrayEncoding {
+            array_encoding: Some(ArrayEncodingEnum::FsstMiniBlock(Box::new(FsstMiniBlock {
+                binary_mini_block: Some(Box::new(data)),
+                symbol_table,
+            }))),
         }
     }
 
@@ -169,10 +205,10 @@ impl ProtobufUtils {
         }
     }
 
-    pub fn fixed_size_list(data: ArrayEncoding, dimension: u32) -> ArrayEncoding {
+    pub fn fixed_size_list(data: ArrayEncoding, dimension: u64) -> ArrayEncoding {
         ArrayEncoding {
             array_encoding: Some(ArrayEncodingEnum::FixedSizeList(Box::new(FixedSizeList {
-                dimension,
+                dimension: dimension.try_into().unwrap(),
                 items: Some(Box::new(data)),
             }))),
         }
@@ -184,6 +220,40 @@ impl ProtobufUtils {
                 binary: Some(Box::new(data)),
                 symbol_table,
             }))),
+        }
+    }
+
+    pub fn miniblock_layout(
+        rep_encoding: ArrayEncoding,
+        def_encoding: ArrayEncoding,
+        value_encoding: ArrayEncoding,
+    ) -> PageLayout {
+        PageLayout {
+            layout: Some(Layout::MiniBlockLayout(MiniBlockLayout {
+                def_compression: Some(def_encoding),
+                rep_compression: Some(rep_encoding),
+                value_compression: Some(value_encoding),
+            })),
+        }
+    }
+
+    pub fn full_zip_layout(
+        bits_rep: u8,
+        bits_def: u8,
+        value_encoding: ArrayEncoding,
+    ) -> PageLayout {
+        PageLayout {
+            layout: Some(Layout::FullZipLayout(pb::FullZipLayout {
+                bits_rep: bits_rep as u32,
+                bits_def: bits_def as u32,
+                value_compression: Some(value_encoding),
+            })),
+        }
+    }
+
+    pub fn simple_all_null_layout() -> PageLayout {
+        PageLayout {
+            layout: Some(Layout::AllNullLayout(AllNullLayout {})),
         }
     }
 }

@@ -146,7 +146,7 @@ const AWS_CREDS_CACHE_KEY: &str = "aws_credentials";
 pub struct AwsCredentialAdapter {
     pub inner: Arc<dyn ProvideCredentials>,
 
-    // RefCell can't be shared accross threads, so we use HashMap
+    // RefCell can't be shared across threads, so we use HashMap
     cache: Arc<RwLock<HashMap<String, Arc<aws_credential_types::Credentials>>>>,
 
     // The amount of time before expiry to refresh credentials
@@ -435,7 +435,7 @@ impl ObjectStore {
         // path_abs::PathAbs::new(".") returns an empty string.
         if let Some(s) = expanded_path.as_path().to_str() {
             if s.is_empty() {
-                expanded_path = std::env::current_dir()?.to_path_buf();
+                expanded_path = std::env::current_dir()?;
             }
         }
         Ok((

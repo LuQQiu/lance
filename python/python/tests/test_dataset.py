@@ -6,6 +6,7 @@ import contextlib
 import os
 import pickle
 import platform
+import random
 import re
 import time
 import uuid
@@ -29,6 +30,7 @@ from helper import ProgressForTest
 from lance._dataset.sharded_batch_iterator import ShardedBatchIterator
 from lance.commit import CommitConflictError
 from lance.debug import format_fragment
+from lance.util import validate_vector_index
 
 # Various valid inputs for write_dataset
 input_schema = pa.schema([pa.field("a", pa.float64()), pa.field("b", pa.int64())])
@@ -115,7 +117,14 @@ def test_dataset_append(tmp_path: Path):
     # verify appending batches with a different schema doesn't work
     table2 = pa.Table.from_pydict({"COLUMN-C": [1, 2, 3], "colB": [4, 5, 6]})
     with pytest.raises(OSError):
-        lance.write_dataset(table2, base_dir, mode="append")
+        lance.write_dataset(table2, dataset, mode="append")
+
+    # But we can append subschemas
+    table3 = pa.Table.from_pydict({"colA": [4, 5, 6]})
+    dataset.insert(table3)  # Append is default
+    assert dataset.to_table() == pa.table(
+        {"colA": [1, 2, 3, 4, 5, 6], "colB": [4, 5, 6, None, None, None]}
+    )
 
 
 def test_dataset_from_record_batch_iterable(tmp_path: Path):
@@ -413,6 +422,24 @@ def test_filter(tmp_path: Path):
     assert actual_tab == pa.Table.from_pydict({"a": range(51, 100)})
 
 
+def test_filter_meta_columns(tmp_path: Path):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    base_dir = tmp_path / "test"
+    ds = lance.write_dataset(table, base_dir)
+
+    rowids = ds.to_table(with_row_id=True, columns=[])
+    some_row_id = random.sample(rowids.column(0).to_pylist(), 1)[0]
+    filtered = ds.to_table(filter=f"_rowid = {some_row_id}", with_row_id=True)
+
+    assert len(filtered) == 1
+
+    rowaddrs = ds.to_table(with_row_address=True, columns=[])
+    some_row_addr = random.sample(rowaddrs.column(0).to_pylist(), 1)[0]
+    filtered = ds.to_table(filter=f"_rowaddr = {some_row_addr}", with_row_address=True)
+
+    assert len(filtered) == 1
+
+
 @pytest.mark.parametrize("data_storage_version", ["legacy", "stable"])
 def test_limit_offset(tmp_path: Path, data_storage_version: str):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
@@ -577,6 +604,33 @@ def test_nested_projection(tmp_path: Path):
     )
 
 
+def test_nested_projection_list(tmp_path: Path):
+    table = pa.Table.from_pydict(
+        {
+            "a": range(100),
+            "b": range(100),
+            "list_struct": [
+                [{"x": counter, "y": counter % 2 == 0}] for counter in range(100)
+            ],
+        }
+    )
+    base_dir = tmp_path / "test"
+    lance.write_dataset(table, base_dir)
+
+    dataset = lance.dataset(base_dir)
+
+    projected = dataset.to_table(columns={"list_struct": "list_struct[1]['x']"})
+    assert projected == pa.Table.from_pydict({"list_struct": range(100)})
+
+    # FIXME: sqlparser seems to ignore the .y part, but I can't create a simple
+    # reproducible example for sqlparser. Possibly an issue in our dialect.
+    # projected = dataset.to_table(
+    #   columns={"list_struct": "array_element(list_struct, 1).y"})
+    # assert projected == pa.Table.from_pydict(
+    #     {"list_struct": [i % 2 == 0 for i in range(100)]}
+    # )
+
+
 def test_polar_scan(tmp_path: Path):
     some_structs = [{"x": counter, "y": counter} for counter in range(100)]
     table = pa.Table.from_pydict(
@@ -676,36 +730,6 @@ def test_pickle_fragment(tmp_path: Path):
     unpickled = pickle.loads(pickled)
 
     assert fragment.to_table() == unpickled.to_table()
-
-
-def test_add_columns(tmp_path: Path):
-    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
-    base_dir = tmp_path / "test"
-    lance.write_dataset(table, base_dir)
-
-    dataset = lance.dataset(base_dir)
-    fragments = dataset.get_fragments()
-
-    fragment = fragments[0]
-
-    def adder(batch: pa.RecordBatch) -> pa.RecordBatch:
-        c_array = pa.compute.multiply(batch.column(0), 2)
-        return pa.RecordBatch.from_arrays([c_array], names=["c"])
-
-    fragment_metadata, schema = fragment.merge_columns(adder, columns=["a"])
-
-    operation = lance.LanceOperation.Overwrite(schema.to_pyarrow(), [fragment_metadata])
-    dataset = lance.LanceDataset.commit(base_dir, operation)
-    assert dataset.schema == schema.to_pyarrow()
-
-    tbl = dataset.to_table()
-    assert tbl == pa.Table.from_pydict(
-        {
-            "a": range(100),
-            "b": range(100),
-            "c": pa.array(range(0, 200, 2), pa.int64()),
-        }
-    )
 
 
 def test_cleanup_old_versions(tmp_path):
@@ -818,16 +842,16 @@ def test_append_with_commit(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
 
-    lance.write_dataset(table, base_dir)
+    dataset = lance.write_dataset(table, base_dir)
 
     fragment = lance.fragment.LanceFragment.create(base_dir, table)
     append = lance.LanceOperation.Append([fragment])
 
     with pytest.raises(OSError):
         # Must specify read version
-        dataset = lance.LanceDataset.commit(base_dir, append)
+        dataset = lance.LanceDataset.commit(dataset, append)
 
-    dataset = lance.LanceDataset.commit(base_dir, append, read_version=1)
+    dataset = lance.LanceDataset.commit(dataset, append, read_version=1)
 
     tbl = dataset.to_table()
 
@@ -893,12 +917,9 @@ def test_merge_with_commit(tmp_path: Path):
     lance.write_dataset(table, base_dir)
 
     fragment = lance.dataset(base_dir).get_fragments()[0]
-    # add_columns is deprecated, but we can make sure it still works
-    # for now.
-    with pytest.deprecated_call():
-        merged = fragment.add_columns(
-            lambda _: pa.RecordBatch.from_pydict({"c": range(100)})
-        )
+    merged = fragment.merge_columns(
+        lambda _: pa.RecordBatch.from_pydict({"c": range(100)})
+    )[0]
 
     expected = pa.Table.from_pydict({"a": range(100), "b": range(100), "c": range(100)})
 
@@ -910,33 +931,6 @@ def test_merge_with_commit(tmp_path: Path):
     tbl = dataset.to_table()
 
     assert tbl == expected
-
-
-def test_merge_batch_size(tmp_path: Path):
-    # Create dataset with 10 fragments with 100 rows each
-    table = pa.table({"a": range(1000)})
-    for batch_size in [1, 10, 100, 1000]:
-        ds_path = str(tmp_path / str(batch_size))
-        dataset = lance.write_dataset(table, ds_path, max_rows_per_file=100)
-        fragments = []
-
-        def mutate(batch):
-            assert batch.num_rows <= batch_size
-            return pa.RecordBatch.from_pydict({"b": batch.column("a")})
-
-        for frag in dataset.get_fragments():
-            merged, schema = frag.merge_columns(mutate, batch_size=batch_size)
-            fragments.append(merged)
-
-        merge = lance.LanceOperation.Merge(fragments, schema)
-        dataset = lance.LanceDataset.commit(
-            ds_path, merge, read_version=dataset.version
-        )
-
-        dataset.validate()
-        tbl = dataset.to_table()
-        expected = pa.table({"a": range(1000), "b": range(1000)})
-        assert tbl == expected
 
 
 def test_merge_with_schema_holes(tmp_path: Path):
@@ -2140,6 +2134,26 @@ def test_metadata(tmp_path: Path):
     lance.write_dataset(data, tmp_path)
 
 
+def test_default_scan_options(tmp_path: Path):
+    data = pa.table({"a": range(100), "b": range(100)})
+    dataset = lance.write_dataset(data, tmp_path)
+    assert dataset.schema.names == ["a", "b"]
+
+    dataset = lance.dataset(tmp_path)
+    assert dataset.schema.names == ["a", "b"]
+
+    dataset = lance.dataset(
+        tmp_path,
+        default_scan_options={
+            "with_row_id": True,
+        },
+    )
+    assert dataset.schema.names == ["a", "b", "_rowid"]
+
+    dataset = lance.dataset(tmp_path, default_scan_options={"with_row_address": True})
+    assert dataset.schema.names == ["a", "b", "_rowaddr"]
+
+
 def test_scan_with_row_ids(tmp_path: Path):
     """Test expose physical row ids in the scanner."""
     data = pa.table({"a": range(1000)})
@@ -2152,6 +2166,150 @@ def test_scan_with_row_ids(tmp_path: Path):
 
     tbl2 = ds._take_rows(row_ids)
     assert tbl2["a"] == tbl["a"]
+
+
+@pytest.mark.cuda
+def test_random_dataset_recall_accelerated(tmp_path: Path):
+    dims = 32
+    schema = pa.schema([pa.field("a", pa.list_(pa.float32(), dims), False)])
+    values = pc.random(512 * dims).cast("float32")
+    table = pa.Table.from_pydict(
+        {"a": pa.FixedSizeListArray.from_arrays(values, dims)}, schema=schema
+    )
+
+    base_dir = tmp_path / "test"
+
+    dataset = lance.write_dataset(table, base_dir)
+
+    from lance.dependencies import torch
+
+    # create index and assert no rows are uncounted
+    dataset.create_index(
+        "a",
+        "IVF_PQ",
+        num_partitions=2,
+        num_sub_vectors=32,
+        accelerator=torch.device("cpu"),
+    )
+    validate_vector_index(dataset, "a", pass_threshold=0.5)
+
+
+@pytest.mark.cuda
+def test_random_dataset_recall_accelerated_one_pass(tmp_path: Path):
+    dims = 32
+    schema = pa.schema([pa.field("a", pa.list_(pa.float32(), dims), False)])
+    values = pc.random(512 * dims).cast("float32")
+    table = pa.Table.from_pydict(
+        {"a": pa.FixedSizeListArray.from_arrays(values, dims)}, schema=schema
+    )
+
+    base_dir = tmp_path / "test"
+
+    dataset = lance.write_dataset(table, base_dir)
+
+    from lance.dependencies import torch
+
+    # create index and assert no rows are uncounted
+    dataset.create_index(
+        "a",
+        "IVF_PQ",
+        num_partitions=2,
+        num_sub_vectors=32,
+        accelerator=torch.device("cpu"),
+        one_pass_ivfpq=True,
+    )
+    validate_vector_index(dataset, "a", pass_threshold=0.5)
+
+
+@pytest.mark.cuda
+def test_count_index_rows_accelerated(tmp_path: Path):
+    dims = 32
+    schema = pa.schema([pa.field("a", pa.list_(pa.float32(), dims), False)])
+    values = pc.random(512 * dims).cast("float32")
+    table = pa.Table.from_pydict(
+        {"a": pa.FixedSizeListArray.from_arrays(values, dims)}, schema=schema
+    )
+
+    base_dir = tmp_path / "test"
+
+    dataset = lance.write_dataset(table, base_dir)
+
+    # assert we return None for index name that doesn't exist
+    index_name = "a_idx"
+    with pytest.raises(KeyError):
+        dataset.stats.index_stats(index_name)["num_unindexed_rows"]
+    with pytest.raises(KeyError):
+        dataset.stats.index_stats(index_name)["num_indexed_rows"]
+
+    from lance.dependencies import torch
+
+    # create index and assert no rows are uncounted
+    dataset.create_index(
+        "a",
+        "IVF_PQ",
+        name=index_name,
+        num_partitions=2,
+        num_sub_vectors=1,
+        accelerator=torch.device("cpu"),
+    )
+    assert dataset.stats.index_stats(index_name)["num_unindexed_rows"] == 0
+    assert dataset.stats.index_stats(index_name)["num_indexed_rows"] == 512
+
+    # append some data
+    new_table = pa.Table.from_pydict(
+        {"a": [[float(i) for i in range(32)] for _ in range(512)]}, schema=schema
+    )
+    dataset = lance.write_dataset(new_table, base_dir, mode="append")
+
+    # assert rows added since index was created are uncounted
+    assert dataset.stats.index_stats(index_name)["num_unindexed_rows"] == 512
+    assert dataset.stats.index_stats(index_name)["num_indexed_rows"] == 512
+
+
+@pytest.mark.cuda
+def test_count_index_rows_accelerated_one_pass(tmp_path: Path):
+    dims = 32
+    schema = pa.schema([pa.field("a", pa.list_(pa.float32(), dims), False)])
+    values = pc.random(512 * dims).cast("float32")
+    table = pa.Table.from_pydict(
+        {"a": pa.FixedSizeListArray.from_arrays(values, dims)}, schema=schema
+    )
+
+    base_dir = tmp_path / "test"
+
+    dataset = lance.write_dataset(table, base_dir)
+
+    # assert we return None for index name that doesn't exist
+    index_name = "a_idx"
+    with pytest.raises(KeyError):
+        dataset.stats.index_stats(index_name)["num_unindexed_rows"]
+    with pytest.raises(KeyError):
+        dataset.stats.index_stats(index_name)["num_indexed_rows"]
+
+    from lance.dependencies import torch
+
+    # create index and assert no rows are uncounted
+    dataset.create_index(
+        "a",
+        "IVF_PQ",
+        name=index_name,
+        num_partitions=2,
+        num_sub_vectors=1,
+        accelerator=torch.device("cpu"),
+        one_pass_ivfpq=True,
+    )
+    assert dataset.stats.index_stats(index_name)["num_unindexed_rows"] == 0
+    assert dataset.stats.index_stats(index_name)["num_indexed_rows"] == 512
+
+    # append some data
+    new_table = pa.Table.from_pydict(
+        {"a": [[float(i) for i in range(32)] for _ in range(512)]}, schema=schema
+    )
+    dataset = lance.write_dataset(new_table, base_dir, mode="append")
+
+    # assert rows added since index was created are uncounted
+    assert dataset.stats.index_stats(index_name)["num_unindexed_rows"] == 512
+    assert dataset.stats.index_stats(index_name)["num_indexed_rows"] == 512
 
 
 def test_count_index_rows(tmp_path: Path):
@@ -2482,3 +2640,54 @@ def test_default_storage_version(tmp_path: Path):
     sample_file = frag.to_json()["files"][0]
     assert sample_file["file_major_version"] == EXPECTED_MAJOR_VERSION
     assert sample_file["file_minor_version"] == EXPECTED_MINOR_VERSION
+
+
+def test_no_detached_v1(tmp_path: Path):
+    table = pa.table({"x": [0]})
+    dataset = lance.write_dataset(table, tmp_path)
+
+    # Make a detached append
+    table = pa.table({"x": [1]})
+    frag = lance.LanceFragment.create(dataset.uri, table)
+    op = lance.LanceOperation.Append([frag])
+    with pytest.raises(OSError, match="v1 manifest paths"):
+        dataset.commit(dataset.uri, op, read_version=dataset.version, detached=True)
+
+
+def test_detached_commits(tmp_path: Path):
+    table = pa.table({"x": [0]})
+    dataset = lance.write_dataset(table, tmp_path, enable_v2_manifest_paths=True)
+
+    # Make a detached append
+    table = pa.table({"x": [1]})
+    frag = lance.LanceFragment.create(dataset.uri, table)
+    op = lance.LanceOperation.Append([frag])
+    detached = dataset.commit(
+        dataset.uri, op, read_version=dataset.version, detached=True
+    )
+    assert (detached.version & 0x8000000000000000) != 0
+
+    assert detached.to_table() == pa.table({"x": [0, 1]})
+    # Detached commit should not show up in the dataset
+    dataset = lance.dataset(tmp_path)
+    assert dataset.to_table() == pa.table({"x": [0]})
+
+    # We can make more commits to dataset and they don't affect attached
+    table = pa.table({"x": [2]})
+    dataset = lance.write_dataset(table, tmp_path, mode="append")
+    assert dataset.to_table() == pa.table({"x": [0, 2]})
+
+    # We can check out the detached commit
+    detached = dataset.checkout_version(detached.version)
+    assert detached.to_table() == pa.table({"x": [0, 1]})
+
+    # Detached commit can use detached commit as read version
+    table = pa.table({"x": [3]})
+    frag = lance.LanceFragment.create(detached.uri, table)
+    op = lance.LanceOperation.Append([frag])
+
+    detached2 = dataset.commit(
+        dataset.uri, op, read_version=detached.version, detached=True
+    )
+
+    assert detached2.to_table() == pa.table({"x": [0, 1, 3]})

@@ -20,15 +20,19 @@ use lance_core::{cache::FileMetadataCache, Error, Result};
 
 use crate::{
     buffer::LanceBuffer,
-    data::{DataBlock, FixedWidthDataBlock},
+    data::{BlockInfo, DataBlock, FixedWidthDataBlock},
     decoder::{
         DecodeArrayTask, DecodeBatchScheduler, FieldScheduler, FilterExpression, ListPriorityRange,
-        LogicalPageDecoder, NextDecodeTask, PriorityRange, ScheduledScanLine, SchedulerContext,
-        SchedulingJob,
+        LogicalPageDecoder, MessageType, NextDecodeTask, PageEncoding, PriorityRange,
+        ScheduledScanLine, SchedulerContext, SchedulingJob,
     },
-    encoder::{ArrayEncoder, EncodeTask, EncodedArray, EncodedColumn, EncodedPage, FieldEncoder},
+    encoder::{
+        ArrayEncoder, EncodeTask, EncodedArray, EncodedColumn, EncodedPage, FieldEncoder,
+        OutOfLineBuffers,
+    },
     encodings::logical::r#struct::SimpleStructScheduler,
     format::pb,
+    repdef::RepDefBuilder,
     EncodingsIo,
 };
 
@@ -353,14 +357,18 @@ async fn indirect_schedule_task(
         });
     }
     let item_ranges = item_ranges.into_iter().collect::<Vec<_>>();
+    let num_items = item_ranges.iter().map(|r| r.end - r.start).sum::<u64>();
 
     // Create a new root scheduler, which has one column, which is our items data
     let root_fields = Fields::from(vec![Field::new("item", items_type, true)]);
     let indirect_root_scheduler =
         SimpleStructScheduler::new(vec![items_scheduler], root_fields.clone());
-    let mut indirect_scheduler =
-        DecodeBatchScheduler::from_scheduler(Arc::new(indirect_root_scheduler), root_fields, cache);
-    let mut root_decoder = indirect_scheduler.new_root_decoder_ranges(&item_ranges);
+    let mut indirect_scheduler = DecodeBatchScheduler::from_scheduler(
+        Arc::new(indirect_root_scheduler),
+        root_fields.clone(),
+        cache,
+    );
+    let mut root_decoder = SimpleStructDecoder::new(root_fields, num_items);
 
     let priority = Box::new(ListPriorityRange::new(priority, offsets.clone()));
 
@@ -374,6 +382,7 @@ async fn indirect_schedule_task(
 
     for message in indirect_messages {
         for decoder in message.decoders {
+            let decoder = decoder.into_legacy();
             if !decoder.path.is_empty() {
                 root_decoder.accept_child(decoder)?;
             }
@@ -420,7 +429,7 @@ impl<'a> SchedulingJob for ListFieldSchedulingJob<'a> {
         &mut self,
         context: &mut SchedulerContext,
         priority: &dyn PriorityRange,
-    ) -> Result<crate::decoder::ScheduledScanLine> {
+    ) -> Result<ScheduledScanLine> {
         let next_offsets = self.offsets.schedule_next(context, priority)?;
         let offsets_scheduled = next_offsets.rows_scheduled;
         let list_reqs = self.list_requests_iter.next(offsets_scheduled);
@@ -437,10 +446,16 @@ impl<'a> SchedulingJob for ListFieldSchedulingJob<'a> {
             .all(|req| req.null_offset_adjustment == null_offset_adjustment));
         let num_rows = list_reqs.iter().map(|req| req.num_lists).sum::<u64>();
         // offsets is a uint64 which is guaranteed to create one decoder on each call to schedule_next
-        let next_offsets_decoder = next_offsets.decoders.into_iter().next().unwrap().decoder;
+        let next_offsets_decoder = next_offsets
+            .decoders
+            .into_iter()
+            .next()
+            .unwrap()
+            .into_legacy()
+            .decoder;
 
         let items_scheduler = self.scheduler.items_scheduler.clone();
-        let items_type = self.scheduler.items_type.clone();
+        let items_type = self.scheduler.items_field.data_type().clone();
         let io = context.io().clone();
         let cache = context.cache().clone();
 
@@ -463,16 +478,15 @@ impl<'a> SchedulingJob for ListFieldSchedulingJob<'a> {
             item_decoder: None,
             rows_drained: 0,
             rows_loaded: 0,
-            item_field_name: self.scheduler.item_field_name.clone(),
+            items_field: self.scheduler.items_field.clone(),
             num_rows,
             unloaded: Some(indirect_fut),
-            items_type: self.scheduler.items_type.clone(),
             offset_type: self.scheduler.offset_type.clone(),
             data_type: self.scheduler.list_type.clone(),
         });
         let decoder = context.locate_decoder(decoder);
         Ok(ScheduledScanLine {
-            decoders: vec![decoder],
+            decoders: vec![MessageType::DecoderReady(decoder)],
             rows_scheduled: num_rows,
         })
     }
@@ -500,8 +514,7 @@ impl<'a> SchedulingJob for ListFieldSchedulingJob<'a> {
 pub struct ListFieldScheduler {
     offsets_scheduler: Arc<dyn FieldScheduler>,
     items_scheduler: Arc<dyn FieldScheduler>,
-    item_field_name: String,
-    items_type: DataType,
+    items_field: Arc<Field>,
     offset_type: DataType,
     list_type: DataType,
     offset_page_info: Vec<OffsetPageInfo>,
@@ -522,26 +535,20 @@ impl ListFieldScheduler {
     pub fn new(
         offsets_scheduler: Arc<dyn FieldScheduler>,
         items_scheduler: Arc<dyn FieldScheduler>,
-        item_field_name: String,
-        items_type: DataType,
+        items_field: Arc<Field>,
         // Should be int32 or int64
         offset_type: DataType,
         offset_page_info: Vec<OffsetPageInfo>,
     ) -> Self {
         let list_type = match &offset_type {
-            DataType::Int32 => {
-                DataType::List(Arc::new(Field::new("item", items_type.clone(), true)))
-            }
-            DataType::Int64 => {
-                DataType::LargeList(Arc::new(Field::new("item", items_type.clone(), true)))
-            }
+            DataType::Int32 => DataType::List(items_field.clone()),
+            DataType::Int64 => DataType::LargeList(items_field.clone()),
             _ => panic!("Unexpected offset type {}", offset_type),
         };
         Self {
             offsets_scheduler,
             items_scheduler,
-            item_field_name,
-            items_type,
+            items_field,
             offset_type,
             offset_page_info,
             list_type,
@@ -578,7 +585,7 @@ impl FieldScheduler for ListFieldScheduler {
 /// complete.
 ///
 /// Once the indirect I/O is finished we pull items out of `unawaited`, wait them
-/// (this wait should return immedately) and then push them into `item_decoders`.
+/// (this wait should return immediately) and then push them into `item_decoders`.
 ///
 /// We then drain from `item_decoders`, popping item pages off as we finish with
 /// them.
@@ -594,8 +601,7 @@ struct ListPageDecoder {
     num_rows: u64,
     rows_drained: u64,
     rows_loaded: u64,
-    item_field_name: String,
-    items_type: DataType,
+    items_field: Arc<Field>,
     offset_type: DataType,
     data_type: DataType,
 }
@@ -605,8 +611,7 @@ struct ListDecodeTask {
     validity: BooleanBuffer,
     // Will be None if there are no items (all empty / null lists)
     items: Option<Box<dyn DecodeArrayTask>>,
-    item_field_name: String,
-    items_type: DataType,
+    items_field: Arc<Field>,
     offset_type: DataType,
 }
 
@@ -620,15 +625,7 @@ impl DecodeArrayTask for ListDecodeTask {
                 let wrapped_items = items.decode()?;
                 Result::Ok(wrapped_items.as_struct().column(0).clone())
             })
-            .unwrap_or_else(|| Ok(new_empty_array(&self.items_type)))?;
-
-        // TODO: we default to nullable true here, should probably use the nullability given to
-        // us from the input schema
-        let item_field = Arc::new(Field::new(
-            self.item_field_name,
-            self.items_type.clone(),
-            true,
-        ));
+            .unwrap_or_else(|| Ok(new_empty_array(self.items_field.data_type())))?;
 
         // The offsets are already decoded but they need to be shifted back to 0 and cast
         // to the appropriate type
@@ -651,7 +648,10 @@ impl DecodeArrayTask for ListDecodeTask {
                 let offsets = OffsetBuffer::new(offsets_i32.values().clone());
 
                 Ok(Arc::new(ListArray::try_new(
-                    item_field, offsets, items, validity,
+                    self.items_field.clone(),
+                    offsets,
+                    items,
+                    validity,
                 )?))
             }
             DataType::Int64 => {
@@ -660,7 +660,10 @@ impl DecodeArrayTask for ListDecodeTask {
                 let offsets = OffsetBuffer::new(offsets_i64.values().clone());
 
                 Ok(Arc::new(LargeListArray::try_new(
-                    item_field, offsets, items, validity,
+                    self.items_field.clone(),
+                    offsets,
+                    items,
+                    validity,
                 )?))
             }
             _ => panic!("ListDecodeTask with data type that is not i32 or i64"),
@@ -787,9 +790,8 @@ impl LogicalPageDecoder for ListPageDecoder {
             task: Box::new(ListDecodeTask {
                 offsets,
                 validity,
-                item_field_name: self.item_field_name.clone(),
+                items_field: self.items_field.clone(),
                 items: item_decode,
-                items_type: self.items_type.clone(),
                 offset_type: self.offset_type.clone(),
             }) as Box<dyn DecodeArrayTask>,
         })
@@ -930,10 +932,13 @@ impl ListOffsetsEncoder {
                 num_rows,
                 inner_encoder,
             )?;
+            let (data, description) = array.into_buffers();
             Ok(EncodedPage {
-                array,
+                data,
+                description: PageEncoding::Legacy(description),
                 num_rows,
                 column_idx,
+                row_number: 0, // Legacy encoders do not use
             })
         })
         .map(|res_res| res_res.unwrap())
@@ -945,11 +950,13 @@ impl ListOffsetsEncoder {
         let validity = Self::extract_validity(list_arr);
         // Either inserting the offsets OR inserting the validity could cause the
         // accumulation queue to fill up
-        if let Some(mut arrays) = self.accumulation_queue.insert(offsets) {
-            arrays.push(validity);
-            Some(self.make_encode_task(arrays))
-        } else if let Some(arrays) = self.accumulation_queue.insert(validity) {
-            Some(self.make_encode_task(arrays))
+        if let Some(mut arrays) = self.accumulation_queue.insert(offsets, /*row_number=*/ 0) {
+            arrays.0.push(validity);
+            Some(self.make_encode_task(arrays.0))
+        } else if let Some(arrays) =
+            self.accumulation_queue.insert(validity, /*row_number=*/ 0)
+        {
+            Some(self.make_encode_task(arrays.0))
         } else {
             None
         }
@@ -957,7 +964,7 @@ impl ListOffsetsEncoder {
 
     fn flush(&mut self) -> Option<EncodeTask> {
         if let Some(arrays) = self.accumulation_queue.flush() {
-            Some(self.make_encode_task(arrays))
+            Some(self.make_encode_task(arrays.0))
         } else {
             None
         }
@@ -1075,6 +1082,7 @@ impl ListOffsetsEncoder {
             bits_per_value: 64,
             data: LanceBuffer::reinterpret_vec(offsets),
             num_values: num_offsets,
+            block_info: BlockInfo::new(),
         });
         inner_encoder.encode(offsets_data, &DataType::UInt64, buffer_index)
     }
@@ -1162,7 +1170,13 @@ impl ListFieldEncoder {
 }
 
 impl FieldEncoder for ListFieldEncoder {
-    fn maybe_encode(&mut self, array: ArrayRef) -> Result<Vec<EncodeTask>> {
+    fn maybe_encode(
+        &mut self,
+        array: ArrayRef,
+        external_buffers: &mut OutOfLineBuffers,
+        repdef: RepDefBuilder,
+        row_number: u64,
+    ) -> Result<Vec<EncodeTask>> {
         // The list may have an offset / shorter length which means the underlying
         // values array could be longer than what we need to encode and so we need
         // to slice down to the region of interest.
@@ -1192,25 +1206,27 @@ impl FieldEncoder for ListFieldEncoder {
             .maybe_encode_offsets_and_validity(array.as_ref())
             .map(|task| vec![task])
             .unwrap_or_default();
-        let mut item_tasks = self.items_encoder.maybe_encode(items)?;
+        let mut item_tasks =
+            self.items_encoder
+                .maybe_encode(items, external_buffers, repdef, row_number)?;
         if !offsets_tasks.is_empty() && item_tasks.is_empty() {
             // An items page cannot currently be shared by two different offsets pages.  This is
             // a limitation in the current scheduler and could be addressed in the future.  As a result
             // we always need to encode the items page if we encode the offsets page.
             //
-            // In practice this isn't usually too bad unless we are targetting very small pages.
-            item_tasks = self.items_encoder.flush()?;
+            // In practice this isn't usually too bad unless we are targeting very small pages.
+            item_tasks = self.items_encoder.flush(external_buffers)?;
         }
         Self::combine_tasks(offsets_tasks, item_tasks)
     }
 
-    fn flush(&mut self) -> Result<Vec<EncodeTask>> {
+    fn flush(&mut self, external_buffers: &mut OutOfLineBuffers) -> Result<Vec<EncodeTask>> {
         let offsets_tasks = self
             .offsets_encoder
             .flush()
             .map(|task| vec![task])
             .unwrap_or_default();
-        let item_tasks = self.items_encoder.flush()?;
+        let item_tasks = self.items_encoder.flush(external_buffers)?;
         Self::combine_tasks(offsets_tasks, item_tasks)
     }
 
@@ -1218,10 +1234,15 @@ impl FieldEncoder for ListFieldEncoder {
         self.items_encoder.num_columns() + 1
     }
 
-    fn finish(&mut self) -> BoxFuture<'_, Result<Vec<EncodedColumn>>> {
+    fn finish(
+        &mut self,
+        external_buffers: &mut OutOfLineBuffers,
+    ) -> BoxFuture<'_, Result<Vec<EncodedColumn>>> {
+        let inner_columns = self.items_encoder.finish(external_buffers);
         async move {
             let mut columns = vec![EncodedColumn::default()];
-            columns.extend(self.items_encoder.finish().await?);
+            let inner_columns = inner_columns.await?;
+            columns.extend(inner_columns);
             Ok(columns)
         }
         .boxed()
@@ -1241,8 +1262,9 @@ mod tests {
     use arrow_buffer::{OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, Fields};
 
-    use crate::testing::{
-        check_round_trip_encoding_of_data, check_round_trip_encoding_random, TestCases,
+    use crate::{
+        testing::{check_round_trip_encoding_of_data, check_round_trip_encoding_random, TestCases},
+        version::LanceFileVersion,
     };
 
     fn make_list_type(inner_type: DataType) -> DataType {
@@ -1256,25 +1278,25 @@ mod tests {
     #[test_log::test(tokio::test)]
     async fn test_list() {
         let field = Field::new("", make_list_type(DataType::Int32), true);
-        check_round_trip_encoding_random(field, HashMap::new()).await;
+        check_round_trip_encoding_random(field, LanceFileVersion::V2_0).await;
     }
 
     #[test_log::test(tokio::test)]
     async fn test_large_list() {
         let field = Field::new("", make_large_list_type(DataType::Int32), true);
-        check_round_trip_encoding_random(field, HashMap::new()).await;
+        check_round_trip_encoding_random(field, LanceFileVersion::V2_0).await;
     }
 
     #[test_log::test(tokio::test)]
     async fn test_nested_strings() {
         let field = Field::new("", make_list_type(DataType::Utf8), true);
-        check_round_trip_encoding_random(field, HashMap::new()).await;
+        check_round_trip_encoding_random(field, LanceFileVersion::V2_0).await;
     }
 
     #[test_log::test(tokio::test)]
     async fn test_nested_list() {
         let field = Field::new("", make_list_type(make_list_type(DataType::Int32)), true);
-        check_round_trip_encoding_random(field, HashMap::new()).await;
+        check_round_trip_encoding_random(field, LanceFileVersion::V2_0).await;
     }
 
     #[test_log::test(tokio::test)]
@@ -1286,7 +1308,7 @@ mod tests {
         )]));
 
         let field = Field::new("", make_list_type(struct_type), true);
-        check_round_trip_encoding_random(field, HashMap::new()).await;
+        check_round_trip_encoding_random(field, LanceFileVersion::V2_0).await;
     }
 
     #[test_log::test(tokio::test)]

@@ -8,7 +8,7 @@ use futures::{future::BoxFuture, FutureExt};
 use log::trace;
 
 use crate::{
-    data::{AllNullDataBlock, DataBlock, NullableDataBlock},
+    data::{AllNullDataBlock, BlockInfo, DataBlock, NullableDataBlock},
     decoder::{PageScheduler, PrimitivePageDecoder},
     encoder::{ArrayEncoder, EncodedArray},
     format::ProtobufUtils,
@@ -98,7 +98,7 @@ impl BasicPageScheduler {
     ///
     /// It may seem strange we need `values_decoder` here but Arrow requires that value
     /// buffers still be allocated / sized even if everything is null.  So we need the value
-    /// decoder to calculate the capcity of the garbage buffer.
+    /// decoder to calculate the capacity of the garbage buffer.
     pub fn new_all_null() -> Self {
         Self {
             mode: SchedulerNullStatus::All,
@@ -165,6 +165,7 @@ impl PrimitivePageDecoder for BasicPageDecoder {
                 Ok(DataBlock::Nullable(NullableDataBlock {
                     data: Box::new(values),
                     nulls: validity.data,
+                    block_info: BlockInfo::new(),
                 }))
             }
             DataNullStatus::All => Ok(DataBlock::AllNull(AllNullDataBlock {
@@ -215,6 +216,7 @@ impl ArrayEncoder for BasicEncoder {
                 let encoded = DataBlock::Nullable(NullableDataBlock {
                     data: Box::new(encoded_values.data),
                     nulls: nullable.nulls,
+                    block_info: BlockInfo::new(),
                 });
                 Ok(EncodedArray {
                     data: encoded,

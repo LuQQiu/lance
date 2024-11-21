@@ -7,15 +7,19 @@ use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 
+use arrow_data::ArrayData;
 use bytes::{BufMut, Bytes, BytesMut};
 use futures::stream::FuturesOrdered;
 use futures::StreamExt;
-use lance_core::datatypes::Schema as LanceSchema;
+use lance_core::datatypes::{Field, Schema as LanceSchema};
+use lance_core::utils::bit::pad_bytes;
 use lance_core::{Error, Result};
+use lance_encoding::decoder::PageEncoding;
 use lance_encoding::encoder::{
-    BatchEncoder, CoreArrayEncodingStrategy, CoreFieldEncodingStrategy, EncodeTask, EncodedBatch,
-    EncodedPage, EncodingOptions, FieldEncoder, FieldEncodingStrategy,
+    default_encoding_strategy, BatchEncoder, EncodeTask, EncodedBatch, EncodedPage,
+    EncodingOptions, FieldEncoder, FieldEncodingStrategy, OutOfLineBuffers,
 };
+use lance_encoding::repdef::RepDefBuilder;
 use lance_encoding::version::LanceFileVersion;
 use lance_io::object_writer::ObjectWriter;
 use lance_io::traits::Writer;
@@ -31,6 +35,10 @@ use crate::format::pb;
 use crate::format::pbfile;
 use crate::format::pbfile::DirectEncoding;
 use crate::format::MAGIC;
+
+/// Pages buffers are aligned to 64 bytes
+pub(crate) const PAGE_BUFFER_ALIGNMENT: usize = 64;
+const PAD_BUFFER: [u8; PAGE_BUFFER_ALIGNMENT] = [72; PAGE_BUFFER_ALIGNMENT];
 
 #[derive(Debug, Clone, Default)]
 pub struct FileWriterOptions {
@@ -135,21 +143,31 @@ impl FileWriter {
         }
     }
 
+    async fn do_write_buffer(writer: &mut ObjectWriter, buf: &[u8]) -> Result<()> {
+        writer.write_all(buf).await?;
+        let pad_bytes = pad_bytes::<PAGE_BUFFER_ALIGNMENT>(buf.len());
+        writer.write_all(&PAD_BUFFER[..pad_bytes]).await?;
+        Ok(())
+    }
+
     /// Returns the format version that will be used when writing the file
     pub fn version(&self) -> LanceFileVersion {
         self.options.format_version.unwrap_or_default()
     }
 
     async fn write_page(&mut self, encoded_page: EncodedPage) -> Result<()> {
-        let buffers = encoded_page.array.data.into_buffers();
+        let buffers = encoded_page.data;
         let mut buffer_offsets = Vec::with_capacity(buffers.len());
         let mut buffer_sizes = Vec::with_capacity(buffers.len());
         for buffer in buffers {
             buffer_offsets.push(self.writer.tell().await? as u64);
             buffer_sizes.push(buffer.len() as u64);
-            self.writer.write_all(&buffer).await?;
+            Self::do_write_buffer(&mut self.writer, &buffer).await?;
         }
-        let encoded_encoding = Any::from_msg(&encoded_page.array.encoding)?.encode_to_vec();
+        let encoded_encoding = match encoded_page.description {
+            PageEncoding::Legacy(array_encoding) => Any::from_msg(&array_encoding)?.encode_to_vec(),
+            PageEncoding::Structural(page_layout) => Any::from_msg(&page_layout)?.encode_to_vec(),
+        };
         let page = pbfile::column_metadata::Page {
             buffer_offsets,
             buffer_sizes,
@@ -159,6 +177,7 @@ impl FileWriter {
                 })),
             }),
             length: encoded_page.num_rows,
+            priority: encoded_page.row_number,
         };
         self.column_metadata[encoded_page.column_idx as usize]
             .pages
@@ -199,6 +218,29 @@ impl FileWriter {
         Ok(())
     }
 
+    fn verify_field_nullability(arr: &ArrayData, field: &Field) -> Result<()> {
+        if !field.nullable && arr.null_count() > 0 {
+            return Err(Error::invalid_input(format!("The field `{}` contained null values even though the field is marked non-null in the schema", field.name), location!()));
+        }
+
+        for (child_field, child_arr) in field.children.iter().zip(arr.child_data()) {
+            Self::verify_field_nullability(child_arr, child_field)?;
+        }
+
+        Ok(())
+    }
+
+    fn verify_nullability_constraints(&self, batch: &RecordBatch) -> Result<()> {
+        for (col, field) in batch
+            .columns()
+            .iter()
+            .zip(self.schema.as_ref().unwrap().fields.iter())
+        {
+            Self::verify_field_nullability(&col.to_data(), field)?;
+        }
+        Ok(())
+    }
+
     fn initialize(&mut self, mut schema: LanceSchema) -> Result<()> {
         let cache_bytes_per_column = if let Some(data_cache_bytes) = self.options.data_cache_bytes {
             data_cache_bytes / schema.fields.len() as u64
@@ -213,16 +255,14 @@ impl FileWriter {
         let keep_original_array = self.options.keep_original_array.unwrap_or(false);
         let encoding_strategy = self.options.encoding_strategy.clone().unwrap_or_else(|| {
             let version = self.version();
-            Arc::new(CoreFieldEncodingStrategy {
-                array_encoding_strategy: Arc::new(CoreArrayEncodingStrategy { version }),
-                version,
-            })
+            default_encoding_strategy(version).into()
         });
 
         let encoding_options = EncodingOptions {
             cache_bytes_per_column,
             max_page_bytes,
             keep_original_array,
+            buffer_alignment: PAGE_BUFFER_ALIGNMENT as u64,
         };
         let encoder =
             BatchEncoder::try_new(&schema, encoding_strategy.as_ref(), &encoding_options)?;
@@ -246,7 +286,11 @@ impl FileWriter {
     }
 
     #[instrument(skip_all, level = "debug")]
-    fn encode_batch(&mut self, batch: &RecordBatch) -> Result<Vec<Vec<EncodeTask>>> {
+    fn encode_batch(
+        &mut self,
+        batch: &RecordBatch,
+        external_buffers: &mut OutOfLineBuffers,
+    ) -> Result<Vec<Vec<EncodeTask>>> {
         self.schema
             .as_ref()
             .unwrap()
@@ -264,7 +308,13 @@ impl FileWriter {
                         .into(),
                         location: location!(),
                     })?;
-                column_writer.maybe_encode(array.clone())
+                let repdef = RepDefBuilder::default();
+                column_writer.maybe_encode(
+                    array.clone(),
+                    external_buffers,
+                    repdef,
+                    self.rows_written,
+                )
             })
             .collect::<Result<Vec<_>>>()
     }
@@ -279,6 +329,7 @@ impl FileWriter {
             batch.get_array_memory_size()
         );
         self.ensure_initialized(batch)?;
+        self.verify_nullability_constraints(batch)?;
         let num_rows = batch.num_rows() as u64;
         if num_rows == 0 {
             return Ok(());
@@ -289,19 +340,27 @@ impl FileWriter {
                 location: location!(),
             });
         }
-        self.rows_written = match self.rows_written.checked_add(batch.num_rows() as u64) {
-            Some(rows_written) => rows_written,
-            None => {
-                return Err(Error::InvalidInput { source: format!("cannot write batch with {} rows because {} rows have already been written and Lance files cannot contain more than 2^32 rows", num_rows, self.rows_written).into(), location: location!() });
-            }
-        };
         // First we push each array into its column writer.  This may or may not generate enough
         // data to trigger an encoding task.  We collect any encoding tasks into a queue.
-        let encoding_tasks = self.encode_batch(batch)?;
+        let mut external_buffers =
+            OutOfLineBuffers::new(self.tell().await?, PAGE_BUFFER_ALIGNMENT as u64);
+        let encoding_tasks = self.encode_batch(batch, &mut external_buffers)?;
+        // Next, write external buffers
+        for external_buffer in external_buffers.take_buffers() {
+            Self::do_write_buffer(&mut self.writer, &external_buffer).await?;
+        }
+
         let encoding_tasks = encoding_tasks
             .into_iter()
             .flatten()
             .collect::<FuturesOrdered<_>>();
+
+        self.rows_written = match self.rows_written.checked_add(batch.num_rows() as u64) {
+            Some(rows_written) => rows_written,
+            None => {
+                return Err(Error::InvalidInput { source: format!("cannot write batch with {} rows because {} rows have already been written and Lance files cannot contain more than 2^64 rows", num_rows, self.rows_written).into(), location: location!() });
+            }
+        };
 
         self.write_pages(encoding_tasks).await?;
 
@@ -374,7 +433,7 @@ impl FileWriter {
     pub async fn add_global_buffer(&mut self, buffer: Bytes) -> Result<u32> {
         let position = self.writer.tell().await? as u64;
         let len = buffer.len() as u64;
-        self.writer.write_all(&buffer).await?;
+        Self::do_write_buffer(&mut self.writer, &buffer).await?;
         self.global_buffers.push((position, len));
         Ok(self.global_buffers.len() as u32)
     }
@@ -382,7 +441,12 @@ impl FileWriter {
     async fn finish_writers(&mut self) -> Result<()> {
         let mut col_idx = 0;
         for mut writer in std::mem::take(&mut self.column_writers) {
-            let columns = writer.finish().await?;
+            let mut external_buffers =
+                OutOfLineBuffers::new(self.tell().await?, PAGE_BUFFER_ALIGNMENT as u64);
+            let columns = writer.finish(&mut external_buffers).await?;
+            for buffer in external_buffers.take_buffers() {
+                self.writer.write_all(&buffer).await?;
+            }
             debug_assert_eq!(
                 columns.len(),
                 writer.num_columns() as usize,
@@ -400,7 +464,7 @@ impl FileWriter {
                 for buffer in column.column_buffers {
                     column_metadata.buffer_offsets.push(buffer_pos);
                     let mut size = 0;
-                    self.writer.write_all(&buffer).await?;
+                    Self::do_write_buffer(&mut self.writer, &buffer).await?;
                     size += buffer.len() as u64;
                     buffer_pos += size;
                     column_metadata.buffer_sizes.push(size);
@@ -444,11 +508,16 @@ impl FileWriter {
     /// Returns the total number of rows written
     pub async fn finish(&mut self) -> Result<u64> {
         // 1. flush any remaining data and write out those pages
+        let mut external_buffers =
+            OutOfLineBuffers::new(self.tell().await?, PAGE_BUFFER_ALIGNMENT as u64);
         let encoding_tasks = self
             .column_writers
             .iter_mut()
-            .map(|writer| writer.flush())
+            .map(|writer| writer.flush(&mut external_buffers))
             .collect::<Result<Vec<_>>>()?;
+        for external_buffer in external_buffers.take_buffers() {
+            Self::do_write_buffer(&mut self.writer, &external_buffer).await?;
+        }
         let encoding_tasks = encoding_tasks
             .into_iter()
             .flatten()
@@ -546,7 +615,14 @@ fn concat_lance_footer(batch: &EncodedBatch, write_schema: bool) -> Result<Bytes
             .page_infos
             .iter()
             .map(|page_info| {
-                let encoded_encoding = Any::from_msg(&page_info.encoding)?.encode_to_vec();
+                let encoded_encoding = match &page_info.encoding {
+                    PageEncoding::Legacy(array_encoding) => {
+                        Any::from_msg(array_encoding)?.encode_to_vec()
+                    }
+                    PageEncoding::Structural(page_layout) => {
+                        Any::from_msg(page_layout)?.encode_to_vec()
+                    }
+                };
                 let (buffer_offsets, buffer_sizes): (Vec<_>, Vec<_>) = page_info
                     .buffer_offsets_and_sizes
                     .as_ref()
@@ -562,6 +638,7 @@ fn concat_lance_footer(batch: &EncodedBatch, write_schema: bool) -> Result<Bytes
                         })),
                     }),
                     length: page_info.num_rows,
+                    priority: page_info.priority,
                 })
             })
             .collect::<Result<Vec<_>>>()?;

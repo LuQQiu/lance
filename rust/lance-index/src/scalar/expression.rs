@@ -90,8 +90,7 @@ impl ScalarQueryParser for SargableQueryParser {
         low: ScalarValue,
         high: ScalarValue,
     ) -> Option<IndexedExpression> {
-        let query =
-            SargableQuery::Range(Bound::Included(low.clone()), Bound::Included(high.clone()));
+        let query = SargableQuery::Range(Bound::Included(low), Bound::Included(high));
         Some(IndexedExpression::index_query(
             column.to_string(),
             Arc::new(query),
@@ -347,7 +346,7 @@ pub trait ScalarIndexLoader: Send + Sync {
 
 /// This represents a lookup into one or more scalar indices
 ///
-/// This is a tree of operations beacause we may need to logically combine or
+/// This is a tree of operations because we may need to logically combine or
 /// modify the results of scalar lookups
 #[derive(Debug, Clone)]
 pub enum ScalarIndexExpr {
@@ -1090,8 +1089,8 @@ mod tests {
             &index_info,
             "(aisle = 10 OR color = 'blue') AND size > 30",
             Some(IndexedExpression {
-                scalar_query: Some(ScalarIndexExpr::Or(left.clone(), right.clone())),
-                refine_expr: Some(refine.clone()),
+                scalar_query: Some(ScalarIndexExpr::Or(left, right)),
+                refine_expr: Some(refine),
             }),
         );
         // Examples of things that are not yet supported but should be supportable someday

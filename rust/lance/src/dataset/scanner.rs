@@ -15,6 +15,7 @@ use datafusion::functions_aggregate::count::count_udaf;
 use datafusion::logical_expr::{lit, Expr};
 use datafusion::physical_expr::PhysicalSortExpr;
 use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
+use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::expressions;
 use datafusion::physical_plan::projection::ProjectionExec as DFProjectionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
@@ -30,7 +31,7 @@ use datafusion::physical_plan::{
     ExecutionPlan, SendableRecordBatchStream,
 };
 use datafusion::scalar::ScalarValue;
-use datafusion_physical_expr::PhysicalExpr;
+use datafusion_physical_expr::{Partitioning, PhysicalExpr};
 use futures::stream::{Stream, StreamExt};
 use futures::TryStreamExt;
 use lance_arrow::floats::{coerce_float_vector, FloatType};
@@ -41,7 +42,7 @@ use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD};
 use lance_datafusion::exec::{execute_plan, LanceExecutionOptions};
 use lance_datafusion::projection::ProjectionPlan;
 use lance_index::scalar::expression::PlannerIndexExt;
-use lance_index::scalar::inverted::SCORE_COL;
+use lance_index::scalar::inverted::{FTS_SCHEMA, SCORE_COL};
 use lance_index::scalar::{FullTextSearchQuery, ScalarIndexType};
 use lance_index::vector::{Query, DIST_COL};
 use lance_index::{scalar::expression::ScalarIndexExpr, DatasetIndexExt};
@@ -55,9 +56,9 @@ use super::Dataset;
 use crate::datatypes::Schema;
 use crate::index::scalar::detect_scalar_index_type;
 use crate::index::DatasetIndexInternalExt;
-use crate::io::exec::fts::FtsExec;
-use crate::io::exec::get_physical_optimizer;
+use crate::io::exec::fts::{FlatFtsExec, FtsExec};
 use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
+use crate::io::exec::{get_physical_optimizer, LanceScanConfig};
 use crate::io::exec::{
     knn::new_knn_exec, project, AddRowAddrExec, FilterPlan, KNNVectorDistanceExec,
     LancePushdownScanExec, LanceScanExec, Planner, PreFilterSource, ScanConfig, TakeExec,
@@ -68,7 +69,7 @@ use snafu::{location, Location};
 #[cfg(feature = "substrait")]
 use lance_datafusion::substrait::parse_substrait;
 
-const BATCH_SIZE_FALLBACK: usize = 8192;
+pub(crate) const BATCH_SIZE_FALLBACK: usize = 8192;
 // For backwards compatibility / historical reasons we re-calculate the default batch size
 // on each call
 pub fn get_default_batch_size() -> Option<usize> {
@@ -181,6 +182,55 @@ impl MaterializationStyle {
     }
 }
 
+/// Filter for filtering rows
+pub enum LanceFilter {
+    /// The filter is an SQL string
+    Sql(String),
+    /// The filter is a Substrait expression
+    Substrait(Vec<u8>),
+    /// The filter is a Datafusion expression
+    Datafusion(Expr),
+}
+
+impl LanceFilter {
+    /// Converts the filter to a Datafusion expression
+    ///
+    /// The schema for this conversion should be the full schema available to
+    /// the filter (`full_schema`).  However, due to a limitation in the way
+    /// we do Substrait conversion today we can only do Substrait conversion with
+    /// the dataset schema (`dataset_schema`).  This means that Substrait will
+    /// not be able to access columns that are not in the dataset schema (e.g.
+    /// _rowid, _rowaddr, etc.)
+    #[allow(unused)]
+    #[instrument(level = "trace", name = "filter_to_df", skip_all)]
+    pub fn to_datafusion(&self, dataset_schema: &Schema, full_schema: &Schema) -> Result<Expr> {
+        match self {
+            Self::Sql(sql) => {
+                let schema = Arc::new(ArrowSchema::from(full_schema));
+                let planner = Planner::new(schema);
+                let filter = planner.parse_filter(sql)?;
+                planner.optimize_expr(filter)
+            }
+            #[cfg(feature = "substrait")]
+            Self::Substrait(expr) => {
+                use futures::FutureExt;
+
+                let schema = Arc::new(ArrowSchema::from(dataset_schema));
+                let expr = parse_substrait(expr, schema.clone())
+                    .now_or_never()
+                    .expect("could not parse the Substrait filter in a synchronous fashion")?;
+                let planner = Planner::new(schema);
+                planner.optimize_expr(expr)
+            }
+            #[cfg(not(feature = "substrait"))]
+            Self::Substrait(_) => {
+                panic!("Substrait filter is not supported in this build");
+            }
+            Self::Datafusion(expr) => Ok(expr.clone()),
+        }
+    }
+}
+
 /// Dataset Scanner
 ///
 /// ```rust,ignore
@@ -206,7 +256,7 @@ pub struct Scanner {
     materialization_style: MaterializationStyle,
 
     /// Optional filter expression.
-    pub(crate) filter: Option<Expr>,
+    filter: Option<LanceFilter>,
 
     /// Optional full text search query
     full_text_query: Option<FullTextSearchQuery>,
@@ -282,7 +332,11 @@ fn escape_column_name(name: &str) -> String {
 
 impl Scanner {
     pub fn new(dataset: Arc<Dataset>) -> Self {
-        let projection_plan = ProjectionPlan::new_empty(Arc::new(dataset.schema().clone()));
+        // By default, we only scan the local schema
+        let projection_plan = ProjectionPlan::new_empty(
+            Arc::new(dataset.local_schema().clone()),
+            /*load_blobs= */ false,
+        );
         Self {
             dataset,
             projection_plan,
@@ -373,9 +427,16 @@ impl Scanner {
         &mut self,
         columns: &[(impl AsRef<str>, impl AsRef<str>)],
     ) -> Result<&mut Self> {
-        let physical_schema = self.scan_output_schema(true)?;
-        let base_schema = self.dataset.schema().merge(physical_schema.as_ref())?;
-        self.projection_plan = ProjectionPlan::try_new(&base_schema, columns)?;
+        let base_schema = self.scan_output_schema(self.dataset.schema(), true)?;
+        self.projection_plan =
+            ProjectionPlan::try_new(&base_schema, columns, /*load_blobs=*/ false)?;
+        if self.projection_plan.sibling_schema.is_some() {
+            return Err(Error::NotSupported {
+                source: "Scanning columns with non-default storage class is not yet supported"
+                    .into(),
+                location: location!(),
+            });
+        }
         Ok(self)
     }
 
@@ -424,10 +485,7 @@ impl Scanner {
     /// Once the filter is applied, Lance will create an optimized I/O plan for filtering.
     ///
     pub fn filter(&mut self, filter: &str) -> Result<&mut Self> {
-        let schema = Arc::new(ArrowSchema::from(self.dataset.schema()));
-        let planner = Planner::new(schema);
-        self.filter = Some(planner.parse_filter(filter)?);
-        self.filter = Some(planner.optimize_expr(self.filter.take().unwrap())?);
+        self.filter = Some(LanceFilter::Sql(filter.to_string()));
         Ok(self)
     }
 
@@ -464,17 +522,13 @@ impl Scanner {
     ///
     /// The message must contain exactly one expression and that expression
     /// must be a scalar expression whose return type is boolean.
-    #[cfg(feature = "substrait")]
-    pub async fn filter_substrait(&mut self, filter: &[u8]) -> Result<&mut Self> {
-        let schema = Arc::new(ArrowSchema::from(self.dataset.schema()));
-        let expr = parse_substrait(filter, schema.clone()).await?;
-        let planner = Planner::new(schema);
-        self.filter = Some(planner.optimize_expr(expr)?);
+    pub fn filter_substrait(&mut self, filter: &[u8]) -> Result<&mut Self> {
+        self.filter = Some(LanceFilter::Substrait(filter.to_vec()));
         Ok(self)
     }
 
     pub(crate) fn filter_expr(&mut self, filter: Expr) -> &mut Self {
-        self.filter = Some(filter);
+        self.filter = Some(LanceFilter::Datafusion(filter));
         self
     }
 
@@ -755,11 +809,25 @@ impl Scanner {
         Ok(plan.schema())
     }
 
-    /// The output schema from the initial scan stage of a plan
+    /// Fetches the currently set filter
     ///
-    /// This includes columns that are added by the scan but don't exist in the dataset
-    /// schema (e.g. _distance, _rowid, _rowaddr)
-    pub(crate) fn scan_output_schema(&self, force_row_id: bool) -> Result<Arc<Schema>> {
+    /// Note that this forces the filter to be evaluated and the result will depend on
+    /// the current state of the scanner (e.g. if with_row_id has been called then _rowid
+    /// will be available for filtering but not otherwise) and so you may want to call this
+    /// after setting all other options.
+    pub fn get_filter(&self) -> Result<Option<Expr>> {
+        if let Some(filter) = &self.filter {
+            let filter_schema = self.scan_input_schema()?;
+            Ok(Some(filter.to_datafusion(
+                self.dataset.schema(),
+                filter_schema.as_ref(),
+            )?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn get_extra_columns(&self, force_row_id: bool) -> Vec<ArrowField> {
         let mut extra_columns = vec![];
 
         if self.nearest.as_ref().is_some() {
@@ -778,12 +846,38 @@ impl Scanner {
             extra_columns.push(ROW_ADDR_FIELD.clone());
         }
 
-        let schema = if !extra_columns.is_empty() {
-            self.projection_plan
-                .physical_schema
-                .merge(&ArrowSchema::new(extra_columns))?
+        extra_columns
+    }
+
+    pub(crate) fn scan_input_schema(&self) -> Result<Arc<Schema>> {
+        let extra_columns = self.get_extra_columns(false);
+
+        if !extra_columns.is_empty() {
+            let physical_schema = self
+                .dataset
+                .schema()
+                .merge(&ArrowSchema::new(extra_columns))?;
+            Ok(Arc::new(physical_schema))
         } else {
-            self.projection_plan.physical_schema.as_ref().clone()
+            Ok(Arc::new(self.dataset.schema().clone()))
+        }
+    }
+
+    /// The output schema from the initial scan stage of a plan
+    ///
+    /// This includes columns that are added by the scan but don't exist in the dataset
+    /// schema (e.g. _distance, _rowid, _rowaddr)
+    pub(crate) fn scan_output_schema(
+        &self,
+        base_schema: &Schema,
+        force_row_id: bool,
+    ) -> Result<Arc<Schema>> {
+        let extra_columns = self.get_extra_columns(force_row_id);
+
+        let schema = if !extra_columns.is_empty() {
+            base_schema.merge(&ArrowSchema::new(extra_columns))?
+        } else {
+            base_schema.clone()
         };
 
         // drop metadata
@@ -804,7 +898,10 @@ impl Scanner {
         // Append the extra columns
         let mut output_expr = self.projection_plan.to_physical_exprs()?;
 
-        let physical_schema = ArrowSchema::from(self.scan_output_schema(false)?.as_ref());
+        let physical_schema = ArrowSchema::from(
+            self.scan_output_schema(&self.projection_plan.physical_schema, false)?
+                .as_ref(),
+        );
 
         // distance goes before the row_id column
         if self.nearest.is_some() && output_expr.iter().all(|(_, name)| name != DIST_COL) {
@@ -872,7 +969,7 @@ impl Scanner {
             false,
             false,
         )?;
-        let plan_schema = plan.schema().clone();
+        let plan_schema = plan.schema();
         let count_plan = Arc::new(AggregateExec::try_new(
             AggregateMode::Single,
             PhysicalGroupBy::new_single(Vec::new()),
@@ -954,7 +1051,17 @@ impl Scanner {
 
     fn calc_eager_columns(&self, filter_plan: &FilterPlan) -> Result<Arc<Schema>> {
         let columns = filter_plan.refine_columns();
-        let filter_schema = self.dataset.schema().project(&columns)?;
+        // If the column didn't exist in the scan output schema then we wouldn't make
+        // it to this point.  However, there may be columns (like _rowid, _distance, etc.)
+        // which do not exist in the dataset schema but are added by the scan.  We can ignore
+        // those as eager columns.
+        let filter_schema = self.dataset.schema().project_or_drop(&columns)?;
+        if filter_schema.fields.iter().any(|f| !f.is_default_storage()) {
+            return Err(Error::NotSupported {
+                source: "non-default storage columns cannot be used as filters".into(),
+                location: location!(),
+            });
+        }
         let physical_schema = self.projection_plan.physical_schema.clone();
         let remaining_schema = physical_schema.exclude(&filter_schema)?;
 
@@ -1022,6 +1129,7 @@ impl Scanner {
     /// 3. Sort
     /// 4. Limit / Offset
     /// 5. Take remaining columns / Projection
+    #[instrument(level = "debug", skip_all)]
     pub async fn create_plan(&self) -> Result<Arc<dyn ExecutionPlan>> {
         if self.projection_plan.physical_schema.fields.is_empty()
             && !self.with_row_id
@@ -1034,12 +1142,31 @@ impl Scanner {
                 location: location!(),
             });
         }
+        if let Some(first_blob_col) = self
+            .projection_plan
+            .physical_schema
+            .fields
+            .iter()
+            .find(|f| !f.is_default_storage())
+        {
+            return Err(Error::NotSupported {
+                source: format!(
+                    "Scanning blob columns such as \"{}\" is not yet supported",
+                    first_blob_col.name
+                )
+                .into(),
+                location: location!(),
+            });
+        }
+
         // Scalar indices are only used when prefiltering
         let use_scalar_index = self.use_scalar_index && (self.prefilter || self.nearest.is_none());
 
-        let planner = Planner::new(Arc::new(self.dataset.schema().into()));
+        let filter_schema = self.scan_input_schema()?;
+        let planner = Planner::new(Arc::new(filter_schema.as_ref().into()));
 
         let mut filter_plan = if let Some(filter) = self.filter.as_ref() {
+            let filter = filter.to_datafusion(self.dataset.schema(), filter_schema.as_ref())?;
             let index_info = self.dataset.scalar_index_info().await?;
             let filter_plan =
                 planner.create_filter_plan(filter.clone(), &index_info, use_scalar_index)?;
@@ -1260,7 +1387,8 @@ impl Scanner {
         }
 
         // Stage 5: take remaining columns required for projection
-        let physical_schema = self.scan_output_schema(false)?;
+        let physical_schema =
+            self.scan_output_schema(&self.projection_plan.physical_schema, false)?;
         let remaining_schema = physical_schema.exclude(plan.schema().as_ref())?;
         if !remaining_schema.fields.is_empty() {
             plan = self.take(plan, &remaining_schema, self.batch_readahead)?;
@@ -1302,8 +1430,13 @@ impl Scanner {
             for column in string_columns {
                 let index = self.dataset.load_scalar_index_for_column(column).await?;
                 if let Some(index) = index {
-                    let uuid = index.uuid.to_string();
-                    let index_type = detect_scalar_index_type(&self.dataset, column, &uuid).await?;
+                    let index_type = detect_scalar_index_type(
+                        &self.dataset,
+                        &index,
+                        column,
+                        &self.dataset.session,
+                    )
+                    .await?;
                     if matches!(index_type, ScalarIndexType::Inverted) {
                         indexed_columns.push(column.clone());
                     }
@@ -1315,37 +1448,90 @@ impl Scanner {
             query.columns.clone()
         };
 
-        // Now the full text search supports only one column
-        if columns.len() != 1 {
+        if columns.is_empty() {
             return Err(Error::invalid_input(
-                format!(
-                    "Full text search supports only one column right now, but got {} columns",
-                    columns.len()
-                ),
+                "Cannot perform full text search unless an INVERTED index has been created on at least one column".to_string(),
                 location!(),
             ));
         }
-        let column = &columns[0];
-        let index = self
-            .dataset
-            .load_scalar_index_for_column(column)
-            .await?
-            .ok_or(Error::invalid_input(
-                format!("Column {} has no inverted index", column),
-                location!(),
-            ))?;
-        let index_uuids = self
-            .dataset
-            .load_indices_by_name(&index.name)
-            .await?
-            .into_iter()
-            .collect();
 
-        let query = query.clone().columns(Some(columns)).limit(self.limit);
+        // rewrite the query to be with the columns and limit
+        let query = query
+            .clone()
+            .columns(Some(columns.clone()))
+            .limit(self.limit);
+
+        // load indices
+        let mut column_inputs = HashMap::with_capacity(columns.len());
+        for column in columns {
+            let index = self
+                .dataset
+                .load_scalar_index_for_column(&column)
+                .await?
+                .ok_or(Error::invalid_input(
+                    format!("Column {} has no inverted index", column),
+                    location!(),
+                ))?;
+            let index_uuids: Vec<_> = self
+                .dataset
+                .load_indices_by_name(&index.name)
+                .await?
+                .into_iter()
+                .collect();
+
+            let unindexed_fragments = self.dataset.unindexed_fragments(&index.name).await?;
+            let unindexed_scan_node = if unindexed_fragments.is_empty() {
+                Arc::new(EmptyExec::new(FTS_SCHEMA.clone()))
+            } else {
+                let mut columns = vec![column.clone()];
+                if let Some(expr) = filter_plan.full_expr.as_ref() {
+                    let filter_columns = Planner::column_names_in_expr(expr);
+                    columns.extend(filter_columns);
+                }
+                let flat_fts_scan_schema =
+                    Arc::new(self.dataset.schema().project(&columns).unwrap());
+                let mut scan_node = self.scan_fragments(
+                    true,
+                    false,
+                    true,
+                    flat_fts_scan_schema,
+                    Arc::new(unindexed_fragments),
+                    None,
+                    false,
+                );
+
+                if let Some(expr) = filter_plan.full_expr.as_ref() {
+                    // If there is a prefilter we need to manually apply it to the new data
+                    let planner = Planner::new(scan_node.schema());
+                    let physical_refine_expr = planner.create_physical_expr(expr)?;
+                    scan_node = Arc::new(FilterExec::try_new(physical_refine_expr, scan_node)?);
+                }
+
+                scan_node
+            };
+
+            column_inputs.insert(column.clone(), (index_uuids, unindexed_scan_node));
+        }
+
+        let indices = column_inputs
+            .iter()
+            .map(|(col, (idx, _))| (col.clone(), idx.clone()))
+            .collect();
         let prefilter_source = self.prefilter_source(filter_plan).await?;
-        let fts_plan = FtsExec::new(self.dataset.clone(), index_uuids, query, prefilter_source);
+        let fts_plan = Arc::new(FtsExec::new(
+            self.dataset.clone(),
+            indices,
+            query.clone(),
+            prefilter_source,
+        )) as Arc<dyn ExecutionPlan>;
+        let flat_fts_plan = Arc::new(FlatFtsExec::new(self.dataset.clone(), column_inputs, query));
+        let fts_node = Arc::new(UnionExec::new(vec![fts_plan, flat_fts_plan]));
+        let fts_node = Arc::new(RepartitionExec::try_new(
+            fts_node,
+            Partitioning::RoundRobinBatch(1),
+        )?);
         let sort_expr = PhysicalSortExpr {
-            expr: expressions::col(SCORE_COL, fts_plan.schema().as_ref())?,
+            expr: expressions::col(SCORE_COL, fts_node.schema().as_ref())?,
             options: SortOptions {
                 descending: true,
                 nulls_first: false,
@@ -1353,11 +1539,7 @@ impl Scanner {
         };
 
         Ok(Arc::new(
-            SortExec::new(
-                vec![sort_expr],
-                Arc::new(fts_plan) as Arc<dyn ExecutionPlan>,
-            )
-            .with_fetch(self.limit.map(|l| l as usize)),
+            SortExec::new(vec![sort_expr], fts_node).with_fetch(self.limit.map(|l| l as usize)),
         ))
     }
 
@@ -1702,19 +1884,22 @@ impl Scanner {
         range: Option<Range<u64>>,
         ordered: bool,
     ) -> Arc<dyn ExecutionPlan> {
+        let config = LanceScanConfig {
+            batch_size: self.get_batch_size(),
+            batch_readahead: self.batch_readahead,
+            fragment_readahead: self.fragment_readahead,
+            io_buffer_size: self.get_io_buffer_size(),
+            with_row_id,
+            with_row_address,
+            with_make_deletions_null,
+            ordered_output: ordered,
+        };
         Arc::new(LanceScanExec::new(
             self.dataset.clone(),
             fragments,
             range,
             projection,
-            self.get_batch_size(),
-            self.batch_readahead,
-            self.fragment_readahead,
-            self.get_io_buffer_size(),
-            with_row_id,
-            with_row_address,
-            with_make_deletions_null,
-            ordered,
+            config,
         ))
     }
 
@@ -1883,6 +2068,7 @@ impl Scanner {
         ))
     }
 
+    #[instrument(level = "info", skip(self))]
     pub async fn explain_plan(&self, verbose: bool) -> Result<String> {
         let plan = self.create_plan().await?;
         let display = DisplayableExecutionPlan::new(plan.as_ref());
@@ -1945,6 +2131,7 @@ pub mod test_dataset {
     use arrow_array::{ArrayRef, FixedSizeListArray, Int32Array, RecordBatchIterator, StringArray};
     use arrow_schema::ArrowError;
     use lance_file::version::LanceFileVersion;
+    use lance_index::scalar::InvertedIndexParams;
     use lance_index::{scalar::ScalarIndexParams, IndexType};
     use tempfile::{tempdir, TempDir};
 
@@ -2070,6 +2257,18 @@ pub mod test_dataset {
                 .await
         }
 
+        pub async fn make_fts_index(&mut self) -> Result<()> {
+            self.dataset
+                .create_index(
+                    &["s"],
+                    IndexType::Inverted,
+                    None,
+                    &InvertedIndexParams::default(),
+                    true,
+                )
+                .await
+        }
+
         pub async fn append_new_data(&mut self) -> Result<()> {
             let vector_values: Float32Array = (0..10)
                 .flat_map(|i| vec![i as f32; self.dimension as usize].into_iter())
@@ -2100,6 +2299,7 @@ pub mod test_dataset {
 mod test {
 
     use std::collections::BTreeSet;
+    use std::sync::Mutex;
     use std::vec;
 
     use arrow::array::as_primitive_array;
@@ -2114,13 +2314,16 @@ mod test {
     use arrow_select::take;
     use datafusion::logical_expr::{col, lit};
     use half::f16;
-    use lance_datagen::{array, gen, BatchCount, Dimension, RowCount};
+    use lance_datagen::{array, gen, BatchCount, ByteCount, Dimension, RowCount};
     use lance_file::version::LanceFileVersion;
+    use lance_index::scalar::InvertedIndexParams;
     use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::ivf::IvfBuildParams;
+    use lance_index::vector::pq::PQBuildParams;
     use lance_index::vector::sq::builder::SQBuildParams;
     use lance_index::{scalar::ScalarIndexParams, IndexType};
     use lance_io::object_store::ObjectStoreParams;
+    use lance_linalg::distance::DistanceType;
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector};
     use rstest::rstest;
     use tempfile::{tempdir, TempDir};
@@ -2131,8 +2334,8 @@ mod test {
     use crate::dataset::scanner::test_dataset::TestVectorDataset;
     use crate::dataset::WriteMode;
     use crate::dataset::WriteParams;
-    use crate::index::vector::VectorIndexParams;
-    use crate::utils::test::IoTrackingStore;
+    use crate::index::vector::{StageParams, VectorIndexParams};
+    use crate::utils::test::{IoStats, IoTrackingStore};
 
     #[tokio::test]
     async fn test_batch_size() {
@@ -2246,7 +2449,7 @@ mod test {
         assert!(scan.filter.is_none());
 
         scan.filter("i > 50")?;
-        assert_eq!(scan.filter, Some(col("i").gt(lit(50))));
+        assert_eq!(scan.get_filter().unwrap(), Some(col("i").gt(lit(50))));
 
         for use_stats in [false, true] {
             let batches = scan
@@ -2591,8 +2794,6 @@ mod test {
         scan.filter("i > 100").unwrap();
         scan.project(&["i", "vec"]).unwrap();
         scan.refine(5);
-
-        println!("{}", scan.explain_plan(true).await.unwrap());
 
         let results = scan
             .try_into_stream()
@@ -3719,7 +3920,7 @@ mod test {
             let new_not_indexed =
                 arrow_arith::numeric::add(&data["indexed"], &Int32Array::new_scalar(1000)).unwrap();
             let append_data = RecordBatch::try_new(
-                data.schema().clone(),
+                data.schema(),
                 vec![data["vector"].clone(), new_indexed, new_not_indexed],
             )
             .unwrap();
@@ -4061,7 +4262,7 @@ mod test {
             for use_projection in [false, true] {
                 for use_deleted_data in [false, true] {
                     for use_new_data in [false, true] {
-                        // Don't test compaction in conjuction with deletion and new data, it's too
+                        // Don't test compaction in conjunction with deletion and new data, it's too
                         // many combinations with no clear benefit.  Feel free to update if there is
                         // a need
                         // TODO: enable compaction for stable row id once supported.
@@ -4148,6 +4349,7 @@ mod test {
     ) {
         // Create a large dataset with a scalar indexed column and a sorted but not scalar
         // indexed column
+        use lance_table::io::commit::RenameCommitHandler;
         let data = gen()
             .col(
                 "vector",
@@ -4166,6 +4368,7 @@ mod test {
                     object_store_wrapper: Some(io_stats_wrapper),
                     ..Default::default()
                 }),
+                commit_handler: Some(Arc::new(RenameCommitHandler)),
                 data_storage_version: Some(data_storage_version),
                 ..Default::default()
             }),
@@ -4843,6 +5046,98 @@ mod test {
         )
         .await?;
 
+        // FTS
+        // ---------------------------------------------------------------------
+        // All rows are indexed
+        dataset.make_fts_index().await?;
+        assert_plan_equals(
+            &dataset.dataset,
+            |scan| {
+                scan.project(&["s"])?
+                    .with_row_id()
+                    .full_text_search(FullTextSearchQuery::new("hello".to_owned()))
+            },
+            r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
+  Take: columns="_rowid, _score, (s)"
+    CoalesceBatchesExec: target_batch_size=8192
+      SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
+        RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+          UnionExec
+            Fts: query=hello
+            FlatFts: query=hello
+              EmptyExec"#,
+        )
+        .await?;
+
+        // With prefilter
+        dataset.make_fts_index().await?;
+        assert_plan_equals(
+            &dataset.dataset,
+            |scan| {
+                scan.project(&["s"])?
+                    .with_row_id()
+                    .filter("i > 10")?
+                    .prefilter(true)
+                    .full_text_search(FullTextSearchQuery::new("hello".to_owned()))
+            },
+            r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
+  Take: columns="_rowid, _score, (s)"
+    CoalesceBatchesExec: target_batch_size=8192
+      SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
+        RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+          UnionExec
+            Fts: query=hello
+              ScalarIndexQuery: query=i > 10
+            FlatFts: query=hello
+              EmptyExec"#,
+        )
+        .await?;
+
+        // With unindexed rows
+        dataset.append_new_data().await?;
+        assert_plan_equals(
+            &dataset.dataset,
+            |scan| {
+                scan.project(&["s"])?
+                    .with_row_id()
+                    .full_text_search(FullTextSearchQuery::new("hello".to_owned()))
+            },
+            r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
+  Take: columns="_rowid, _score, (s)"
+    CoalesceBatchesExec: target_batch_size=8192
+      SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
+        RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+          UnionExec
+            Fts: query=hello
+            FlatFts: query=hello
+              LanceScan: uri=..., projection=[s], row_id=true, row_addr=false, ordered=false"#,
+        )
+        .await?;
+
+        // With unindexed data & prefilter
+        assert_plan_equals(
+            &dataset.dataset,
+            |scan| {
+                scan.project(&["s"])?
+                    .with_row_id()
+                    .filter("i > 10")?
+                    .prefilter(true)
+                    .full_text_search(FullTextSearchQuery::new("hello".to_owned()))
+            },
+            r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
+  Take: columns="_rowid, _score, (s)"
+    CoalesceBatchesExec: target_batch_size=8192
+      SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
+        RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+          UnionExec
+            Fts: query=hello
+              ScalarIndexQuery: query=i > 10
+            FlatFts: query=hello
+              FilterExec: i@1 > 10
+                LanceScan: uri=..., projection=[s, i], row_id=true, row_addr=false, ordered=false"#,
+        )
+        .await?;
+
         Ok(())
     }
 
@@ -4915,5 +5210,171 @@ mod test {
         )
         .await
         .unwrap();
+    }
+
+    #[rstest]
+    #[tokio::test]
+    pub async fn test_scan_planning_io(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
+        // Create a large dataset with a scalar indexed column and a sorted but not scalar
+        // indexed column
+        let data = gen()
+            .col(
+                "vector",
+                array::rand_vec::<Float32Type>(Dimension::from(32)),
+            )
+            .col("text", array::rand_utf8(ByteCount::from(4), false))
+            .col("indexed", array::step::<Int32Type>())
+            .col("not_indexed", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(100), BatchCount::from(5));
+
+        let (io_stats_wrapper, io_stats) = IoTrackingStore::new_wrapper();
+        let mut dataset = Dataset::write(
+            data,
+            "memory://test",
+            Some(WriteParams {
+                store_params: Some(ObjectStoreParams {
+                    object_store_wrapper: Some(io_stats_wrapper),
+                    ..Default::default()
+                }),
+                data_storage_version: Some(data_storage_version),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["indexed"],
+                IndexType::Scalar,
+                None,
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["text"],
+                IndexType::Inverted,
+                None,
+                &InvertedIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                None,
+                &VectorIndexParams {
+                    metric_type: DistanceType::L2,
+                    stages: vec![
+                        StageParams::Ivf(IvfBuildParams {
+                            max_iters: 2,
+                            num_partitions: 2,
+                            sample_rate: 2,
+                            ..Default::default()
+                        }),
+                        StageParams::PQ(PQBuildParams {
+                            max_iters: 2,
+                            num_sub_vectors: 2,
+                            ..Default::default()
+                        }),
+                    ],
+                    version: crate::index::vector::IndexFileVersion::Legacy,
+                },
+                false,
+            )
+            .await
+            .unwrap();
+
+        struct IopsTracker {
+            baseline: u64,
+            new_iops: u64,
+            io_stats: Arc<Mutex<IoStats>>,
+        }
+
+        impl IopsTracker {
+            fn update(&mut self) {
+                let iops = self.io_stats.lock().unwrap().read_iops;
+                self.new_iops = iops - self.baseline;
+                self.baseline = iops;
+            }
+
+            fn new_iops(&mut self) -> u64 {
+                self.update();
+                self.new_iops
+            }
+        }
+
+        let mut tracker = IopsTracker {
+            baseline: 0,
+            new_iops: 0,
+            io_stats,
+        };
+
+        // First planning cycle needs to do some I/O to determine what scalar indices are available
+        dataset
+            .scan()
+            .prefilter(true)
+            .filter("indexed > 10")
+            .unwrap()
+            .explain_plan(true)
+            .await
+            .unwrap();
+
+        // First pass will need to perform some IOPs to determine what scalar indices are available
+        assert!(tracker.new_iops() > 0);
+
+        // Second planning cycle should not perform any I/O
+        dataset
+            .scan()
+            .prefilter(true)
+            .filter("indexed > 10")
+            .unwrap()
+            .explain_plan(true)
+            .await
+            .unwrap();
+
+        assert_eq!(tracker.new_iops(), 0);
+
+        dataset
+            .scan()
+            .prefilter(true)
+            .filter("true")
+            .unwrap()
+            .explain_plan(true)
+            .await
+            .unwrap();
+
+        assert_eq!(tracker.new_iops(), 0);
+
+        dataset
+            .scan()
+            .prefilter(true)
+            .materialization_style(MaterializationStyle::AllEarly)
+            .filter("true")
+            .unwrap()
+            .explain_plan(true)
+            .await
+            .unwrap();
+
+        assert_eq!(tracker.new_iops(), 0);
+
+        dataset
+            .scan()
+            .prefilter(true)
+            .materialization_style(MaterializationStyle::AllLate)
+            .filter("true")
+            .unwrap()
+            .explain_plan(true)
+            .await
+            .unwrap();
+
+        assert_eq!(tracker.new_iops(), 0);
     }
 }

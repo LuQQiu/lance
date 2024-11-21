@@ -35,14 +35,14 @@ use log::{debug, info, warn};
 /// An source execution node created from an existing stream
 ///
 /// It can only be used once, and will return the stream.  After that the node
-/// is exhuasted.
+/// is exhausted.
 ///
 /// Note: the stream should be finite, otherwise we will report datafusion properties
 /// incorrectly.
 pub struct OneShotExec {
     stream: Mutex<Option<SendableRecordBatchStream>>,
     // We save off a copy of the schema to speed up formatting and so ExecutionPlan::schema & display_as
-    // can still function after exhuasted
+    // can still function after exhausted
     schema: Arc<ArrowSchema>,
     properties: PlanProperties,
 }
@@ -50,7 +50,7 @@ pub struct OneShotExec {
 impl OneShotExec {
     /// Create a new instance from a given stream
     pub fn new(stream: SendableRecordBatchStream) -> Self {
-        let schema = stream.schema().clone();
+        let schema = stream.schema();
         Self {
             stream: Mutex::new(Some(stream)),
             schema: schema.clone(),
@@ -91,7 +91,7 @@ impl DisplayAs for OneShotExec {
         let stream = self.stream.lock().unwrap();
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                let exhausted = if stream.is_some() { "" } else { "EXHUASTED " };
+                let exhausted = if stream.is_some() { "" } else { "EXHAUSTED" };
                 let columns = self
                     .schema
                     .field_names()
@@ -272,7 +272,7 @@ struct OneShotPartitionStream {
 
 impl OneShotPartitionStream {
     fn new(data: SendableRecordBatchStream) -> Self {
-        let schema = data.schema().clone();
+        let schema = data.schema();
         Self {
             data: Arc::new(Mutex::new(Some(data))),
             schema,
@@ -298,7 +298,7 @@ impl SessionContextExt for SessionContext {
         &self,
         data: SendableRecordBatchStream,
     ) -> datafusion::common::Result<DataFrame> {
-        let schema = data.schema().clone();
+        let schema = data.schema();
         let part_stream = Arc::new(OneShotPartitionStream::new(data));
         let provider = StreamingTable::try_new(schema, vec![part_stream])?;
         self.read_table(Arc::new(provider))

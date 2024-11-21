@@ -54,7 +54,7 @@ pub(super) async fn build_partitions(
     pq: ProductQuantizer,
     metric_type: MetricType,
     part_range: Range<u32>,
-    precomputed_partitons: Option<HashMap<u64, u32>>,
+    precomputed_partitions: Option<HashMap<u64, u32>>,
     shuffle_partition_batches: usize,
     shuffle_partition_concurrency: usize,
     precomputed_shuffle_buffers: Option<(Path, Vec<String>)>,
@@ -86,7 +86,7 @@ pub(super) async fn build_partitions(
         data,
         column,
         ivf_transformer.into(),
-        precomputed_partitons,
+        precomputed_partitions,
         ivf.num_partitions() as u32,
         shuffle_partition_batches,
         shuffle_partition_concurrency,
@@ -132,8 +132,9 @@ async fn load_precomputed_partitions(
                 .iter()
                 .zip(partitions.values().iter())
                 .for_each(|(row_id, partition)| {
-                    let addr = RowAddress::new_from_id(*row_id);
-                    lookup[addr.fragment_id() as usize][addr.row_id() as usize] = *partition as i32;
+                    let addr = RowAddress::from(*row_id);
+                    lookup[addr.fragment_id() as usize][addr.row_offset() as usize] =
+                        *partition as i32;
                 });
             async move { Ok(lookup) }
         })
@@ -157,8 +158,9 @@ fn add_precomputed_partitions(
             .values()
             .iter()
             .filter_map(|row_id| {
-                let addr = RowAddress::new_from_id(*row_id);
-                let part_id = partition_map[addr.fragment_id() as usize][addr.row_id() as usize];
+                let addr = RowAddress::from(*row_id);
+                let part_id =
+                    partition_map[addr.fragment_id() as usize][addr.row_offset() as usize];
                 if part_id < 0 {
                     None
                 } else {
@@ -167,7 +169,7 @@ fn add_precomputed_partitions(
             }),
     );
     let batch = batch
-        .try_with_column(part_id_field.clone(), Arc::new(part_ids.clone()))
+        .try_with_column(part_id_field.clone(), Arc::new(part_ids))
         .expect("failed to add part id column");
     Ok(batch)
 }

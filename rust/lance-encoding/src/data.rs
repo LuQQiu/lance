@@ -14,10 +14,13 @@
 //! slight penalty on encode (to normalize arrow data) but make the development of encoders
 //! and decoders easier (since they can rely on a normalized representation)
 
-use std::{ops::Range, sync::Arc};
+use std::{
+    ops::Range,
+    sync::{Arc, RwLock},
+};
 
 use arrow::array::{ArrayData, ArrayDataBuilder, AsArray};
-use arrow_array::{new_null_array, Array, ArrayRef, UInt64Array};
+use arrow_array::{new_empty_array, new_null_array, Array, ArrayRef, UInt64Array};
 use arrow_buffer::{ArrowNativeType, BooleanBuffer, BooleanBufferBuilder, NullBuffer};
 use arrow_schema::DataType;
 use lance_arrow::DataTypeExt;
@@ -25,7 +28,10 @@ use snafu::{location, Location};
 
 use lance_core::{Error, Result};
 
-use crate::buffer::LanceBuffer;
+use crate::{
+    buffer::LanceBuffer,
+    statistics::{ComputeStat, Stat},
+};
 
 /// A data block with no buffers where everything is null
 ///
@@ -60,6 +66,33 @@ impl AllNullDataBlock {
     }
 }
 
+use std::collections::HashMap;
+
+// `BlockInfo` stores the statistics of this `DataBlock`, such as `NullCount` for `NullableDataBlock`,
+// `BitWidth` for `FixedWidthDataBlock`, `Cardinality` for all `DataBlock`
+#[derive(Debug, Clone)]
+pub struct BlockInfo(pub Arc<RwLock<HashMap<Stat, Arc<dyn Array>>>>);
+
+impl Default for BlockInfo {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BlockInfo {
+    pub fn new() -> Self {
+        Self(Arc::new(RwLock::new(HashMap::new())))
+    }
+}
+
+impl PartialEq for BlockInfo {
+    fn eq(&self, other: &Self) -> bool {
+        let self_info = self.0.read().unwrap();
+        let other_info = other.0.read().unwrap();
+        *self_info == *other_info
+    }
+}
+
 /// Wraps a data block and adds nullability information to it
 ///
 /// Note: this data block should not be used for future work.  It will be deprecated
@@ -71,6 +104,8 @@ pub struct NullableDataBlock {
     pub data: Box<DataBlock>,
     /// A bitmap of validity for each value
     pub nulls: LanceBuffer,
+
+    pub block_info: BlockInfo,
 }
 
 impl NullableDataBlock {
@@ -95,6 +130,7 @@ impl NullableDataBlock {
         Self {
             data: Box::new(self.data.borrow_and_clone()),
             nulls: self.nulls.borrow_and_clone(),
+            block_info: self.block_info.clone(),
         }
     }
 
@@ -102,12 +138,56 @@ impl NullableDataBlock {
         Ok(Self {
             data: Box::new(self.data.try_clone()?),
             nulls: self.nulls.try_clone()?,
+            block_info: self.block_info.clone(),
         })
+    }
+
+    pub fn data_size(&self) -> u64 {
+        self.data.data_size() + self.nulls.len() as u64
+    }
+}
+
+/// A block representing the same constant value repeated many times
+#[derive(Debug, PartialEq)]
+pub struct ConstantDataBlock {
+    /// Data buffer containing the value
+    pub data: LanceBuffer,
+    /// The number of values
+    pub num_values: u64,
+}
+
+impl ConstantDataBlock {
+    fn into_buffers(self) -> Vec<LanceBuffer> {
+        vec![self.data]
+    }
+
+    fn into_arrow(self, _data_type: DataType, _validate: bool) -> Result<ArrayData> {
+        // We don't need this yet but if we come up with some way of serializing
+        // scalars to/from bytes then we could implement it.
+        todo!()
+    }
+
+    pub fn borrow_and_clone(&mut self) -> Self {
+        Self {
+            data: self.data.borrow_and_clone(),
+            num_values: self.num_values,
+        }
+    }
+
+    pub fn try_clone(&self) -> Result<Self> {
+        Ok(Self {
+            data: self.data.try_clone()?,
+            num_values: self.num_values,
+        })
+    }
+
+    pub fn data_size(&self) -> u64 {
+        self.data.len() as u64
     }
 }
 
 /// A data block for a single buffer of data where each element has a fixed number of bits
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct FixedWidthDataBlock {
     /// The data buffer
     pub data: LanceBuffer,
@@ -115,6 +195,8 @@ pub struct FixedWidthDataBlock {
     pub bits_per_value: u64,
     /// The number of values represented by this block
     pub num_values: u64,
+
+    pub block_info: BlockInfo,
 }
 
 impl FixedWidthDataBlock {
@@ -136,28 +218,124 @@ impl FixedWidthDataBlock {
         }
     }
 
-    fn into_arrow(self, data_type: DataType, validate: bool) -> Result<ArrayData> {
+    pub fn into_arrow(self, data_type: DataType, validate: bool) -> Result<ArrayData> {
         let root_num_values = self.num_values;
         self.do_into_arrow(data_type, root_num_values, validate)
     }
 
-    fn into_buffers(self) -> Vec<LanceBuffer> {
+    pub fn into_buffers(self) -> Vec<LanceBuffer> {
         vec![self.data]
     }
 
-    fn borrow_and_clone(&mut self) -> Self {
+    pub fn borrow_and_clone(&mut self) -> Self {
         Self {
             data: self.data.borrow_and_clone(),
             bits_per_value: self.bits_per_value,
             num_values: self.num_values,
+            block_info: self.block_info.clone(),
         }
     }
 
-    fn try_clone(&self) -> Result<Self> {
+    pub fn try_clone(&self) -> Result<Self> {
         Ok(Self {
             data: self.data.try_clone()?,
             bits_per_value: self.bits_per_value,
             num_values: self.num_values,
+            block_info: self.block_info.clone(),
+        })
+    }
+
+    pub fn data_size(&self) -> u64 {
+        self.data.len() as u64
+    }
+}
+
+pub struct VariableWidthDataBlockBuilder {
+    offsets: Vec<u32>,
+    bytes: Vec<u8>,
+}
+
+impl VariableWidthDataBlockBuilder {
+    fn new(estimated_size_bytes: u64) -> Self {
+        Self {
+            offsets: vec![0u32],
+            bytes: Vec::with_capacity(estimated_size_bytes as usize),
+        }
+    }
+}
+
+impl DataBlockBuilderImpl for VariableWidthDataBlockBuilder {
+    fn append(&mut self, data_block: &mut DataBlock, selection: Range<u64>) {
+        let block = data_block.as_variable_width_mut_ref().unwrap();
+        assert!(block.bits_per_offset == 32);
+
+        let offsets = block.offsets.borrow_to_typed_slice::<u32>();
+        let offsets = offsets.as_ref();
+
+        let start_offset = offsets[selection.start as usize];
+        let end_offset = offsets[selection.end as usize];
+        let mut previous_len = self.bytes.len();
+
+        self.bytes
+            .extend_from_slice(&block.data[start_offset as usize..end_offset as usize]);
+
+        self.offsets.extend(
+            offsets[selection.start as usize..selection.end as usize]
+                .iter()
+                .zip(&offsets[selection.start as usize + 1..=selection.end as usize])
+                .map(|(&current, &next)| {
+                    let this_value_len = next - current;
+                    previous_len += this_value_len as usize;
+                    previous_len as u32
+                }),
+        );
+    }
+
+    fn finish(self: Box<Self>) -> DataBlock {
+        let num_values = (self.offsets.len() - 1) as u64;
+        DataBlock::VariableWidth(VariableWidthBlock {
+            data: LanceBuffer::Owned(self.bytes),
+            offsets: LanceBuffer::reinterpret_vec(self.offsets),
+            bits_per_offset: 32,
+            num_values,
+            block_info: BlockInfo::new(),
+        })
+    }
+}
+
+struct FixedWidthDataBlockBuilder {
+    bits_per_value: u64,
+    bytes_per_value: u64,
+    values: Vec<u8>,
+}
+
+impl FixedWidthDataBlockBuilder {
+    fn new(bits_per_value: u64, estimated_size_bytes: u64) -> Self {
+        assert!(bits_per_value % 8 == 0);
+        Self {
+            bits_per_value,
+            bytes_per_value: bits_per_value / 8,
+            values: Vec::with_capacity(estimated_size_bytes as usize),
+        }
+    }
+}
+
+impl DataBlockBuilderImpl for FixedWidthDataBlockBuilder {
+    fn append(&mut self, data_block: &mut DataBlock, selection: Range<u64>) {
+        let block = data_block.as_fixed_width_ref().unwrap();
+        assert_eq!(self.bits_per_value, block.bits_per_value);
+        let start = selection.start as usize * self.bytes_per_value as usize;
+        let end = selection.end as usize * self.bytes_per_value as usize;
+        self.values.extend_from_slice(&block.data[start..end]);
+    }
+
+    fn finish(self: Box<Self>) -> DataBlock {
+        let num_values = (self.values.len() / self.bytes_per_value as usize) as u64;
+        DataBlock::FixedWidth(FixedWidthDataBlock {
+            data: LanceBuffer::Owned(self.values),
+            bits_per_value: self.bits_per_value,
+            num_values,
+            block_info: BlockInfo::new(),
         })
     }
 }
@@ -184,6 +362,13 @@ impl FixedSizeListBlock {
             child: Box::new(self.child.try_clone()?),
             dimension: self.dimension,
         })
+    }
+
+    fn remove_validity(self) -> Self {
+        Self {
+            child: Box::new(self.child.remove_validity()),
+            dimension: self.dimension,
+        }
     }
 
     fn num_values(&self) -> u64 {
@@ -257,6 +442,37 @@ impl FixedSizeListBlock {
     fn into_buffers(self) -> Vec<LanceBuffer> {
         self.child.into_buffers()
     }
+
+    fn data_size(&self) -> u64 {
+        self.child.data_size()
+    }
+}
+
+struct FixedSizeListBlockBuilder {
+    inner: Box<dyn DataBlockBuilderImpl>,
+    dimension: u64,
+}
+
+impl FixedSizeListBlockBuilder {
+    fn new(inner: Box<dyn DataBlockBuilderImpl>, dimension: u64) -> Self {
+        Self { inner, dimension }
+    }
+}
+
+impl DataBlockBuilderImpl for FixedSizeListBlockBuilder {
+    fn append(&mut self, data_block: &mut DataBlock, selection: Range<u64>) {
+        let selection = selection.start * self.dimension..selection.end * self.dimension;
+        let fsl = data_block.as_fixed_size_list_mut_ref().unwrap();
+        self.inner.append(fsl.child.as_mut(), selection);
+    }
+
+    fn finish(self: Box<Self>) -> DataBlock {
+        let inner_block = self.inner.finish();
+        DataBlock::FixedSizeList(FixedSizeListBlock {
+            child: Box::new(inner_block),
+            dimension: self.dimension,
+        })
+    }
 }
 
 /// A data block with no regular structure.  There is no available spot to attach
@@ -266,6 +482,7 @@ impl FixedSizeListBlock {
 pub struct OpaqueBlock {
     pub buffers: Vec<LanceBuffer>,
     pub num_values: u64,
+    pub block_info: BlockInfo,
 }
 
 impl OpaqueBlock {
@@ -277,6 +494,7 @@ impl OpaqueBlock {
                 .map(|b| b.borrow_and_clone())
                 .collect(),
             num_values: self.num_values,
+            block_info: self.block_info.clone(),
         }
     }
 
@@ -288,7 +506,12 @@ impl OpaqueBlock {
                 .map(|b| b.try_clone())
                 .collect::<Result<_>>()?,
             num_values: self.num_values,
+            block_info: self.block_info.clone(),
         })
+    }
+
+    pub fn data_size(&self) -> u64 {
+        self.buffers.iter().map(|b| b.len() as u64).sum()
     }
 }
 
@@ -305,6 +528,8 @@ pub struct VariableWidthBlock {
     pub bits_per_offset: u8,
     /// The number of values represented by this block
     pub num_values: u64,
+
+    pub block_info: BlockInfo,
 }
 
 impl VariableWidthBlock {
@@ -333,6 +558,7 @@ impl VariableWidthBlock {
             offsets: self.offsets.borrow_and_clone(),
             bits_per_offset: self.bits_per_offset,
             num_values: self.num_values,
+            block_info: self.block_info.clone(),
         }
     }
 
@@ -342,7 +568,12 @@ impl VariableWidthBlock {
             offsets: self.offsets.try_clone()?,
             bits_per_offset: self.bits_per_offset,
             num_values: self.num_values,
+            block_info: self.block_info.clone(),
         })
+    }
+
+    pub fn data_size(&self) -> u64 {
+        (self.data.len() + self.offsets.len()) as u64
     }
 }
 
@@ -377,6 +608,16 @@ impl StructDataBlock {
         }
     }
 
+    fn remove_validity(self) -> Self {
+        Self {
+            children: self
+                .children
+                .into_iter()
+                .map(|c| c.remove_validity())
+                .collect(),
+        }
+    }
+
     fn into_buffers(self) -> Vec<LanceBuffer> {
         self.children
             .into_iter()
@@ -406,10 +647,6 @@ impl StructDataBlock {
 }
 
 /// A data block for dictionary encoded data
-///
-/// Note that, unlike Arrow, there is only one canonical place to store nulls, and that is
-/// in the dictionary itself.  This simplifies the representation of dictionary encoded data
-/// and makes it more efficient to encode and decode.
 #[derive(Debug)]
 pub struct DictionaryDataBlock {
     /// The indices buffer
@@ -482,6 +719,8 @@ impl DictionaryDataBlock {
 /// operation as some normalization may be required.
 #[derive(Debug)]
 pub enum DataBlock {
+    Empty(),
+    Constant(ConstantDataBlock),
     AllNull(AllNullDataBlock),
     Nullable(NullableDataBlock),
     FixedWidth(FixedWidthDataBlock),
@@ -496,6 +735,8 @@ impl DataBlock {
     /// Convert self into an Arrow ArrayData
     pub fn into_arrow(self, data_type: DataType, validate: bool) -> Result<ArrayData> {
         match self {
+            Self::Empty() => Ok(new_empty_array(&data_type).to_data()),
+            Self::Constant(inner) => inner.into_arrow(data_type, validate),
             Self::AllNull(inner) => inner.into_arrow(data_type, validate),
             Self::Nullable(inner) => inner.into_arrow(data_type, validate),
             Self::FixedWidth(inner) => inner.into_arrow(data_type, validate),
@@ -515,6 +756,8 @@ impl DataBlock {
     /// The order matters and will be used to reconstruct the data block at read time.
     pub fn into_buffers(self) -> Vec<LanceBuffer> {
         match self {
+            Self::Empty() => Vec::default(),
+            Self::Constant(inner) => inner.into_buffers(),
             Self::AllNull(inner) => inner.into_buffers(),
             Self::Nullable(inner) => inner.into_buffers(),
             Self::FixedWidth(inner) => inner.into_buffers(),
@@ -532,6 +775,8 @@ impl DataBlock {
     /// all buffers will be in Borrowed mode.
     pub fn borrow_and_clone(&mut self) -> Self {
         match self {
+            Self::Empty() => Self::Empty(),
+            Self::Constant(inner) => Self::Constant(inner.borrow_and_clone()),
             Self::AllNull(inner) => Self::AllNull(inner.borrow_and_clone()),
             Self::Nullable(inner) => Self::Nullable(inner.borrow_and_clone()),
             Self::FixedWidth(inner) => Self::FixedWidth(inner.borrow_and_clone()),
@@ -549,6 +794,8 @@ impl DataBlock {
     /// ensure that all buffers are in borrowed mode before calling this method.
     pub fn try_clone(&self) -> Result<Self> {
         match self {
+            Self::Empty() => Ok(Self::Empty()),
+            Self::Constant(inner) => Ok(Self::Constant(inner.try_clone()?)),
             Self::AllNull(inner) => Ok(Self::AllNull(inner.try_clone()?)),
             Self::Nullable(inner) => Ok(Self::Nullable(inner.try_clone()?)),
             Self::FixedWidth(inner) => Ok(Self::FixedWidth(inner.try_clone()?)),
@@ -562,6 +809,8 @@ impl DataBlock {
 
     pub fn name(&self) -> &'static str {
         match self {
+            Self::Constant(_) => "Constant",
+            Self::Empty() => "Empty",
             Self::AllNull(_) => "AllNull",
             Self::Nullable(_) => "Nullable",
             Self::FixedWidth(_) => "FixedWidth",
@@ -575,6 +824,8 @@ impl DataBlock {
 
     pub fn num_values(&self) -> u64 {
         match self {
+            Self::Empty() => 0,
+            Self::Constant(inner) => inner.num_values,
             Self::AllNull(inner) => inner.num_values,
             Self::Nullable(inner) => inner.data.num_values(),
             Self::FixedWidth(inner) => inner.num_values,
@@ -585,11 +836,96 @@ impl DataBlock {
             Self::Opaque(inner) => inner.num_values,
         }
     }
+
+    pub fn data_size(&self) -> u64 {
+        match self {
+            Self::Empty() => 0,
+            Self::Constant(inner) => inner.data_size(),
+            Self::AllNull(_) => 0,
+            Self::Nullable(inner) => inner.data_size(),
+            Self::FixedWidth(inner) => inner.data_size(),
+            Self::FixedSizeList(inner) => inner.data_size(),
+            Self::VariableWidth(inner) => inner.data_size(),
+            Self::Struct(_) => {
+                todo!("the data_size method for StructDataBlock is not implemented yet")
+            }
+            Self::Dictionary(_) => {
+                todo!("the data_size method for DictionaryDataBlock is not implemented yet")
+            }
+            Self::Opaque(inner) => inner.data_size(),
+        }
+    }
+
+    /// Removes any validity information from the block
+    ///
+    /// This does not filter the block (e.g. remove rows).  It only removes
+    /// the validity bitmaps (if present).  Any garbage masked by null bits
+    /// will now appear as proper values.
+    pub fn remove_validity(self) -> Self {
+        match self {
+            Self::Empty() => Self::Empty(),
+            Self::Constant(inner) => Self::Constant(inner),
+            Self::AllNull(_) => panic!("Cannot remove validity on all-null data"),
+            Self::Nullable(inner) => *inner.data,
+            Self::FixedWidth(inner) => Self::FixedWidth(inner),
+            Self::FixedSizeList(inner) => Self::FixedSizeList(inner.remove_validity()),
+            Self::VariableWidth(inner) => Self::VariableWidth(inner),
+            Self::Struct(inner) => Self::Struct(inner.remove_validity()),
+            Self::Dictionary(inner) => Self::FixedWidth(inner.indices),
+            Self::Opaque(inner) => Self::Opaque(inner),
+        }
+    }
+
+    pub fn make_builder(&self, estimated_size_bytes: u64) -> Box<dyn DataBlockBuilderImpl> {
+        match self {
+            Self::FixedWidth(inner) => Box::new(FixedWidthDataBlockBuilder::new(
+                inner.bits_per_value,
+                estimated_size_bytes,
+            )),
+            Self::VariableWidth(inner) => {
+                if inner.bits_per_offset == 32 {
+                    Box::new(VariableWidthDataBlockBuilder::new(estimated_size_bytes))
+                } else {
+                    todo!()
+                }
+            }
+            Self::FixedSizeList(inner) => {
+                let inner_builder = inner.child.make_builder(estimated_size_bytes);
+                Box::new(FixedSizeListBlockBuilder::new(
+                    inner_builder,
+                    inner.dimension,
+                ))
+            }
+            _ => todo!(),
+        }
+    }
 }
 
 macro_rules! as_type {
     ($fn_name:ident, $inner:tt, $inner_type:ident) => {
         pub fn $fn_name(self) -> Option<$inner_type> {
+            match self {
+                Self::$inner(inner) => Some(inner),
+                _ => None,
+            }
+        }
+    };
+}
+
+macro_rules! as_type_ref {
+    ($fn_name:ident, $inner:tt, $inner_type:ident) => {
+        pub fn $fn_name(&self) -> Option<&$inner_type> {
+            match self {
+                Self::$inner(inner) => Some(inner),
+                _ => None,
+            }
+        }
+    };
+}
+
+macro_rules! as_type_ref_mut {
+    ($fn_name:ident, $inner:tt, $inner_type:ident) => {
+        pub fn $fn_name(&mut self) -> Option<&mut $inner_type> {
             match self {
                 Self::$inner(inner) => Some(inner),
                 _ => None,
@@ -607,6 +943,24 @@ impl DataBlock {
     as_type!(as_variable_width, VariableWidth, VariableWidthBlock);
     as_type!(as_struct, Struct, StructDataBlock);
     as_type!(as_dictionary, Dictionary, DictionaryDataBlock);
+    as_type_ref!(as_all_null_ref, AllNull, AllNullDataBlock);
+    as_type_ref!(as_nullable_ref, Nullable, NullableDataBlock);
+    as_type_ref!(as_fixed_width_ref, FixedWidth, FixedWidthDataBlock);
+    as_type_ref!(as_fixed_size_list_ref, FixedSizeList, FixedSizeListBlock);
+    as_type_ref!(as_variable_width_ref, VariableWidth, VariableWidthBlock);
+    as_type_ref!(as_struct_ref, Struct, StructDataBlock);
+    as_type_ref!(as_dictionary_ref, Dictionary, DictionaryDataBlock);
+    as_type_ref_mut!(as_all_null_mut_ref, AllNull, AllNullDataBlock);
+    as_type_ref_mut!(as_nullable_mut_ref, Nullable, NullableDataBlock);
+    as_type_ref_mut!(as_fixed_width_mut_ref, FixedWidth, FixedWidthDataBlock);
+    as_type_ref_mut!(
+        as_fixed_size_list_mut_ref,
+        FixedSizeList,
+        FixedSizeListBlock
+    );
+    as_type_ref_mut!(as_variable_width_mut_ref, VariableWidth, VariableWidthBlock);
+    as_type_ref_mut!(as_struct_mut_ref, Struct, StructDataBlock);
+    as_type_ref_mut!(as_dictionary_mut_ref, Dictionary, DictionaryDataBlock);
 }
 
 // Methods to convert from Arrow -> DataBlock
@@ -671,15 +1025,13 @@ fn arrow_binary_to_data_block(
     num_values: u64,
     bits_per_offset: u8,
 ) -> DataBlock {
-    let datas = arrays.iter().map(|arr| arr.to_data()).collect::<Vec<_>>();
+    let data_vec = arrays.iter().map(|arr| arr.to_data()).collect::<Vec<_>>();
     let bytes_per_offset = bits_per_offset as usize / 8;
-    let offsets = datas
+    let offsets = data_vec
         .iter()
         .map(|d| {
             LanceBuffer::Borrowed(
-                d.buffers()[0]
-                    .slice_with_length(d.offset(), (d.len() + 1) * bytes_per_offset)
-                    .clone(),
+                d.buffers()[0].slice_with_length(d.offset(), (d.len() + 1) * bytes_per_offset),
             )
         })
         .collect::<Vec<_>>();
@@ -688,7 +1040,7 @@ fn arrow_binary_to_data_block(
     } else {
         stitch_offsets::<i64>(offsets)
     };
-    let data = datas
+    let data = data_vec
         .iter()
         .zip(data_ranges)
         .map(|(d, byte_range)| {
@@ -704,6 +1056,7 @@ fn arrow_binary_to_data_block(
         offsets,
         bits_per_offset,
         num_values,
+        block_info: BlockInfo::new(),
     })
 }
 
@@ -868,12 +1221,14 @@ fn arrow_dictionary_to_data_block(arrays: &[ArrayRef], validity: Option<NullBuff
             data: LanceBuffer::Owned(indices_bytes),
             bits_per_value: bits_per_index,
             num_values,
+            block_info: BlockInfo::new(),
         }
     } else {
         FixedWidthDataBlock {
             data: LanceBuffer::Borrowed(indices.to_data().buffers()[0].clone()),
             bits_per_value: indices.data_type().byte_width() as u64 * 8,
             num_values,
+            block_info: BlockInfo::new(),
         }
     };
 
@@ -942,7 +1297,7 @@ impl DataBlock {
             return Self::AllNull(AllNullDataBlock { num_values });
         }
 
-        let encoded = match data_type {
+        let mut encoded = match data_type {
             DataType::Binary | DataType::Utf8 => arrow_binary_to_data_block(arrays, num_values, 32),
             DataType::BinaryView | DataType::Utf8View => {
                 todo!()
@@ -956,6 +1311,7 @@ impl DataBlock {
                     data,
                     bits_per_value: 1,
                     num_values,
+                    block_info: BlockInfo::new(),
                 })
             }
             DataType::Date32
@@ -984,6 +1340,7 @@ impl DataBlock {
                     data,
                     bits_per_value: data_type.byte_width() as u64 * 8,
                     num_values,
+                    block_info: BlockInfo::new(),
                 })
             }
             DataType::Null => Self::AllNull(AllNullDataBlock { num_values }),
@@ -992,11 +1349,11 @@ impl DataBlock {
                 let structs = arrays.iter().map(|arr| arr.as_struct()).collect::<Vec<_>>();
                 let mut children = Vec::with_capacity(fields.len());
                 for child_idx in 0..fields.len() {
-                    let childs = structs
+                    let child_vec = structs
                         .iter()
                         .map(|s| s.column(child_idx).clone())
                         .collect::<Vec<_>>();
-                    children.push(Self::from_arrays(&childs, num_values));
+                    children.push(Self::from_arrays(&child_vec, num_values));
                 }
                 Self::Struct(StructDataBlock { children })
             }
@@ -1024,12 +1381,17 @@ impl DataBlock {
                 )
             }
         };
+
+        // compute statistics
+        encoded.compute_stat();
+
         if !matches!(data_type, DataType::Dictionary(_, _)) {
             match nulls {
                 Nullability::None => encoded,
                 Nullability::Some(nulls) => Self::Nullable(NullableDataBlock {
                     data: Box::new(encoded),
                     nulls: LanceBuffer::Borrowed(nulls.into_inner().into_inner()),
+                    block_info: BlockInfo::new(),
                 }),
                 _ => unreachable!(),
             }
@@ -1052,20 +1414,62 @@ impl From<ArrayRef> for DataBlock {
     }
 }
 
+pub trait DataBlockBuilderImpl {
+    fn append(&mut self, data_block: &mut DataBlock, selection: Range<u64>);
+    fn finish(self: Box<Self>) -> DataBlock;
+}
+
+pub struct DataBlockBuilder {
+    estimated_size_bytes: u64,
+    builder: Option<Box<dyn DataBlockBuilderImpl>>,
+}
+
+impl DataBlockBuilder {
+    pub fn with_capacity_estimate(estimated_size_bytes: u64) -> Self {
+        Self {
+            estimated_size_bytes,
+            builder: None,
+        }
+    }
+
+    fn get_builder(&mut self, block: &DataBlock) -> &mut dyn DataBlockBuilderImpl {
+        if self.builder.is_none() {
+            self.builder = Some(block.make_builder(self.estimated_size_bytes));
+        }
+        self.builder.as_mut().unwrap().as_mut()
+    }
+
+    pub fn append(&mut self, data_block: &mut DataBlock, selection: Range<u64>) {
+        self.get_builder(data_block).append(data_block, selection);
+    }
+
+    pub fn finish(self) -> DataBlock {
+        let builder = self.builder.expect("DataBlockBuilder didn't see any data");
+        builder.finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
-    use arrow::datatypes::Int8Type;
+    use arrow::datatypes::{Int32Type, Int8Type};
     use arrow_array::{
-        ArrayRef, DictionaryArray, Int8Array, LargeBinaryArray, StringArray, UInt8Array,
+        make_array, new_null_array, ArrayRef, DictionaryArray, Int8Array, LargeBinaryArray,
+        StringArray, UInt8Array,
     };
     use arrow_buffer::{BooleanBuffer, NullBuffer};
 
+    use arrow_schema::{DataType, Field, Fields};
+    use lance_datagen::{array, ArrayGeneratorExt, RowCount, DEFAULT_SEED};
+    use rand::SeedableRng;
+
     use crate::buffer::LanceBuffer;
 
-    use super::DataBlock;
+    use super::{AllNullDataBlock, DataBlock};
 
+    use arrow::compute::concat;
+    use arrow_array::Array;
     #[test]
     fn test_string_to_data_block() {
         // Converting string arrays that contain nulls to DataBlock
@@ -1226,7 +1630,6 @@ mod tests {
                 LanceBuffer::reinterpret_vec::<i8>(vec![3, 0, 1, 2, 3])
             );
         };
-        println!("Check one");
         check_common(data);
 
         // However, we can manually create a dictionary where nulls are in the dictionary
@@ -1236,7 +1639,6 @@ mod tests {
 
         let data = DataBlock::from_array(dict);
 
-        println!("Check two");
         check_common(data);
     }
 
@@ -1287,6 +1689,22 @@ mod tests {
     }
 
     #[test]
+    fn test_all_null() {
+        for data_type in [
+            DataType::UInt32,
+            DataType::FixedSizeBinary(2),
+            DataType::List(Arc::new(Field::new("item", DataType::UInt32, true))),
+            DataType::Struct(Fields::from(vec![Field::new("a", DataType::UInt32, true)])),
+        ] {
+            let block = DataBlock::AllNull(AllNullDataBlock { num_values: 10 });
+            let arr = block.into_arrow(data_type.clone(), true).unwrap();
+            let arr = make_array(arr);
+            let expected = new_null_array(&data_type, 10);
+            assert_eq!(&arr, &expected);
+        }
+    }
+
+    #[test]
     fn test_dictionary_cannot_concatenate() {
         // 256 unique strings
         let items = StringArray::from(
@@ -1318,5 +1736,78 @@ mod tests {
             dict.dictionary.as_variable_width().unwrap().data.len(),
             65536
         );
+    }
+
+    #[test]
+    fn test_data_size() {
+        let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(DEFAULT_SEED.0);
+        // test data_size() when input has no nulls
+        let mut gen = array::rand::<Int32Type>().with_nulls(&[false, false, false]);
+
+        let arr = gen.generate(RowCount::from(3), &mut rng).unwrap();
+        let block = DataBlock::from_array(arr.clone());
+        assert!(block.data_size() == arr.get_buffer_memory_size() as u64);
+
+        let arr = gen.generate(RowCount::from(400), &mut rng).unwrap();
+        let block = DataBlock::from_array(arr.clone());
+        assert!(block.data_size() == arr.get_buffer_memory_size() as u64);
+
+        // test data_size() when input has nulls
+        let mut gen = array::rand::<Int32Type>().with_nulls(&[false, true, false]);
+        let arr = gen.generate(RowCount::from(3), &mut rng).unwrap();
+        let block = DataBlock::from_array(arr.clone());
+
+        let array_data = arr.to_data();
+        let total_buffer_size: usize = array_data.buffers().iter().map(|buffer| buffer.len()).sum();
+        // the NullBuffer.len() returns the length in bits so we divide_round_up by 8
+        let array_nulls_size_in_bytes = (arr.nulls().unwrap().len() + 7) / 8;
+        assert!(block.data_size() == (total_buffer_size + array_nulls_size_in_bytes) as u64);
+
+        let arr = gen.generate(RowCount::from(400), &mut rng).unwrap();
+        let block = DataBlock::from_array(arr.clone());
+
+        let array_data = arr.to_data();
+        let total_buffer_size: usize = array_data.buffers().iter().map(|buffer| buffer.len()).sum();
+        let array_nulls_size_in_bytes = (arr.nulls().unwrap().len() + 7) / 8;
+        assert!(block.data_size() == (total_buffer_size + array_nulls_size_in_bytes) as u64);
+
+        let mut gen = array::rand::<Int32Type>().with_nulls(&[true, true, false]);
+        let arr = gen.generate(RowCount::from(3), &mut rng).unwrap();
+        let block = DataBlock::from_array(arr.clone());
+
+        let array_data = arr.to_data();
+        let total_buffer_size: usize = array_data.buffers().iter().map(|buffer| buffer.len()).sum();
+        let array_nulls_size_in_bytes = (arr.nulls().unwrap().len() + 7) / 8;
+        assert!(block.data_size() == (total_buffer_size + array_nulls_size_in_bytes) as u64);
+
+        let arr = gen.generate(RowCount::from(400), &mut rng).unwrap();
+        let block = DataBlock::from_array(arr.clone());
+
+        let array_data = arr.to_data();
+        let total_buffer_size: usize = array_data.buffers().iter().map(|buffer| buffer.len()).sum();
+        let array_nulls_size_in_bytes = (arr.nulls().unwrap().len() + 7) / 8;
+        assert!(block.data_size() == (total_buffer_size + array_nulls_size_in_bytes) as u64);
+
+        let mut gen = array::rand::<Int32Type>().with_nulls(&[false, true, false]);
+        let arr1 = gen.generate(RowCount::from(3), &mut rng).unwrap();
+        let arr2 = gen.generate(RowCount::from(3), &mut rng).unwrap();
+        let arr3 = gen.generate(RowCount::from(3), &mut rng).unwrap();
+        let block = DataBlock::from_arrays(&[arr1.clone(), arr2.clone(), arr3.clone()], 9);
+
+        let concatenated_array = concat(&[
+            &*Arc::new(arr1.clone()) as &dyn Array,
+            &*Arc::new(arr2.clone()) as &dyn Array,
+            &*Arc::new(arr3.clone()) as &dyn Array,
+        ])
+        .unwrap();
+        let total_buffer_size: usize = concatenated_array
+            .to_data()
+            .buffers()
+            .iter()
+            .map(|buffer| buffer.len())
+            .sum();
+
+        let total_nulls_size_in_bytes = (concatenated_array.nulls().unwrap().len() + 7) / 8;
+        assert!(block.data_size() == (total_buffer_size + total_nulls_size_in_bytes) as u64);
     }
 }

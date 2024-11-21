@@ -30,9 +30,9 @@ use lance_arrow::RecordBatchExt;
 use lance_core::cache::{CapacityMode, FileMetadataCache};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{datatypes::Schema, Error, Result, ROW_ID};
-use lance_encoding::decoder::{DecoderMiddlewareChain, FilterExpression};
+use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::reader::FileReader;
-use lance_file::v2::reader::FileReader as Lancev2FileReader;
+use lance_file::v2::reader::{FileReader as Lancev2FileReader, FileReaderOptions};
 use lance_file::v2::writer::FileWriterOptions;
 use lance_file::writer::FileWriter;
 use lance_io::object_store::ObjectStore;
@@ -475,6 +475,9 @@ impl IvfShuffler {
             location!(),
         ))?;
 
+        info!("Writing unsorted data to disk at {}", path);
+        info!("with schema: {:?}", schema);
+
         let mut file_writer = FileWriter::<ManifestDescribing>::with_object_writer(
             writer,
             Schema::try_from(schema.as_ref())?,
@@ -515,8 +518,14 @@ impl IvfShuffler {
                 let cache =
                     FileMetadataCache::with_capacity(128 * 1024 * 1024, CapacityMode::Bytes);
 
-                let reader =
-                    Lancev2FileReader::try_open(file, None, Default::default(), &cache).await?;
+                let reader = Lancev2FileReader::try_open(
+                    file,
+                    None,
+                    Default::default(),
+                    &cache,
+                    FileReaderOptions::default(),
+                )
+                .await?;
                 let num_batches = reader.metadata().num_rows / (SHUFFLE_BATCH_SIZE as u64);
                 total_batches.push(num_batches as usize);
             }
@@ -569,6 +578,7 @@ impl IvfShuffler {
                     None,
                     Default::default(),
                     &FileMetadataCache::no_cache(),
+                    FileReaderOptions::default(),
                 )
                 .await?;
                 let mut stream = reader
@@ -640,6 +650,7 @@ impl IvfShuffler {
                     None,
                     Default::default(),
                     &FileMetadataCache::no_cache(),
+                    FileReaderOptions::default(),
                 )
                 .await?;
                 reader
@@ -723,7 +734,7 @@ impl IvfShuffler {
                             continue;
                         }
 
-                        // the currnet part doesn't overlap with the current batch
+                        // the current part doesn't overlap with the current batch
                         if start >= cur_end {
                             continue;
                         }
@@ -812,8 +823,9 @@ impl IvfShuffler {
             let reader = lance_file::v2::reader::FileReader::try_open(
                 file_scheduler,
                 None,
-                Arc::<DecoderMiddlewareChain>::default(),
+                Arc::<DecoderPlugins>::default(),
                 &FileMetadataCache::no_cache(),
+                FileReaderOptions::default(),
             )
             .await?;
             let stream = reader
@@ -924,7 +936,7 @@ mod test {
                 )
             });
 
-        let stream = RecordBatchStreamAdapter::new(schema.clone(), stream);
+        let stream = RecordBatchStreamAdapter::new(schema, stream);
 
         let shuffler = IvfShuffler::try_new(100, None, true, None).unwrap();
 
@@ -1124,7 +1136,7 @@ mod test {
             Ok(RecordBatch::try_new(schema2.clone(), vec![row_ids, part_id, pq_codes]).unwrap())
         });
 
-        let stream = RecordBatchStreamAdapter::new(schema.clone(), stream);
+        let stream = RecordBatchStreamAdapter::new(schema, stream);
 
         let shuffler = IvfShuffler::try_new(num_partitions, None, true, None).unwrap();
 

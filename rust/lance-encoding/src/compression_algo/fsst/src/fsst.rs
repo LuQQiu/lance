@@ -18,8 +18,11 @@ const FSST_CODE_MASK: u16 = FSST_CODE_MAX - 1;
 const FSST_SAMPLETARGET: usize = 1 << 14;
 const FSST_SAMPLEMAXSZ: usize = 2 * FSST_SAMPLETARGET;
 
-// the the input size is less than 4MB, we mark the file header and copy the input to the output as is
-const FSST_LEAST_INPUT_SIZE: usize = 4 * 1024 * 1024; // 4MB
+// if the input size is less than 4MB, we mark the file header and copy the input to the output as is
+pub const FSST_LEAST_INPUT_SIZE: usize = 4 * 1024 * 1024; // 4MB
+
+// if the max length of the input strings are less than `FSST_LEAST_INPUT_MAX_LENGTH`, we shouldn't use FSST.
+pub const FSST_LEAST_INPUT_MAX_LENGTH: u64 = 5;
 
 // we only use the lower 32 bits in icl, so we can use 1 << 32 to represent a free slot in the hash table
 const FSST_ICL_FREE: u64 = 1 << 32;
@@ -387,7 +390,7 @@ impl SymbolTable {
 
     // rationale for finalize:
     // - during symbol table construction, we may create more than 256 codes, but bring it down to max 255 in the last makeTable()
-    //   consequently we needed more than 8 bits during symbol table contruction, but can simplify the codes to single bytes in finalize()
+    //   consequently we needed more than 8 bits during symbol table construction, but can simplify the codes to single bytes in finalize()
     //   (this feature is in fact lo longer used, but could still be exploited: symbol construction creates no more than 255 symbols in each pass)
     // - we not only reduce the amount of codes to <255, but also *reorder* the symbols and renumber their codes, for higher compression perf.
     //   we renumber codes so they are grouped by length, to allow optimized scalar string compression (byteLim and suffixLim optimizations).
@@ -1467,32 +1470,32 @@ But exactly how the acquaintance and friendship came about, we cannot say.";
 
     #[test_log::test(tokio::test)]
     async fn test_fsst() {
-        let test_input_size = 8 * 1024 * 1024;
+        let test_input_size = 1024 * 1024;
         let repeat_num = test_input_size / TEST_PARAGRAPH.len();
         let test_input = TEST_PARAGRAPH.repeat(repeat_num);
         helper(&test_input);
 
-        let test_input_size = 16 * 1024 * 1024;
+        let test_input_size = 2 * 1024 * 1024;
         let repeat_num = test_input_size / TEST_PARAGRAPH.len();
         let test_input = TEST_PARAGRAPH.repeat(repeat_num);
         helper(&test_input);
 
-        let test_input_size = 8 * 1024 * 1024;
+        let test_input_size = 1024 * 1024;
         let repeat_num = test_input_size / TEST_PARAGRAPH2.len();
         let test_input = TEST_PARAGRAPH.repeat(repeat_num);
         helper(&test_input);
 
-        let test_input_size = 16 * 1024 * 1024;
+        let test_input_size = 2 * 1024 * 1024;
         let repeat_num = test_input_size / TEST_PARAGRAPH2.len();
         let test_input = TEST_PARAGRAPH2.repeat(repeat_num);
         helper(&test_input);
 
-        let test_input_size = 8 * 1024 * 1024;
+        let test_input_size = 1024 * 1024;
         let repeat_num = test_input_size / TEST_PARAGRAPH3.len();
         let test_input = TEST_PARAGRAPH3.repeat(repeat_num); // Also corrected `repea_num` to `repeat_num`
         helper(&test_input);
 
-        let test_input_size = 16 * 1024 * 1024;
+        let test_input_size = 2 * 1024 * 1024;
         let repeat_num = test_input_size / TEST_PARAGRAPH3.len();
         let test_input = TEST_PARAGRAPH3.repeat(repeat_num); // Also corrected `repea_num` to `repeat_num`
         helper(&test_input);

@@ -11,6 +11,7 @@ use lance_arrow::DataTypeExt;
 use lance_core::{Error, Result};
 use snafu::{location, Location};
 
+use crate::data::BlockInfo;
 use crate::data::FixedSizeListBlock;
 use crate::format::ProtobufUtils;
 use crate::{
@@ -145,6 +146,7 @@ impl PrimitivePageDecoder for PackedStructPageDecoder {
                 data: LanceBuffer::from(field_bytes),
                 bits_per_value: bytes_per_field as u64 * 8,
                 num_values: num_rows,
+                block_info: BlockInfo::new(),
             };
             let child_block = FixedSizeListBlock::from_flat(child_block, field.data_type());
             children.push(child_block);
@@ -188,7 +190,7 @@ impl ArrayEncoder for PackedStructEncoder {
             encoded_fields.push(encoder.encode(child, child_type.data_type(), &mut 0)?);
         }
 
-        let (encoded_datas, child_encodings): (Vec<_>, Vec<_>) = encoded_fields
+        let (encoded_data_vec, child_encodings): (Vec<_>, Vec<_>) = encoded_fields
             .into_iter()
             .map(|field| (field.data, field.encoding))
             .unzip();
@@ -198,7 +200,7 @@ impl ArrayEncoder for PackedStructEncoder {
         // We can currently encode both FixedWidth and FixedSizeList.  In order
         // to encode the latter we "flatten" it converting a FixedSizeList into
         // a FixedWidth with very wide items.
-        let fixed_fields = encoded_datas
+        let fixed_fields = encoded_data_vec
             .into_iter()
             .map(|child| match child {
                 DataBlock::FixedWidth(fixed) => Ok(fixed),
@@ -238,6 +240,7 @@ impl ArrayEncoder for PackedStructEncoder {
             data: zipped,
             bits_per_value: total_bits_per_value,
             num_values,
+            block_info: BlockInfo::new(),
         });
 
         let encoding = ProtobufUtils::packed_struct(child_encodings, index);
@@ -259,8 +262,9 @@ pub mod tests {
     use arrow_schema::{DataType, Field, Fields};
     use std::{collections::HashMap, sync::Arc, vec};
 
-    use crate::testing::{
-        check_round_trip_encoding_of_data, check_round_trip_encoding_random, TestCases,
+    use crate::{
+        testing::{check_round_trip_encoding_of_data, check_round_trip_encoding_random, TestCases},
+        version::LanceFileVersion,
     };
 
     #[test_log::test(tokio::test)]
@@ -269,12 +273,12 @@ pub mod tests {
             Field::new("a", DataType::UInt64, false),
             Field::new("b", DataType::UInt32, false),
         ]));
-        let field = Field::new("", data_type, false);
-
         let mut metadata = HashMap::new();
         metadata.insert("packed".to_string(), "true".to_string());
 
-        check_round_trip_encoding_random(field, metadata).await;
+        let field = Field::new("", data_type, false).with_metadata(metadata);
+
+        check_round_trip_encoding_random(field, LanceFileVersion::V2_0).await;
     }
 
     #[test_log::test(tokio::test)]

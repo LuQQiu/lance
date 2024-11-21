@@ -21,13 +21,18 @@ use arrow_array::RecordBatchReader;
 use arrow_schema::Schema as ArrowSchema;
 use futures::TryFutureExt;
 use lance::dataset::fragment::FileFragment as LanceFragment;
+use lance::dataset::transaction::Operation;
+use lance::dataset::{InsertBuilder, NewColumnTransform, WriteDestination};
+use lance::Error;
 use lance_table::format::{DataFile as LanceDataFile, Fragment as LanceFragmentMetadata};
 use lance_table::io::deletion::deletion_file_path;
 use pyo3::prelude::*;
 use pyo3::{exceptions::*, pyclass::CompareOp, types::PyDict};
+use snafu::{location, Location};
 
-use crate::dataset::get_write_params;
-use crate::updater::Updater;
+use crate::dataset::{get_write_params, transforms_from_python};
+use crate::error::PythonErrorExt;
+use crate::schema::LanceSchema;
 use crate::{Dataset, Scanner, RT};
 
 #[pyclass(name = "_Fragment", module = "_lib")]
@@ -210,14 +215,43 @@ impl FileFragment {
         Ok(Scanner::new(scn))
     }
 
-    fn updater(&self, columns: Option<Vec<String>>, batch_size: Option<u32>) -> PyResult<Updater> {
-        let cols = columns.as_deref();
-        let inner = RT
-            .block_on(None, async {
-                self.fragment.updater(cols, None, batch_size).await
+    fn add_columns_from_reader(
+        &mut self,
+        reader: &Bound<PyAny>,
+        batch_size: Option<u32>,
+    ) -> PyResult<(FragmentMetadata, LanceSchema)> {
+        let batches = ArrowArrayStreamReader::from_pyarrow_bound(reader)?;
+
+        let transforms = NewColumnTransform::Reader(Box::new(batches));
+
+        let fragment = self.fragment.clone();
+        let (fragment, schema) = RT
+            .spawn(None, async move {
+                fragment.add_columns(transforms, None, batch_size).await
             })?
-            .map_err(|err| PyIOError::new_err(err.to_string()))?;
-        Ok(Updater::new(inner))
+            .infer_error()?;
+
+        Ok((FragmentMetadata::new(fragment), LanceSchema(schema)))
+    }
+
+    fn add_columns(
+        &mut self,
+        transforms: &PyAny,
+        read_columns: Option<Vec<String>>,
+        batch_size: Option<u32>,
+    ) -> PyResult<(FragmentMetadata, LanceSchema)> {
+        let transforms = transforms_from_python(transforms)?;
+
+        let fragment = self.fragment.clone();
+        let (fragment, schema) = RT
+            .spawn(None, async move {
+                fragment
+                    .add_columns(transforms, read_columns, batch_size)
+                    .await
+            })?
+            .infer_error()?;
+
+        Ok((FragmentMetadata::new(fragment), LanceSchema(schema)))
     }
 
     fn delete(&self, predicate: &str) -> PyResult<Option<Self>> {
@@ -423,9 +457,9 @@ impl FragmentMetadata {
 }
 
 #[pyfunction(name = "_write_fragments")]
-#[pyo3(signature = (dataset_uri, reader, **kwargs))]
+#[pyo3(signature = (dest, reader, **kwargs))]
 pub fn write_fragments(
-    dataset_uri: &str,
+    dest: &Bound<PyAny>,
     reader: &Bound<PyAny>,
     kwargs: Option<&PyDict>,
 ) -> PyResult<Vec<FragmentMetadata>> {
@@ -436,11 +470,37 @@ pub fn write_fragments(
         .transpose()?
         .unwrap_or_default();
 
-    let fragments = RT
-        .block_on(Some(reader.py()), async {
-            lance::dataset::write_fragments(dataset_uri, batches, params).await
-        })?
+    let dest = if dest.is_instance_of::<Dataset>() {
+        let dataset: Dataset = dest.extract()?;
+        WriteDestination::Dataset(dataset.ds.clone())
+    } else {
+        WriteDestination::Uri(dest.extract()?)
+    };
+
+    let written = RT
+        .block_on(
+            Some(reader.py()),
+            InsertBuilder::new(dest)
+                .with_params(&params)
+                .execute_uncommitted_stream(batches),
+        )?
         .map_err(|err| PyIOError::new_err(err.to_string()))?;
+
+    assert!(
+        written.blobs_op.is_none(),
+        "Blob writing is not yet supported by the python _write_fragments API"
+    );
+
+    let get_fragments = |operation| match operation {
+        Operation::Overwrite { fragments, .. } => Ok(fragments),
+        Operation::Append { fragments, .. } => Ok(fragments),
+        _ => Err(Error::Internal {
+            message: "Unexpected operation".into(),
+            location: location!(),
+        }),
+    };
+    let fragments =
+        get_fragments(written.operation).map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
 
     fragments
         .into_iter()

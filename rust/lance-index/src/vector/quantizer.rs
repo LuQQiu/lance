@@ -77,7 +77,7 @@ impl std::fmt::Display for QuantizationType {
     }
 }
 
-pub trait QuantizerBuildParams {
+pub trait QuantizerBuildParams: Send + Sync {
     fn sample_size(&self) -> usize;
     fn use_residual(_: DistanceType) -> bool {
         false
@@ -161,6 +161,7 @@ pub struct QuantizationMetadata {
     // For PQ
     pub codebook_position: Option<usize>,
     pub codebook: Option<FixedSizeListArray>,
+    pub transposed: bool,
 }
 
 #[async_trait]

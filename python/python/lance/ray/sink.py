@@ -41,8 +41,9 @@ def _pd_to_arrow(
         return pa.Table.from_pydict(df, schema=schema)
     if _PANDAS_AVAILABLE and isinstance(df, pd.DataFrame):
         tbl = pa.Table.from_pandas(df, schema=schema)
-        tbl.schema = tbl.schema.remove_metadata()
-        return tbl
+        new_schema = tbl.schema.remove_metadata()
+        new_table = tbl.replace_schema_metadata(new_schema.metadata)
+        return new_table
     return df
 
 
@@ -351,7 +352,7 @@ class LanceFragmentWriter:
 
 
 class LanceCommitter(_BaseLanceDatasink):
-    """Lance Commiter as Ray Datasink.
+    """Lance Committer as Ray Datasink.
 
     This is used with `LanceFragmentWriter` to write large-than-memory data to
     lance file.
@@ -362,7 +363,7 @@ class LanceCommitter(_BaseLanceDatasink):
         return 1
 
     def get_name(self) -> str:
-        return f"LanceCommiter({self.mode})"
+        return f"LanceCommitter({self.mode})"
 
     def write(
         self,

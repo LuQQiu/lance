@@ -15,9 +15,17 @@ pub mod decoder;
 pub mod encoder;
 pub mod encodings;
 pub mod format;
+pub mod repdef;
+pub mod statistics;
 #[cfg(test)]
 pub mod testing;
 pub mod version;
+
+// We can definitely add support for big-endian machines someday.  However, it's not a priority and
+// would involve extensive testing (probably through emulation) to ensure that the encodings are
+// correct.
+#[cfg(not(target_endian = "little"))]
+compile_error!("Lance encodings only support little-endian systems.");
 
 /// A trait for an I/O service
 ///
@@ -41,6 +49,9 @@ pub trait EncodingsIo: std::fmt::Debug + Send + Sync {
     /// This is important in cases where indirect I/O causes high priority requests to be submitted
     /// after low priority requests.  We want to fulfill the indirect I/O more quickly so that we
     /// can decode as quickly as possible.
+    ///
+    /// The implementation should be able to handle empty ranges, and should return an empty
+    /// byte buffer for each empty range.
     fn submit_request(
         &self,
         range: Vec<Range<u64>>,

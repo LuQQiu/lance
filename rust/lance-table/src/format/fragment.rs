@@ -91,7 +91,7 @@ impl DataFile {
     }
 
     pub fn schema(&self, full_schema: &Schema) -> Schema {
-        full_schema.project_by_ids(&self.fields)
+        full_schema.project_by_ids(&self.fields, false)
     }
 
     pub fn is_legacy_file(&self) -> bool {
@@ -475,7 +475,7 @@ mod tests {
         });
 
         let proto = pb::DataFragment::from(&fragment);
-        let fragment2 = Fragment::try_from(proto.clone()).unwrap();
+        let fragment2 = Fragment::try_from(proto).unwrap();
         assert_eq!(fragment, fragment2);
 
         fragment.deletion_file = None;

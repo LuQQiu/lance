@@ -36,6 +36,7 @@ use lance_file::{
 };
 use lance_index::vector::flat::index::{FlatIndex, FlatQuantizer};
 use lance_index::vector::ivf::storage::IvfModel;
+use lance_index::vector::pq::storage::transpose;
 use lance_index::vector::quantizer::QuantizationType;
 use lance_index::vector::v3::shuffler::IvfShuffler;
 use lance_index::vector::v3::subindex::{IvfSubIndex, SubIndexType};
@@ -94,11 +95,12 @@ pub mod io;
 pub mod v2;
 
 /// IVF Index.
+/// WARNING: Internal API with no stability guarantees.
 pub struct IVFIndex {
     uuid: String,
 
     /// Ivf model
-    ivf: IvfModel,
+    pub ivf: IvfModel,
 
     reader: Arc<dyn Reader>,
 
@@ -107,7 +109,7 @@ pub struct IVFIndex {
 
     partition_locks: PartitionLoadLock,
 
-    metric_type: MetricType,
+    pub metric_type: MetricType,
 
     // The session cache holds an Arc to this object so we need to
     // hold a weak pointer to avoid cycles
@@ -1072,7 +1074,7 @@ fn sanity_check<'a>(dataset: &'a Dataset, column: &str) -> Result<&'a Field> {
 }
 
 fn sanity_check_ivf_params(ivf: &IvfBuildParams) -> Result<()> {
-    if ivf.precomputed_partitons_file.is_some() && ivf.centroids.is_none() {
+    if ivf.precomputed_partitions_file.is_some() && ivf.centroids.is_none() {
         return Err(Error::Index {
             message: "precomputed_partitions_file requires centroids to be set".to_string(),
             location: location!(),
@@ -1086,10 +1088,10 @@ fn sanity_check_ivf_params(ivf: &IvfBuildParams) -> Result<()> {
         });
     }
 
-    if ivf.precomputed_shuffle_buffers.is_some() && ivf.precomputed_partitons_file.is_some() {
+    if ivf.precomputed_shuffle_buffers.is_some() && ivf.precomputed_partitions_file.is_some() {
         return Err(Error::Index {
             message:
-                "precomputed_shuffle_buffers and precomputed_partitons_file are mutually exclusive"
+                "precomputed_shuffle_buffers and precomputed_partitions_file are mutually exclusive"
                     .to_string(),
             location: location!(),
         });
@@ -1232,7 +1234,7 @@ async fn scan_index_field_stream(
 async fn load_precomputed_partitions_if_available(
     ivf_params: &IvfBuildParams,
 ) -> Result<Option<HashMap<u64, u32>>> {
-    match &ivf_params.precomputed_partitons_file {
+    match &ivf_params.precomputed_partitions_file {
         Some(file) => {
             info!("Loading precomputed partitions from file: {}", file);
             let mut builder = DatasetBuilder::from_uri(file);
@@ -1357,7 +1359,12 @@ impl RemapPageTask {
         ivf.offsets.push(writer.tell().await?);
         ivf.lengths
             .push(page.row_ids.as_ref().unwrap().len() as u32);
-        PlainEncoder::write(writer, &[page.code.as_ref().unwrap().as_ref()]).await?;
+        let original_pq = transpose(
+            page.code.as_ref().unwrap(),
+            page.pq.code_dim(),
+            page.row_ids.as_ref().unwrap().len(),
+        );
+        PlainEncoder::write(writer, &[&original_pq]).await?;
         PlainEncoder::write(writer, &[page.row_ids.as_ref().unwrap().as_ref()]).await?;
         Ok(())
     }
@@ -1755,6 +1762,7 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::index::prefilter::DatasetPreFilter;
+    use crate::index::vector_index_details;
     use crate::index::{vector::VectorIndexParams, DatasetIndexExt, DatasetIndexInternalExt};
 
     const DIM: usize = 32;
@@ -1912,8 +1920,8 @@ mod tests {
             let array = Arc::new(
                 FixedSizeListArray::try_new_from_values(vectors_array.clone(), dim as i32).unwrap(),
             );
-            let batch = RecordBatch::try_new(schema.clone(), vec![array.clone()]).unwrap();
-            RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone())
+            let batch = RecordBatch::try_new(schema.clone(), vec![array]).unwrap();
+            RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema)
         }
 
         async fn generate_dataset(&mut self, test_uri: &str) -> Result<Dataset> {
@@ -2132,6 +2140,7 @@ mod tests {
             fields: Vec::new(),
             name: INDEX_NAME.to_string(),
             fragment_bitmap: None,
+            index_details: Some(vector_index_details()),
         };
 
         let prefilter = Arc::new(DatasetPreFilter::new(dataset.clone(), &[index_meta], None));
@@ -2805,7 +2814,6 @@ mod tests {
                 .unwrap()
                 .as_primitive::<UInt64Type>()
                 .value(0);
-            println!("Row id: {} query_id: {}", row_id, query_id);
             if row_id == (query_id as u64) {
                 correct_times += 1;
             }

@@ -70,6 +70,8 @@ fn check_vector_column(schema: &Schema, column: &str) -> Result<()> {
 /// Preconditions:
 /// - `input` schema must contains `query.column`,
 /// - The column must be a vector column.
+///
+/// WARNING: Internal API with no stability guarantees.
 #[derive(Debug)]
 pub struct KNNVectorDistanceExec {
     /// Inner input node.
@@ -208,7 +210,7 @@ impl ExecutionPlan for KNNVectorDistanceExec {
         let column_statistics = inner_stats
             .column_statistics
             .into_iter()
-            .chain([dist_col_stats.clone()])
+            .chain([dist_col_stats])
             .collect::<Vec<_>>();
         Ok(Statistics {
             num_rows: inner_stats.num_rows,
@@ -229,7 +231,7 @@ lazy_static::lazy_static! {
         ROW_ID_FIELD.clone(),
     ]));
 
-    static ref KNN_PARTITION_SCHEMA: SchemaRef = Arc::new(Schema::new(vec![
+    pub static ref KNN_PARTITION_SCHEMA: SchemaRef = Arc::new(Schema::new(vec![
         Field::new(PART_ID_COLUMN, DataType::List(Field::new("item", DataType::UInt32, false).into()), false),
         Field::new(INDEX_UUID_COLUMN, DataType::Utf8, false),
     ]));
@@ -274,15 +276,15 @@ pub fn new_knn_exec(
 /// ```
 #[derive(Debug)]
 pub struct ANNIvfPartitionExec {
-    dataset: Arc<Dataset>,
+    pub dataset: Arc<Dataset>,
 
     /// The vector query to execute.
-    query: Query,
+    pub query: Query,
 
     /// The UUIDs of the indices to search.
-    index_uuids: Vec<String>,
+    pub index_uuids: Vec<String>,
 
-    properties: PlanProperties,
+    pub properties: PlanProperties,
 }
 
 impl ANNIvfPartitionExec {
@@ -577,7 +579,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
             .try_flatten();
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
-            schema.clone(),
+            schema,
             per_index_stream
                 .and_then(move |(part_ids, index_uuid)| {
                     let ds = ds.clone();
@@ -787,7 +789,6 @@ mod tests {
             DistanceType::L2,
         )
         .unwrap();
-        println!("{:?}", idx);
         assert_eq!(
             idx.schema().as_ref(),
             &ArrowSchema::new(vec![

@@ -121,7 +121,7 @@ fn inner_create_scanner<'local>(
 
     let mut scanner = dataset_guard.inner.scan();
 
-    // handle frament_ids
+    // handle fragment_ids
     if let Some(fragment_ids) = fragment_ids_opt {
         let mut fragments = Vec::with_capacity(fragment_ids.len());
         for fragment_id in fragment_ids {
@@ -143,7 +143,7 @@ fn inner_create_scanner<'local>(
 
     let substrait_opt = env.get_bytes_opt(&substrait_filter_obj)?;
     if let Some(substrait) = substrait_opt {
-        RT.block_on(async { scanner.filter_substrait(substrait).await })?;
+        RT.block_on(async { scanner.filter_substrait(substrait) })?;
     }
 
     let filter_opt = env.get_string_opt(&filter_obj)?;

@@ -4,7 +4,7 @@
 //! Benchmark of HNSW graph.
 //!
 //!
-
+#![allow(clippy::print_stdout)]
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -58,9 +58,7 @@ async fn main() {
         let mut dataset = Dataset::write(batches, dataset_dir.as_ref(), None)
             .await
             .unwrap();
-        let params = InvertedIndexParams {
-            with_position: true,
-        };
+        let params = InvertedIndexParams::default();
         let start = std::time::Instant::now();
         dataset
             .create_index(
@@ -110,7 +108,7 @@ async fn main() {
         .try_into_batch()
         .await
         .unwrap();
-    let flat_results = flat_full_text_search(&[&batch], "doc", &query.query)
+    let flat_results = flat_full_text_search(&[&batch], "doc", &query.query, None)
         .unwrap()
         .into_iter()
         .collect::<HashSet<_>>();

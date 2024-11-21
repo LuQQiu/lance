@@ -39,7 +39,7 @@ const BACKPRESSURE_DEBOUNCE: u64 = 60;
 //
 // The process-wide limit exists when users need a hard limit on the number of parallel
 // IOPS, e.g. due to port availability limits or to prevent multiple scans from saturating
-// the network.  (Note: a process-wide limit of X will not neccesarily limit the number of
+// the network.  (Note: a process-wide limit of X will not necessarily limit the number of
 // open TCP connections to exactly X.  The underlying object store may open more connections
 // anyways)
 //
@@ -292,7 +292,7 @@ impl IoQueue {
                 // Next, try and grab a reservation from the queue
                 let mut state = self.state.lock().unwrap();
                 if let Some(task) = state.next_task() {
-                    // Reservation sucessfully acquired, we will release the global
+                    // Reservation successfully acquired, we will release the global
                     // global reservation after task has run.
                     iop_res.forget();
                     return Some(task);
@@ -450,10 +450,14 @@ impl IoTask {
     }
 
     async fn run(self) {
-        let bytes_fut = self
-            .reader
-            .get_range(self.to_read.start as usize..self.to_read.end as usize);
-        let bytes = bytes_fut.await.map_err(Error::from);
+        let bytes = if self.to_read.start == self.to_read.end {
+            Ok(Bytes::new())
+        } else {
+            let bytes_fut = self
+                .reader
+                .get_range(self.to_read.start as usize..self.to_read.end as usize);
+            bytes_fut.await.map_err(Error::from)
+        };
         IOPS_QUOTA.release();
         (self.when_done)(bytes);
     }
@@ -742,7 +746,7 @@ impl FileScheduler {
 
     /// Submit a single IOP to the reader
     ///
-    /// If you have multpile IOPS to perform then [`Self::submit_request`] is going
+    /// If you have multiple IOPS to perform then [`Self::submit_request`] is going
     /// to be more efficient.
     ///
     /// See [`Self::submit_request`] for more information on the priority and backpressure.

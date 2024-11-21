@@ -53,7 +53,7 @@ pub async fn read_manifest(object_store: &ObjectStore, path: &Path) -> Result<Ma
     let manifest_len = file_size - manifest_pos;
 
     let buf: Bytes = if manifest_len <= buf.len() {
-        // The prefetch catpured the entire manifest. We just need to trim the buffer.
+        // The prefetch captured the entire manifest. We just need to trim the buffer.
         buf.slice(buf.len() - manifest_len..buf.len())
     } else {
         // The prefetch only captured part of the manifest. We need to make an
@@ -201,6 +201,7 @@ impl ManifestProvider for ManifestDescribing {
             schema.clone(),
             Arc::new(vec![]),
             DataStorageFormat::new(LanceFileVersion::Legacy),
+            /*blob_dataset_version= */ None,
         );
         let pos = do_write_manifest(object_writer, &mut manifest, None).await?;
         Ok(Some(pos))
@@ -313,7 +314,16 @@ mod test {
         let arrow_schema =
             ArrowSchema::new(vec![ArrowField::new(long_name, DataType::Int64, false)]);
         let schema = Schema::try_from(&arrow_schema).unwrap();
-        let mut manifest = Manifest::new(schema, Arc::new(vec![]), DataStorageFormat::default());
+
+        let mut config = HashMap::new();
+        config.insert("key".to_string(), "value".to_string());
+
+        let mut manifest = Manifest::new(
+            schema,
+            Arc::new(vec![]),
+            DataStorageFormat::default(),
+            /*blob_dataset_version= */ None,
+        );
         let pos = write_manifest(&mut writer, &mut manifest, None)
             .await
             .unwrap();
