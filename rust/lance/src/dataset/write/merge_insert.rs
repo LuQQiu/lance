@@ -33,17 +33,13 @@ use datafusion::{
     },
     logical_expr::{self, Expr, JoinType},
     physical_plan::{
-        joins::{HashJoinExec, PartitionMode},
-        projection::ProjectionExec,
-        repartition::RepartitionExec,
-        stream::RecordBatchStreamAdapter,
-        union::UnionExec,
-        ColumnarValue, ExecutionPlan, PhysicalExpr, SendableRecordBatchStream,
+        display::DisplayableExecutionPlan, joins::{HashJoinExec, PartitionMode}, projection::ProjectionExec, repartition::RepartitionExec, stream::RecordBatchStreamAdapter, union::UnionExec, ColumnarValue, ExecutionPlan, PhysicalExpr, SendableRecordBatchStream
     },
     prelude::DataFrame,
     scalar::ScalarValue,
 };
 
+use datafusion_expr::LogicalPlanBuilder;
 use lance_arrow::{interleave_batches, RecordBatchExt, SchemaExt};
 use lance_datafusion::{
     chunker::chunk_stream, dataframe::DataFrameExt, exec::get_session_context,
@@ -58,7 +54,7 @@ use futures::{
 use lance_core::{
     datatypes::{OnMissing, OnTypeMismatch, SchemaCompareOptions},
     error::{box_error, InvalidInputSnafu},
-    utils::futures::Capacity,
+    utils::{futures::Capacity, tokio::get_num_compute_intensive_cpus},
     Error, Result, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD,
 };
 use lance_datafusion::{
@@ -623,6 +619,9 @@ impl MergeInsertJob {
                     JoinType::Inner
                 };
                 let joined = new_data.join(projected, join_type, &join_cols, &target_cols, None)?;
+                let physical_plan = joined.clone().create_physical_plan().await?;
+                println!("Physical Plan:\n{}", DisplayableExecutionPlan::new(physical_plan.as_ref()).indent(true));
+
                 Ok(joined.execute_stream().await?)
             }
         }
@@ -665,14 +664,21 @@ impl MergeInsertJob {
         use datafusion::logical_expr::{col, lit};
         let session_ctx = get_session_context(&LanceExecutionOptions {
             use_spilling: true,
+            target_partition: Some(get_num_compute_intensive_cpus().min(3)),
+            mem_pool_size: Some(40*1024*1024),
             ..Default::default()
         });
-        let mut group_stream = session_ctx
+        println!("Session config: {:?}", session_ctx.copied_config());
+        // After creating the dataframe but before executing:
+        let df = session_ctx
             .read_one_shot(source)?
             .with_column("_fragment_id", col(ROW_ADDR) >> lit(32))?
-            .sort(vec![col(ROW_ADDR).sort(true, true)])?
-            .group_by_stream(&["_fragment_id"])
-            .await?;
+            .sort(vec![col(ROW_ADDR).sort(true, true)])?;
+
+        let physical_plan = df.clone().create_physical_plan().await?;
+        println!("Physical Plan for update fragments:\n{}", DisplayableExecutionPlan::new(physical_plan.as_ref()).indent(true));
+
+        let mut group_stream = df.group_by_stream(&["_fragment_id"]).await?;
 
         // Can update the fragments in parallel.
         let updated_fragments = Arc::new(Mutex::new(Vec::new()));
@@ -1514,6 +1520,91 @@ mod tests {
         assert_eq!(merge_stats.num_inserted_rows, stats[0]);
         assert_eq!(merge_stats.num_updated_rows, stats[1]);
         assert_eq!(merge_stats.num_deleted_rows, stats[2]);
+    }
+
+    use std::sync::Arc;
+    use arrow_array::RecordBatch;
+    use arrow_schema::{Schema, Field, DataType};
+    use std::time::Instant;
+
+    // Add slash to URL (equivalent to Python's randomly_add_slash function)
+    fn add_slash(url: &str) -> String {
+        if url.ends_with('/') {
+            url[..url.len()-1].to_string()
+        } else {
+            url.to_string()
+        }
+    }
+
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn test_merge_insert_with_existing_dataset()  {
+        // Path to the existing dataset
+        let dataset_path = "/Users/lu/Projects/test/python/lanceTest/0324/db/wissen.lance";
+
+        println!("Opening dataset: {}", dataset_path);
+        let start = Instant::now();
+        let ds = Dataset::open(dataset_path).await.unwrap();
+        let ds = Arc::new(ds);
+        println!("Dataset opened in {:?}", start.elapsed());
+
+        // Extract data from the dataset
+        println!("Extracting data from dataset...");
+        let batch = ds.scan().project(&["uid", "page_url", "text_url"]).unwrap().try_into_batch().await.unwrap();
+        let total_records = ds.count_rows(None).await.unwrap();
+
+        // Extract columns
+        let uid_array = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+        let page_url_array = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+        let text_url_array = batch.column(2).as_any().downcast_ref::<StringArray>().unwrap();
+
+        // Create update batch with modified URLs
+        println!("Creating update data...");
+        let mut uids = Vec::with_capacity(total_records);
+        let mut page_urls = Vec::with_capacity(total_records);
+        let mut text_urls = Vec::with_capacity(total_records);
+
+        for i in 0..total_records {
+            uids.push(uid_array.value(i).to_string());
+            page_urls.push(add_slash(page_url_array.value(i)));
+            text_urls.push(add_slash(text_url_array.value(i)));
+        }
+
+        // Define schema for our update batch
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("uid", DataType::Utf8, false),
+            Field::new("page_url", DataType::Utf8, false),
+            Field::new("text_url", DataType::Utf8, false),
+        ]));
+
+        let update_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(uids)),
+                Arc::new(StringArray::from(page_urls)),
+                Arc::new(StringArray::from(text_urls)),
+            ],
+        ).unwrap();
+
+        // Perform merge insert operation
+        println!("Performing merge_insert on {} records...", total_records);
+        let start = Instant::now();
+
+        // Create the MergeInsertBuilder with "uid" as the key
+        let keys = vec!["uid".to_string()];
+
+        let job = MergeInsertBuilder::try_new(ds.clone(), keys).unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .try_build().unwrap();
+
+        // Create iterator from the single update batch
+        let update_iterator = RecordBatchIterator::new([Ok(update_batch)], schema.clone());
+
+        // Execute the merge operation
+        let (updated_ds, stats) = job
+            .execute_reader(Box::new(update_iterator))
+            .await.unwrap();
     }
 
     #[rstest::rstest]

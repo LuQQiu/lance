@@ -182,6 +182,7 @@ pub struct LanceExecutionOptions {
     pub use_spilling: bool,
     pub mem_pool_size: Option<u64>,
     pub batch_size: Option<usize>,
+    pub target_partition: Option<usize>
 }
 
 const DEFAULT_LANCE_MEM_POOL_SIZE: u64 = 100 * 1024 * 1024;
@@ -215,8 +216,13 @@ impl LanceExecutionOptions {
 }
 
 pub fn new_session_context(options: &LanceExecutionOptions) -> SessionContext {
-    let session_config = SessionConfig::new();
+    let mut session_config = SessionConfig::new();
     let mut runtime_env_builder = RuntimeEnvBuilder::new();
+    if let Some(target_partition) = options.target_partition {
+        session_config = session_config.with_target_partitions(target_partition);
+    }
+    println!("mem_pool_size: {}", options.mem_pool_size());
+    println!("use_spilling: {}", options.use_spilling());
     if options.use_spilling() {
         runtime_env_builder = runtime_env_builder
             .with_disk_manager(DiskManagerConfig::new())
@@ -241,6 +247,9 @@ lazy_static! {
 
 pub fn get_session_context(options: &LanceExecutionOptions) -> SessionContext {
     let session_ctx: SessionContext;
+    if options.target_partition.is_some() {
+        return new_session_context(options);
+    }
     if options.mem_pool_size() == DEFAULT_LANCE_MEM_POOL_SIZE {
         if options.use_spilling() {
             session_ctx = DEFAULT_SESSION_CONTEXT_WITH_SPILLING.clone();
