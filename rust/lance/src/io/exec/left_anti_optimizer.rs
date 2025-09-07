@@ -59,9 +59,9 @@ impl LeftAntiOptimizer {
                 // Swap the on columns as well
                 (Arc::clone(r), Arc::clone(l))
             }).collect(),
-            hash_join.filter().clone(),
+            hash_join.filter().cloned(),
             &JoinType::RightAnti,  // Always RightAnti
-            hash_join.projection().map(|p| p.to_vec()),
+            None,  // Simplified - no projection for now
             hash_join.partition_mode().clone(),
             hash_join.null_equals_null(),
         )?;
