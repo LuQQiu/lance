@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 use super::anti_join_limit_pushdown::AntiJoinLimitPushdown;
+use super::left_anti_optimizer::LeftAntiOptimizer;
 use super::TakeExec;
 use arrow_schema::Schema as ArrowSchema;
 use datafusion::{
@@ -173,6 +174,7 @@ pub fn get_physical_optimizer() -> PhysicalOptimizer {
     PhysicalOptimizer::with_rules(vec![
         Arc::new(CoalesceTake),
         Arc::new(SimplifyProjection),
-        Arc::new(AntiJoinLimitPushdown::new()),
+        Arc::new(LeftAntiOptimizer::new()),  // Convert LeftAnti to RightAnti first
+        Arc::new(AntiJoinLimitPushdown::new()),  // Then add limit pushdown
     ])
 }
