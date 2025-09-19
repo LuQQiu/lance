@@ -376,9 +376,15 @@ impl FilteredReadStream {
             .clone()
             .unwrap_or_else(|| dataset.fragments().clone());
         global_metrics.fragments_scanned.add(fragments.len());
+        
+        tracing::info!(
+            "FilteredReadStream::try_new: Loading {} fragments metadata",
+            fragments.len()
+        );
 
         // Ideally we don't need to collect here but if we don't we get "implementation of FnOnce is
         // not general enough" false positives from rustc
+        let load_start = std::time::Instant::now();
         let frag_futs = fragments
             .iter()
             .map(|frag| {
@@ -394,6 +400,11 @@ impl FilteredReadStream {
             .try_buffered(io_parallelism)
             .try_collect::<Vec<_>>()
             .await?;
+        tracing::info!(
+            "FilteredReadStream: Loaded {} fragment metadata in {:?}",
+            loaded_fragments.len(),
+            load_start.elapsed()
+        );
 
         let output_schema = Arc::new(options.projection.to_arrow_schema());
 
@@ -401,6 +412,7 @@ impl FilteredReadStream {
         let scheduler_config = SchedulerConfig::max_bandwidth(obj_store.as_ref());
         let scan_scheduler = ScanScheduler::new(obj_store, scheduler_config);
 
+        let plan_start = std::time::Instant::now();
         let scoped_fragments = Self::plan_scan(
             dataset.as_ref(),
             loaded_fragments,
@@ -410,6 +422,11 @@ impl FilteredReadStream {
             scan_scheduler.clone(),
         )
         .await?;
+        tracing::info!(
+            "FilteredReadStream: Planned scan for {} fragments in {:?}",
+            scoped_fragments.len(),
+            plan_start.elapsed()
+        );
 
         let fragment_streams = futures::stream::iter(scoped_fragments)
             .map(|scoped_fragment| {
@@ -1232,9 +1249,14 @@ impl FilteredReadExec {
                     )?));
                 }
 
+                let stream_init_start = std::time::Instant::now();
                 let new_running_stream =
                     FilteredReadStream::try_new(dataset, options, &metrics, evaluated_index)
                         .await?;
+                tracing::info!(
+                    "FilteredReadExec: FilteredReadStream::try_new completed in {:?}",
+                    stream_init_start.elapsed()
+                );
                 let first_stream = new_running_stream.get_stream(&metrics, partition);
                 *running_stream = Some(new_running_stream);
                 DataFusionResult::Ok(first_stream)
