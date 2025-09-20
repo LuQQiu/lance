@@ -370,6 +370,12 @@ impl FilteredReadStream {
             .fragment_readahead
             .unwrap_or_else(|| ((*DEFAULT_FRAGMENT_READAHEAD).unwrap_or(io_parallelism * 2)))
             .max(1);
+        
+        tracing::info!(
+            "FilteredReadStream config: io_parallelism={}, fragment_readahead={}",
+            io_parallelism,
+            fragment_readahead
+        );
 
         let fragments = options
             .fragments
@@ -428,6 +434,11 @@ impl FilteredReadStream {
             plan_start.elapsed()
         );
 
+        tracing::info!(
+            "Creating fragment stream with readahead={} for {} fragments",
+            fragment_readahead,
+            scoped_fragments.len()
+        );
         let fragment_streams = futures::stream::iter(scoped_fragments)
             .map(|scoped_fragment| {
                 tokio::task::spawn(Self::read_fragment(scoped_fragment))
@@ -860,6 +871,13 @@ impl FilteredReadStream {
     async fn read_fragment(
         mut fragment_read_task: ScopedFragmentRead,
     ) -> Result<impl Stream<Item = Result<ReadBatchFut>>> {
+        let fragment_id = fragment_read_task.fragment.id();
+        let start_time = std::time::Instant::now();
+        tracing::info!(
+            "Starting read_fragment for fragment {} (range: {:?})",
+            fragment_id,
+            fragment_read_task.ranges.first().map(|r| r.start..r.end)
+        );
         let output_schema = Arc::new(fragment_read_task.projection.to_arrow_schema());
 
         if let Some(filter) = &fragment_read_task.filter {
@@ -876,10 +894,17 @@ impl FilteredReadStream {
         }
 
         let read_schema = fragment_read_task.projection.to_bare_schema();
+        let open_start = std::time::Instant::now();
         let mut fragment_reader = fragment_read_task
             .fragment
             .open(&read_schema, fragment_read_task.frag_read_config())
             .await?;
+        tracing::info!(
+            "Fragment {} opened in {:?}, total elapsed: {:?}",
+            fragment_id,
+            open_start.elapsed(),
+            start_time.elapsed()
+        );
 
         if fragment_read_task.with_deleted_rows {
             fragment_reader.with_make_deletions_null();
