@@ -169,7 +169,14 @@ impl TableProvider for FtsTableProvider {
 /// ```
 #[derive(Debug)]
 pub struct FtsQueryUDTF {
-    datasets: HashMap<String, Arc<Dataset>>,
+    resolver: Arc<dyn DatasetResolver>,
+}
+
+impl FtsQueryUDTF {
+    /// Create a new FtsQueryUDTF with a custom resolver
+    pub fn new(resolver: Arc<dyn DatasetResolver>) -> Self {
+        Self { resolver }
+    }
 }
 
 impl TableFunctionImpl for FtsQueryUDTF {
@@ -200,14 +207,11 @@ impl TableFunctionImpl for FtsQueryUDTF {
                 (false, false, false)
             };
 
-        // Fts query
-        let dataset = self
-            .datasets
-            .get(table_name)
-            .ok_or_else(|| DataFusionError::Execution(format!("Table {} not found", table_name)))?;
+        // Resolve dataset using the trait
+        let dataset = self.resolver.resolve_dataset(table_name)?;
 
         let provider = FtsTableProvider::new(
-            dataset.clone(),
+            dataset,
             FullTextSearchQuery::new_query(from_json(fts_query)?),
             with_row_id,
             with_row_addr,
@@ -232,6 +236,71 @@ fn parse_query_options(options: &str) -> datafusion::common::Result<(bool, bool,
     Ok((with_row_id, with_row_addr, ordered))
 }
 
+// ============================================================================
+// Generic DatasetResolver trait for FTS UDTF
+// ============================================================================
+
+/// Trait for resolving dataset names to Dataset instances.
+///
+/// This trait allows different integrations to provide their own dataset
+/// resolution logic (e.g., from a catalog, connection, or custom registry).
+///
+/// # Example
+///
+/// ```ignore
+/// use lance::dataset::udtf::DatasetResolver;
+/// use lance::Dataset;
+/// use std::sync::Arc;
+///
+/// struct MyResolver {
+///     // Your custom state
+/// }
+///
+/// impl DatasetResolver for MyResolver {
+///     fn resolve_dataset(&self, name: &str) -> datafusion::common::Result<Arc<Dataset>> {
+///         // Your custom logic to find and return a dataset
+///         todo!()
+///     }
+/// }
+/// ```
+pub trait DatasetResolver: Debug + Send + Sync {
+    /// Resolve a dataset name to a Dataset instance.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - The name of the dataset to resolve
+    ///
+    /// # Returns
+    ///
+    /// A Dataset instance wrapped in Arc, or an error if the dataset cannot be found
+    fn resolve_dataset(&self, name: &str) -> datafusion::common::Result<Arc<Dataset>>;
+}
+
+// ============================================================================
+// HashMap-based resolver (built-in implementation)
+// ============================================================================
+
+/// A simple HashMap-based dataset resolver.
+///
+/// This is useful for pre-registering a fixed set of datasets.
+#[derive(Debug)]
+struct HashMapResolver {
+    datasets: HashMap<String, Arc<Dataset>>,
+}
+
+impl DatasetResolver for HashMapResolver {
+    fn resolve_dataset(&self, name: &str) -> datafusion::common::Result<Arc<Dataset>> {
+        self.datasets
+            .get(name)
+            .cloned()
+            .ok_or_else(|| DataFusionError::Execution(format!("Table {} not found", name)))
+    }
+}
+
+// ============================================================================
+// FtsQueryUDTF - Now uses DatasetResolver internally!
+// ============================================================================
+
 /// Builder of `FtsQueryUDTF`
 pub struct FtsQueryUDTFBuilder {
     datasets: HashMap<String, Arc<Dataset>>,
@@ -251,7 +320,9 @@ impl FtsQueryUDTFBuilder {
 
     pub fn build(self) -> FtsQueryUDTF {
         FtsQueryUDTF {
-            datasets: self.datasets,
+            resolver: Arc::new(HashMapResolver {
+                datasets: self.datasets,
+            }),
         }
     }
 }
