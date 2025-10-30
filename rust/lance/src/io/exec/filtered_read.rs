@@ -125,6 +125,21 @@ impl ScopedFragmentRead {
     }
 }
 
+/// A fragment with all of its metadata loaded
+struct LoadedFragment {
+    row_id_sequence: Arc<RowIdSequence>,
+    deletion_vector: Option<Arc<DeletionVector>>,
+    fragment: FileFragment,
+    // The number of physical rows in the fragment
+    //
+    // This count includes deleted rows
+    num_physical_rows: u64,
+    // The number of logical rows in the fragment
+    //
+    // This count does not include deleted rows
+    num_logical_rows: u64,
+}
+
 /// Given a sorted iterator of deleted row offsets, return a sorted iterator of valid row ranges
 ///
 /// For example, given a fragment with 100 rows, and a deletion vector of 10, 15, 16 this would
@@ -293,21 +308,6 @@ pub enum FilteredReadThreadingMode {
     ///
     /// The number of partitions is specified by the parameter.
     MultiplePartitions(usize),
-}
-
-/// A fragment with all of its metadata loaded
-pub(crate) struct LoadedFragment {
-    pub(crate) row_id_sequence: Arc<RowIdSequence>,
-    pub(crate) deletion_vector: Option<Arc<DeletionVector>>,
-    pub(crate) fragment: FileFragment,
-    // The number of physical rows in the fragment
-    //
-    // This count includes deleted rows
-    pub(crate) num_physical_rows: u64,
-    // The number of logical rows in the fragment
-    //
-    // This count does not include deleted rows
-    pub(crate) num_logical_rows: u64,
 }
 
 /// A planned fragment read with all information needed for execution
@@ -2317,6 +2317,60 @@ mod tests {
             assert_eq!(col.as_ref(), expected);
         }
 
+        /// Test using the distributed execution path (plan_scan + PlannedFilterReadExec)
+        async fn test_plan_distributed(&self, options: FilteredReadOptions, expected: &dyn Array) {
+            // Get evaluated index if needed
+            let evaluated_index = if let Some(filter) = &options.full_filter {
+                let planner = Planner::new(Arc::new(self.dataset.schema().into()));
+                let index_info = self.dataset.scalar_index_info().await.unwrap();
+                let filter_plan = planner
+                    .create_filter_plan(filter.clone(), &index_info, true)
+                    .unwrap();
+                if let Some(index_query) = filter_plan.index_query {
+                    let index_exec = ScalarIndexExec::new(self.dataset.clone(), index_query);
+                    let mut index_stream = index_exec
+                        .execute(0, Arc::new(TaskContext::default()))
+                        .unwrap();
+                    let index_result = index_stream.next().await.unwrap().unwrap();
+                    Some(Arc::new(EvaluatedIndex::try_from_arrow(&index_result).unwrap()))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            // Plan the scan
+            let fragments = options
+                .fragments
+                .clone()
+                .unwrap_or_else(|| self.dataset.fragments().clone());
+            let (planned_fragments, planned_options) = FilteredReadUtils::plan_scan(
+                &self.dataset,
+                fragments.as_ref().clone(),
+                evaluated_index,
+                &options,
+            )
+            .await
+            .unwrap();
+
+            // Execute with PlannedFilterReadExec
+            let planned_exec =
+                PlannedFilterReadExec::new(self.dataset.clone(), planned_fragments, planned_options);
+            let stream = planned_exec
+                .execute(0, Arc::new(TaskContext::default()))
+                .unwrap();
+            let schema = stream.schema();
+            let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+
+            let batch = concat_batches(&schema, &batches).unwrap();
+
+            assert_eq!(batch.num_rows(), expected.len());
+
+            let col = batch.column(0);
+            assert_eq!(col.as_ref(), expected);
+        }
+
         fn frags(&self, ids: &[u32]) -> Arc<Vec<Fragment>> {
             Arc::new(
                 ids.iter()
@@ -3603,5 +3657,55 @@ mod tests {
             .map(|v| v.as_usize())
             .unwrap_or(0);
         assert!(iops > 0, "Should have recorded IO operations");
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_distributed_execution_path() {
+        // Test that plan_scan + PlannedFilterReadExec produces same results as FilteredReadExec
+        let fixture = Arc::new(TestFixture::new().await);
+        let base_options = FilteredReadOptions::basic_full_read(&fixture.dataset);
+
+        // Test 1: Basic filter with scalar index
+        let filter_plan = fixture.filter_plan("fully_indexed >= 75", true).await;
+        let options = base_options.clone().with_filter_plan(filter_plan);
+        let expected = u32s(vec![75..100, 250..400]);
+
+        // Test both paths produce same result
+        fixture.test_plan(options.clone(), &expected).await;
+        fixture.test_plan_distributed(options, &expected).await;
+
+        // Test 2: Filter with scan_range_before_filter
+        let filter_plan = fixture.filter_plan("fully_indexed >= 75", true).await;
+        let options = base_options
+            .clone()
+            .with_scan_range_before_filter(25..125)
+            .unwrap()
+            .with_filter_plan(filter_plan);
+        let expected = u32s(vec![75..100, 250..275]);
+
+        fixture.test_plan(options.clone(), &expected).await;
+        fixture.test_plan_distributed(options, &expected).await;
+
+        // Test 3: Filter with scan_range_after_filter (limit pushdown)
+        let filter_plan = fixture.filter_plan("fully_indexed >= 75", true).await;
+        let options = base_options
+            .clone()
+            .with_scan_range_after_filter(0..10)
+            .unwrap()
+            .with_filter_plan(filter_plan);
+        let expected = u32s(vec![75..85]);
+
+        fixture.test_plan(options.clone(), &expected).await;
+        fixture.test_plan_distributed(options, &expected).await;
+
+        // Test 4: No filter, just scan_range_before_filter
+        let options = base_options
+            .clone()
+            .with_scan_range_before_filter(50..150)
+            .unwrap();
+        let expected = u32s(vec![50..100, 250..300]);
+
+        fixture.test_plan(options.clone(), &expected).await;
+        fixture.test_plan_distributed(options, &expected).await;
     }
 }
