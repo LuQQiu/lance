@@ -155,6 +155,7 @@ impl object_store::ObjectStore for TracedObjectStore {
 
     #[instrument(level = "debug", skip(self, prefix), fields(prefix = prefix.map(|p| p.as_ref())))]
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
+        tracing::error!("list backtrace:\n{}", std::backtrace::Backtrace::force_capture());
         self.target.list(prefix).stream_in_current_span().boxed()
     }
 
@@ -172,6 +173,7 @@ impl object_store::ObjectStore for TracedObjectStore {
 
     #[instrument(level = "debug", skip(self, prefix), fields(prefix = prefix.map(|p| p.as_ref())))]
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
+        tracing::error!("list_with_delimiter backtrace:\n{}", std::backtrace::Backtrace::force_capture());
         self.target.list_with_delimiter(prefix).await
     }
 

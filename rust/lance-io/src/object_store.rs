@@ -61,7 +61,7 @@ pub static DEFAULT_MAX_IOP_SIZE: std::sync::LazyLock<u64> = std::sync::LazyLock:
         .unwrap_or(16 * 1024 * 1024)
 });
 
-pub const DEFAULT_DOWNLOAD_RETRY_COUNT: usize = 3;
+pub const DEFAULT_DOWNLOAD_RETRY_COUNT: usize = 3; 
 
 pub use providers::{ObjectStoreProvider, ObjectStoreRegistry};
 pub use storage_options::{
