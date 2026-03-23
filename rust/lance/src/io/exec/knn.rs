@@ -610,6 +610,18 @@ pub struct ANNIvfSubIndexExec {
 }
 
 impl ANNIvfSubIndexExec {
+    pub fn query(&self) -> &Query {
+        &self.query
+    }
+
+    pub fn dataset(&self) -> &Arc<Dataset> {
+        &self.dataset
+    }
+
+    pub fn indices(&self) -> &[IndexMetadata] {
+        &self.indices
+    }
+
     pub fn try_new(
         input: Arc<dyn ExecutionPlan>,
         dataset: Arc<Dataset>,
