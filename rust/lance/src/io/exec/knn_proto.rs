@@ -19,9 +19,10 @@ use lance_datafusion::pb;
 use lance_index::vector::Query;
 use lance_linalg::distance::DistanceType;
 use lance_table::format::IndexMetadata;
+use lance_table::format::pb as table_pb;
+use prost::Message;
 
 use crate::Dataset;
-use crate::index::DatasetIndexExt;
 
 use super::knn::{ANNIvfPartitionExec, ANNIvfSubIndexExec};
 use super::table_identifier::{open_dataset_from_table_identifier, table_identifier_from_dataset};
@@ -77,7 +78,7 @@ fn array_from_ipc_bytes(bytes: &[u8]) -> Result<arrow_array::ArrayRef> {
 pub fn query_to_proto(query: &Query) -> Result<pb::VectorQueryProto> {
     let key_arrow_ipc = array_to_ipc_bytes(query.key.as_ref())?;
 
-    let distance_type = query.metric_type.map(|dt| dt.to_string());
+    let metric_type = query.metric_type.map(|dt| dt.to_string());
 
     Ok(pb::VectorQueryProto {
         key_arrow_ipc,
@@ -89,7 +90,7 @@ pub fn query_to_proto(query: &Query) -> Result<pb::VectorQueryProto> {
         maximum_nprobes: query.maximum_nprobes.map(|n| n as u32),
         ef: query.ef.map(|n| n as u32),
         refine_factor: query.refine_factor,
-        distance_type,
+        metric_type,
         use_index: query.use_index,
         dist_q_c: query.dist_q_c,
     })
@@ -99,7 +100,7 @@ pub fn query_from_proto(proto: pb::VectorQueryProto) -> Result<Query> {
     let key = array_from_ipc_bytes(&proto.key_arrow_ipc)?;
 
     let metric_type = proto
-        .distance_type
+        .metric_type
         .as_deref()
         .map(DistanceType::try_from)
         .transpose()
@@ -165,19 +166,19 @@ pub async fn ann_ivf_sub_index_exec_to_proto(
     let table = table_identifier_from_dataset(exec.dataset()).await?;
     let query = query_to_proto(exec.query())?;
 
-    let indices = exec.indices();
-    let index_name = if indices.is_empty() {
-        String::new()
-    } else {
-        indices[0].name.clone()
-    };
-    let segment_uuids: Vec<String> = indices.iter().map(|idx| idx.uuid.to_string()).collect();
+    let indices: Vec<Vec<u8>> = exec
+        .indices()
+        .iter()
+        .map(|idx| {
+            let idx_proto: table_pb::IndexMetadata = idx.into();
+            idx_proto.encode_to_vec()
+        })
+        .collect();
 
     Ok(pb::AnnIvfSubIndexExecProto {
         query: Some(query),
         table: Some(table),
-        index_name,
-        segment_uuids,
+        indices,
     })
 }
 
@@ -199,23 +200,19 @@ pub async fn ann_ivf_sub_index_exec_from_proto(
     })?;
     let query = query_from_proto(query_proto)?;
 
-    // Load index metadata from manifest, filter to the requested segments.
-    let all_indices = dataset.load_indices_by_name(&proto.index_name).await?;
-
-    let segment_uuid_set: std::collections::HashSet<String> =
-        proto.segment_uuids.into_iter().collect();
-    let indices: Vec<IndexMetadata> = all_indices
-        .into_iter()
-        .filter(|idx| segment_uuid_set.contains(&idx.uuid.to_string()))
-        .collect();
+    let indices: Vec<IndexMetadata> = proto
+        .indices
+        .iter()
+        .map(|bytes| {
+            let idx_proto = table_pb::IndexMetadata::decode(bytes.as_slice())
+                .map_err(|e| Error::internal(format!("Failed to decode IndexMetadata: {e}")))?;
+            IndexMetadata::try_from(idx_proto)
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     if indices.is_empty() {
         return Err(Error::invalid_input_source(
-            format!(
-                "No matching segments found for index '{}'",
-                proto.index_name
-            )
-            .into(),
+            "ANNIvfSubIndexExecProto contains no indices".into(),
         ));
     }
 
@@ -249,6 +246,12 @@ mod tests {
     use arrow_array::{ArrayRef, Float32Array, Float64Array};
     use half::f16;
     use lance_datagen::{array, gen_batch};
+
+    use crate::index::DatasetIndexExt;
+    use crate::index::vector::VectorIndexParams;
+    use lance_index::IndexType;
+    use lance_index::vector::ivf::IvfBuildParams;
+    use lance_index::vector::pq::PQBuildParams;
 
     #[test]
     fn test_array_ipc_roundtrip_f32() {
@@ -361,14 +364,8 @@ mod tests {
         (Arc::new(ds), dir)
     }
 
-    use crate::index::DatasetIndexExt;
-    use crate::index::vector::VectorIndexParams;
-    use lance_index::IndexType;
-    use lance_index::vector::ivf::IvfBuildParams;
-    use lance_index::vector::pq::PQBuildParams;
-
     async fn make_indexed_dataset() -> (Arc<Dataset>, tempfile::TempDir) {
-        let (dataset, dir) = make_vector_dataset().await;
+        let (_dataset, dir) = make_vector_dataset().await;
         let mut ds = Dataset::open(dir.path().join("test_ann.lance").to_str().unwrap())
             .await
             .unwrap();
@@ -471,8 +468,7 @@ mod tests {
 
         // Encode
         let proto = ann_ivf_sub_index_exec_to_proto(&exec).await.unwrap();
-        assert_eq!(proto.index_name, "vector_idx");
-        assert_eq!(proto.segment_uuids.len(), indices.len());
+        assert_eq!(proto.indices.len(), indices.len());
 
         // Decode — need a partition exec as input child
         let input_query = query_from_proto(proto.query.clone().unwrap()).unwrap();
@@ -497,5 +493,11 @@ mod tests {
         assert_eq!(back.query().minimum_nprobes, 2);
         assert_eq!(back.query().refine_factor, Some(2));
         assert_eq!(back.indices().len(), indices.len());
+        for (original, decoded) in indices.iter().zip(back.indices().iter()) {
+            assert_eq!(original.uuid, decoded.uuid);
+            assert_eq!(original.name, decoded.name);
+            assert_eq!(original.dataset_version, decoded.dataset_version);
+            assert_eq!(original.fields, decoded.fields);
+        }
     }
 }

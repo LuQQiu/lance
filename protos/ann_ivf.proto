@@ -19,9 +19,9 @@ message VectorQueryProto {
   optional uint32 maximum_nprobes = 7;
   optional uint32 ef = 8;
   optional uint32 refine_factor = 9;
-  // Distance metric as string ("l2", "cosine", "dot", "hamming").
+  // Distance metric type as string ("l2", "cosine", "dot", "hamming").
   // Absent means None (use the index's default metric).
-  optional string distance_type = 10;
+  optional string metric_type = 10;
   bool use_index = 11;
   float dist_q_c = 12;
 }
@@ -35,6 +35,7 @@ message ANNIvfPartitionExecProto {
 message ANNIvfSubIndexExecProto {
   VectorQueryProto query = 1;
   TableIdentifier table = 2;
-  string index_name = 3;
-  repeated string segment_uuids = 4;
+  // Each element is a prost-encoded lance.table.IndexMetadata message.
+  // We use raw bytes to avoid a cross-package proto import.
+  repeated bytes indices = 3;
 }

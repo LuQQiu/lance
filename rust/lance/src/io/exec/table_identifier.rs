@@ -2,9 +2,6 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Helpers for converting between [`Dataset`] and [`TableIdentifier`](pb::TableIdentifier) proto.
-//!
-//! These are used by multiple proto modules (`filtered_read_proto`, `ann_ivf_proto`)
-//! to identify a dataset for remote reconstruction.
 
 use std::sync::Arc;
 
