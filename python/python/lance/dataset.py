@@ -6483,6 +6483,22 @@ class VectorIndexReader:
 
         return self.stats["indices"][0]["num_partitions"]
 
+    def num_segments(self) -> int:
+        """
+        Returns the number of segments (deltas) in this index.
+
+        Each segment corresponds to an independent physical index built
+        on a subset of fragments. When an index has multiple segments,
+        :meth:`read_partition` merges them, while
+        :meth:`read_segment_partition` reads a single one.
+
+        Returns
+        -------
+        int
+            The number of segments.
+        """
+        return len(self.stats["indices"])
+
     def centroids(self) -> np.ndarray:
         """
         Returns the centroids of the index
@@ -6528,6 +6544,52 @@ class VectorIndexReader:
 
         return self.dataset._ds.read_index_partition(
             self.index_name, partition_id, with_vector
+        ).read_all()
+
+    def read_segment_partition(
+        self,
+        segment_idx: int,
+        partition_id: int,
+        *,
+        with_vector: bool = False,
+    ) -> pa.Table:
+        """
+        Returns a pyarrow table for the given IVF partition from a single segment.
+
+        Unlike :meth:`read_partition` which merges all segments together,
+        this method reads from exactly one segment, letting you inspect
+        partition sizes per segment.
+
+        Parameters
+        ----------
+        segment_idx: int
+            The zero-based index of the segment, in ``[0, num_segments())``.
+        partition_id: int
+            The id of the partition to read within the segment.
+        with_vector: bool, default False
+            Whether to include the vector column in the reader.
+            For IVF_PQ, the vector column is PQ codes.
+
+        Returns
+        -------
+        pa.Table
+            A pyarrow table for the given partition in the given segment,
+            containing the row IDs, and quantized vectors (if with_vector
+            is True).
+        """
+        if segment_idx < 0 or segment_idx >= self.num_segments():
+            raise IndexError(
+                f"Segment index {segment_idx} is out of range, "
+                f"expected 0 <= segment_idx < {self.num_segments()}"
+            )
+        if partition_id < 0 or partition_id >= self.num_partitions():
+            raise IndexError(
+                f"Partition id {partition_id} is out of range, "
+                f"expected 0 <= partition_id < {self.num_partitions()}"
+            )
+
+        return self.dataset._ds.read_index_partition_from_segment(
+            self.index_name, segment_idx, partition_id, with_vector
         ).read_all()
 
 

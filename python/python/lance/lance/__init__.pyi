@@ -375,6 +375,13 @@ class _Dataset:
     def create_index_segment_builder(
         self, staging_index_uuid: str
     ) -> IndexSegmentBuilder: ...
+    def read_index_partition_from_segment(
+        self,
+        index_name: str,
+        segment_idx: int,
+        partition_id: int,
+        with_vector: bool = False,
+    ) -> pa.RecordBatchReader: ...
     def commit_existing_index_segments(
         self, index_name: str, column: str, segments: List[IndexSegment]
     ) -> None: ...

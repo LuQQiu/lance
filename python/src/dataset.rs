@@ -2537,6 +2537,32 @@ impl Dataset {
         Ok(PyArrowType(reader))
     }
 
+    #[pyo3(signature = (index_name, segment_idx, partition_id, with_vector=false))]
+    fn read_index_partition_from_segment(
+        &self,
+        index_name: String,
+        segment_idx: usize,
+        partition_id: usize,
+        with_vector: bool,
+    ) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
+        let stream = rt()
+            .block_on(
+                None,
+                self.ds.read_index_partition_from_segment(
+                    &index_name,
+                    segment_idx,
+                    partition_id,
+                    with_vector,
+                ),
+            )?
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+        let reader = Box::new(LanceReader::from_stream(DatasetRecordBatchStream::new(
+            stream,
+        )));
+        Ok(PyArrowType(reader))
+    }
+
     #[pyo3(signature = (keys))]
     fn delete_config_keys(&mut self, keys: Vec<String>) -> PyResult<()> {
         let mut new_self = self.ds.as_ref().clone();

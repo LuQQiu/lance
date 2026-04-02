@@ -265,6 +265,18 @@ pub trait DatasetIndexExt {
         partition_id: usize,
         with_vector: bool,
     ) -> Result<SendableRecordBatchStream>;
+
+    /// Read a single partition from a single segment of a vector index.
+    ///
+    /// Unlike [`read_index_partition`] which merges all segments,
+    /// this reads from exactly one segment identified by `segment_idx`.
+    async fn read_index_partition_from_segment(
+        &self,
+        index_name: &str,
+        segment_idx: usize,
+        partition_id: usize,
+        with_vector: bool,
+    ) -> Result<SendableRecordBatchStream>;
 }
 
 #[cfg(test)]

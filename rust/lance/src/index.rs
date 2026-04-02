@@ -1083,6 +1083,38 @@ impl DatasetIndexExt for Dataset {
             ))),
         }
     }
+
+    async fn read_index_partition_from_segment(
+        &self,
+        index_name: &str,
+        segment_idx: usize,
+        partition_id: usize,
+        with_vector: bool,
+    ) -> Result<SendableRecordBatchStream> {
+        let indices = self.load_indices_by_name(index_name).await?;
+        if indices.is_empty() {
+            return Err(Error::index_not_found(format!("name={}", index_name)));
+        }
+        if segment_idx >= indices.len() {
+            return Err(Error::invalid_input(format!(
+                "segment_idx {} is out of range, expected 0 <= segment_idx < {}",
+                segment_idx,
+                indices.len()
+            )));
+        }
+        let column = self.schema().field_by_id(indices[0].fields[0]).unwrap();
+        let target = &indices[segment_idx];
+        let index = self
+            .open_vector_index(
+                &column.name,
+                &target.uuid.to_string(),
+                &NoOpMetricsCollector,
+            )
+            .await?;
+        index
+            .partition_reader(partition_id, with_vector, &NoOpMetricsCollector)
+            .await
+    }
 }
 
 fn sum_indexed_rows_per_delta(indexed_fragments_per_delta: &[Vec<Fragment>]) -> Result<Vec<usize>> {

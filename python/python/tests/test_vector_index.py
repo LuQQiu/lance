@@ -1751,6 +1751,92 @@ def test_read_partition(indexed_dataset):
         VectorIndexReader(indexed_dataset, "id_idx")
 
 
+def test_read_segment_partition(indexed_dataset):
+    """Test per-segment partition reading (single segment)."""
+    idx_name = indexed_dataset.describe_indices()[0].name
+    reader = VectorIndexReader(indexed_dataset, idx_name)
+
+    # Single-segment case
+    assert reader.num_segments() == 1
+
+    # Reading from segment 0 should match read_partition
+    num_rows = indexed_dataset.count_rows()
+    row_sum = 0
+    for part_id in range(reader.num_partitions()):
+        seg_res = reader.read_segment_partition(0, part_id)
+        merged_res = reader.read_partition(part_id)
+        assert seg_res.num_rows == merged_res.num_rows
+        assert "_rowid" in seg_res.column_names
+        row_sum += seg_res.num_rows
+    assert row_sum == num_rows
+
+    # with_vector=True
+    res = reader.read_segment_partition(0, 0, with_vector=True)
+    assert "__pq_code" in res.column_names
+
+    # Error: segment_idx out of range
+    with pytest.raises(IndexError, match="out of range"):
+        reader.read_segment_partition(1, 0)
+
+    # Error: partition_id out of range
+    with pytest.raises(IndexError, match="out of range"):
+        reader.read_segment_partition(0, reader.num_partitions() + 1)
+
+
+def test_read_segment_partition_multi_segment(tmp_path):
+    """Test per-segment partition reading with multiple segments."""
+    from lance.indices import IndicesBuilder
+
+    tbl = create_table(nvec=5000)
+    ds = lance.write_dataset(tbl, tmp_path)
+    # Append to create a second fragment
+    ds = lance.write_dataset(create_table(nvec=5000), tmp_path, mode="append")
+
+    frags = ds.get_fragments()
+    assert len(frags) >= 2
+    frag_ids = [f.fragment_id for f in frags]
+    mid = len(frag_ids) // 2
+    group0 = frag_ids[:mid]
+    group1 = frag_ids[mid:]
+
+    # Global training so both segments share the same centroids
+    builder = IndicesBuilder(ds, "vector")
+    ivf_model = builder.train_ivf(num_partitions=4, sample_rate=32)
+    pq_model = builder.train_pq(ivf_model, num_subvectors=16, sample_rate=32)
+
+    segments = []
+    for group in [group0, group1]:
+        seg = ds.create_index_uncommitted(
+            column="vector",
+            index_type="IVF_PQ",
+            fragment_ids=group,
+            num_partitions=4,
+            num_sub_vectors=16,
+            ivf_centroids=ivf_model.centroids,
+            pq_codebook=pq_model.codebook,
+            metric="L2",
+        )
+        segments.append(seg)
+
+    planned = ds.create_index_segment_builder().with_segments(segments).build_all()
+    ds = ds.commit_existing_index_segments("vector_idx", "vector", planned)
+
+    reader = VectorIndexReader(ds, "vector_idx")
+    assert reader.num_segments() == 2
+
+    total_rows = ds.count_rows()
+    grand_total = 0
+    for part_id in range(reader.num_partitions()):
+        merged = reader.read_partition(part_id)
+        seg0 = reader.read_segment_partition(0, part_id)
+        seg1 = reader.read_segment_partition(1, part_id)
+        # Per-segment rows should sum to merged rows
+        assert seg0.num_rows + seg1.num_rows == merged.num_rows
+        grand_total += merged.num_rows
+
+    assert grand_total == total_rows
+
+
 def test_vector_index_with_prefilter_and_scalar_index(indexed_dataset):
     uri = indexed_dataset.uri
     new_table = create_table()
