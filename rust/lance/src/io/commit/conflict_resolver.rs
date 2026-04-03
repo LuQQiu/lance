@@ -517,15 +517,42 @@ impl<'a> TransactionRebase<'a> {
                     let other_has_mem_wal = created_indices
                         .iter()
                         .any(|idx| idx.name == MEM_WAL_INDEX_NAME);
+                    // For segmented index optimization, two CreateIndex transactions
+                    // on the same index name but different segments (different removed UUIDs)
+                    // are compatible and should not conflict.
+                    let other_removed = match &other_transaction.operation {
+                        Operation::CreateIndex {
+                            removed_indices: other_removed,
+                            ..
+                        } => other_removed,
+                        _ => &vec![],
+                    };
                     let has_regular_name_conflict = new_indices
                         .iter()
                         .filter(|idx| {
                             idx.name != FRAG_REUSE_INDEX_NAME && idx.name != MEM_WAL_INDEX_NAME
                         })
                         .any(|new_index| {
-                            created_indices
-                                .iter()
-                                .any(|created_index| created_index.name == new_index.name)
+                            created_indices.iter().any(|created_index| {
+                                if created_index.name != new_index.name {
+                                    return false;
+                                }
+                                // Same name but check if they touch different segments.
+                                // If removed_indices have no UUID overlap, the operations
+                                // are on different segments and can coexist.
+                                let self_removed_uuids: std::collections::HashSet<_> =
+                                    removed_indices.iter().map(|idx| idx.uuid).collect();
+                                let other_removed_uuids: std::collections::HashSet<_> =
+                                    other_removed.iter().map(|idx| idx.uuid).collect();
+                                if !self_removed_uuids.is_empty()
+                                    && !other_removed_uuids.is_empty()
+                                    && self_removed_uuids.is_disjoint(&other_removed_uuids)
+                                {
+                                    false // different segments, no conflict
+                                } else {
+                                    true // same or overlapping segments, conflict
+                                }
+                            })
                         });
 
                     if (self_has_frag_reuse && other_has_frag_reuse)
