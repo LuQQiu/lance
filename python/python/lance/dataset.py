@@ -5697,6 +5697,11 @@ class DatasetOptimizer:
             This is useful when the data distribution has changed significantly,
             and we want to retrain the index to improve the search quality.
             This would be faster than re-create the index from scratch.
+        segment_index: optional, int, default None
+            The index of the specific segment to optimize (0-based).
+            When set, directly optimizes that segment without auto-selection.
+            This enables parallel optimization where each process targets
+            a different segment.
         """
         self._dataset._ds.optimize_indices(**kwargs)
 

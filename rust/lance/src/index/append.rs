@@ -180,14 +180,28 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
         )?;
         let ivf_view = logical_index.as_ivf()?;
 
-        let use_single_segment_rebalance = logical_index.num_segments() > 1
-            && options.num_indices_to_merge.is_none()
-            && !options.retrain
-            && unindexed.is_empty();
+        let use_single_segment_rebalance = options.segment_index.is_some()
+            || (logical_index.num_segments() > 1
+                && options.num_indices_to_merge.is_none()
+                && !options.retrain
+                && unindexed.is_empty());
 
         if use_single_segment_rebalance {
-            let Some(selected_segment_id) = select_segment_for_single_rebalance(&ivf_view)? else {
-                return Ok(None);
+            let selected_segment_id = if let Some(seg_idx) = options.segment_index {
+                let segments: Vec<_> = ivf_view.segments().collect();
+                if seg_idx >= segments.len() {
+                    return Err(Error::index(format!(
+                        "segment_index {} out of range (have {} segments)",
+                        seg_idx,
+                        segments.len()
+                    )));
+                }
+                segments[seg_idx].0.uuid
+            } else {
+                match select_segment_for_single_rebalance(&ivf_view)? {
+                    Some(id) => id,
+                    None => return Ok(None),
+                }
             };
             let removed_segment = old_indices
                 .iter()

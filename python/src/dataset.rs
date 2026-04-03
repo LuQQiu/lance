@@ -1825,6 +1825,9 @@ impl Dataset {
                         .map_err(|err| PyValueError::new_err(err.to_string()))?,
                 );
             }
+            if let Some(segment_index) = kwargs.get_item("segment_index")? {
+                options.segment_index = segment_index.extract()?;
+            }
         }
         rt().block_on(
             None,

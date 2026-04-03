@@ -43,6 +43,14 @@ pub struct OptimizeOptions {
     /// and can be read later to identify the source of the commit
     /// (e.g., job_id for tracking completed index jobs).
     pub transaction_properties: Option<Arc<HashMap<String, String>>>,
+
+    /// Optional segment index to optimize (0-based).
+    ///
+    /// When set, skips automatic worst-segment selection and directly
+    /// optimizes the segment at this index in the logical vector index.
+    /// This enables parallel optimization where each process targets
+    /// a different segment.
+    pub segment_index: Option<usize>,
 }
 
 impl OptimizeOptions {
