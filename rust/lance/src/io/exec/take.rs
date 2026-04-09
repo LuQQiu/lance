@@ -14,7 +14,7 @@ use arrow_schema::{Schema as ArrowSchema, SchemaRef};
 use datafusion::common::Statistics;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::physical_plan::metrics::{
-    BaselineMetrics, Count, ExecutionPlanMetricsSet, MetricBuilder, MetricValue, MetricsSet,
+    BaselineMetrics, Count, ExecutionPlanMetricsSet, MetricBuilder, MetricValue, MetricsSet, Time,
 };
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
@@ -43,6 +43,7 @@ use super::utils::IoMetrics;
 struct TakeStreamMetrics {
     baseline_metrics: BaselineMetrics,
     batches_processed: Count,
+    wall_time: Time,
     io_metrics: IoMetrics,
 }
 
@@ -55,9 +56,17 @@ impl TakeStreamMetrics {
                 name: Cow::Borrowed("batches_processed"),
                 count: batches_processed.clone(),
             });
+        let wall_time = Time::new();
+        MetricBuilder::new(metrics)
+            .with_partition(partition)
+            .build(MetricValue::Time {
+                name: Cow::Borrowed("elapsed_wall"),
+                time: wall_time.clone(),
+            });
         Self {
             baseline_metrics: BaselineMetrics::new(metrics, partition),
             batches_processed,
+            wall_time,
             io_metrics: IoMetrics::new(metrics, partition),
         }
     }
@@ -203,6 +212,7 @@ impl TakeStream {
         batch: RecordBatch,
         batch_number: u32,
     ) -> DataFusionResult<RecordBatch> {
+        let _wall_timer = self.metrics.wall_time.timer();
         let compute_timer = self.metrics.baseline_metrics.elapsed_compute().timer();
         let (row_addrs_arr, validity_mask) = self.get_row_addrs(&batch).await?;
 
