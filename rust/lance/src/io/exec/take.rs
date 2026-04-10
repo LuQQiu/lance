@@ -60,7 +60,7 @@ impl TakeStreamMetrics {
         MetricBuilder::new(metrics)
             .with_partition(partition)
             .build(MetricValue::Time {
-                name: Cow::Borrowed("elapsed_wall"),
+                name: Cow::Borrowed("elapsed"),
                 time: wall_time.clone(),
             });
         Self {
