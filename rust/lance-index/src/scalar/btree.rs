@@ -22,7 +22,10 @@ use crate::{
     scalar::{
         CreatedIndex, UpdateCriteria,
         expression::{SargableQueryParser, ScalarQueryParser},
-        registry::{ScalarIndexPlugin, TrainingOrdering, TrainingRequest, VALUE_COLUMN_NAME},
+        registry::{
+            ScalarIndexCacheKey, ScalarIndexPlugin, TrainingOrdering, TrainingRequest,
+            VALUE_COLUMN_NAME,
+        },
     },
 };
 use crate::{metrics::NoOpMetricsCollector, scalar::registry::TrainingCriteria};
@@ -1029,6 +1032,7 @@ impl DeepSizeOf for BTreeIndexState {
 }
 
 impl BTreeIndexState {
+    #[cfg(test)]
     fn reconstruct(
         &self,
         store: Arc<dyn IndexStore>,
@@ -1146,26 +1150,6 @@ fn read_u32_le(data: &bytes::Bytes, offset: &mut usize) -> Result<u32> {
 fn read_u64_le(data: &bytes::Bytes, offset: &mut usize) -> Result<u64> {
     let bytes = read_bytes(data, offset, 8)?;
     Ok(u64::from_le_bytes(bytes.as_ref().try_into().unwrap()))
-}
-
-/// Cache key for a [`BTreeIndexState`]. The cache it is used with is already
-/// namespaced per-index, so the key string is a constant.
-struct BTreeIndexStateKey;
-
-impl CacheKey for BTreeIndexStateKey {
-    type ValueType = BTreeIndexState;
-
-    fn key(&self) -> std::borrow::Cow<'_, str> {
-        "state".into()
-    }
-
-    fn type_name() -> &'static str {
-        "BTreeIndexState"
-    }
-
-    fn codec() -> Option<CacheCodec> {
-        Some(CacheCodec::from_impl::<BTreeIndexState>())
-    }
 }
 
 /// Note: this is very similar to the IVF index except we store the IVF part in a btree
@@ -2941,31 +2925,19 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
 
     async fn get_from_cache(
         &self,
-        index_store: Arc<dyn IndexStore>,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        _index_store: Arc<dyn IndexStore>,
+        _frag_reuse_index: Option<Arc<FragReuseIndex>>,
         cache: &LanceCache,
     ) -> Result<Option<Arc<dyn ScalarIndex>>> {
-        let Some(state) = cache.get_with_key(&BTreeIndexStateKey).await else {
-            return Ok(None);
-        };
-        Ok(Some(state.reconstruct(
-            index_store,
-            cache,
-            frag_reuse_index,
-        )?))
+        Ok(cache.get_unsized_with_key(&ScalarIndexCacheKey).await)
     }
 
     async fn put_in_cache(&self, cache: &LanceCache, index: Arc<dyn ScalarIndex>) -> Result<()> {
-        let btree = index.as_any().downcast_ref::<BTreeIndex>().ok_or_else(|| {
+        index.as_any().downcast_ref::<BTreeIndex>().ok_or_else(|| {
             Error::internal("BTreeIndexPlugin::put_in_cache called with a non-BTree index")
         })?;
-        let state = BTreeIndexState {
-            lookup_batch: btree.lookup_batch.clone(),
-            batch_size: btree.batch_size,
-            ranges_to_files: btree.ranges_to_files.clone(),
-        };
         cache
-            .insert_with_key(&BTreeIndexStateKey, Arc::new(state))
+            .insert_unsized_with_key(&ScalarIndexCacheKey, index)
             .await;
         Ok(())
     }
@@ -5046,7 +5018,65 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_btree_index_state_reconstruct_and_plugin_cache() {
+    async fn test_btree_plugin_cache_returns_deserialized_index() {
+        let tmpdir = TempObjDir::default();
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let stream = gen_batch()
+            .col("value", array::step::<Int32Type>())
+            .col("_rowid", array::step::<UInt64Type>())
+            .into_df_stream(RowCount::from(16), BatchCount::from(1));
+        train_btree_index(stream, test_store.as_ref(), 16, None, None)
+            .await
+            .unwrap();
+
+        let index = BTreeIndex::load(test_store.clone(), None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        let index_for_cache: Arc<dyn ScalarIndex> = index.clone();
+
+        let cache = LanceCache::with_capacity(1024 * 1024);
+        let plugin = BTreeIndexPlugin;
+        plugin
+            .put_in_cache(&cache, index_for_cache.clone())
+            .await
+            .unwrap();
+        let from_cache = plugin
+            .get_from_cache(test_store.clone(), None, &cache)
+            .await
+            .unwrap()
+            .expect("index should be served from the cache");
+
+        assert!(
+            Arc::ptr_eq(&index_for_cache, &from_cache),
+            "BTree cache should return the deserialized runtime index"
+        );
+
+        let result = from_cache
+            .search(
+                &SargableQuery::Equals(ScalarValue::Int32(Some(7))),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+        let row_ids: Vec<u64> = match &result {
+            SearchResult::Exact(set) => set
+                .true_rows()
+                .row_addrs()
+                .unwrap()
+                .map(u64::from)
+                .collect(),
+            other => panic!("expected Exact, got {other:?}"),
+        };
+        assert_eq!(row_ids, vec![7]);
+    }
+
+    #[tokio::test]
+    async fn test_btree_index_state_reconstruct_and_runtime_plugin_cache() {
         let tmpdir = TempObjDir::default();
         let test_store = Arc::new(LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
@@ -5087,15 +5117,20 @@ mod tests {
             index.page_lookup
         );
 
-        // The plugin's put/get hooks round-trip through a real cache + the codec.
+        // The plugin's put/get hooks cache the deserialized runtime index.
         let cache = LanceCache::with_capacity(64 * 1024 * 1024);
         let plugin = BTreeIndexPlugin;
-        plugin.put_in_cache(&cache, index.clone()).await.unwrap();
+        let index_for_cache: Arc<dyn ScalarIndex> = index.clone();
+        plugin
+            .put_in_cache(&cache, index_for_cache.clone())
+            .await
+            .unwrap();
         let from_cache = plugin
             .get_from_cache(test_store.clone(), None, &cache)
             .await
             .unwrap()
             .expect("index should be served from the cache");
+        assert!(Arc::ptr_eq(&index_for_cache, &from_cache));
 
         // Searches against the cached index match the original.
         let query = SargableQuery::Range(
@@ -5195,10 +5230,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_btree_index_state_range_partitioned_plugin_cache_roundtrip() {
+    async fn test_btree_index_range_partitioned_runtime_plugin_cache_roundtrip() {
         // Build a range-partitioned BTree (two range partitions merged into one index) and
-        // round-trip it through the plugin's cache hooks. This exercises the
-        // `ranges_to_files = Some` path end-to-end through serialize/deserialize/reconstruct.
+        // round-trip it through the plugin's runtime cache hooks.
         let tmpdir = TempObjDir::default();
         let store = Arc::new(LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
@@ -5255,12 +5289,17 @@ mod tests {
 
         let cache = LanceCache::with_capacity(64 * 1024 * 1024);
         let plugin = BTreeIndexPlugin;
-        plugin.put_in_cache(&cache, index.clone()).await.unwrap();
+        let index_for_cache: Arc<dyn ScalarIndex> = index.clone();
+        plugin
+            .put_in_cache(&cache, index_for_cache.clone())
+            .await
+            .unwrap();
         let from_cache = plugin
             .get_from_cache(store.clone(), None, &cache)
             .await
             .unwrap()
             .expect("index should be served from the cache");
+        assert!(Arc::ptr_eq(&index_for_cache, &from_cache));
 
         // Search a value from each range partition and confirm both paths agree.
         for value in [0i32, total - 1] {
