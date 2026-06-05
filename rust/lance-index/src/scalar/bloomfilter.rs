@@ -1112,6 +1112,7 @@ impl ScalarIndexPlugin for BloomFilterIndexPlugin {
         _index_details: &prost_types::Any,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
         cache: &LanceCache,
+        _metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn ScalarIndex>> {
         Ok(
             BloomFilterIndex::load(index_store, frag_reuse_index, cache).await?

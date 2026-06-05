@@ -999,6 +999,7 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
         _index_details: &prost_types::Any,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
         cache: &LanceCache,
+        _metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn ScalarIndex>> {
         Ok(ZoneMapIndex::load(index_store, frag_reuse_index, cache).await? as Arc<dyn ScalarIndex>)
     }

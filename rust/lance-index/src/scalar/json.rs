@@ -793,13 +793,20 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
         index_details: &prost_types::Any,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
         cache: &LanceCache,
+        metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn ScalarIndex>> {
         let registry = self.registry().unwrap();
         let json_details = crate::pb::JsonIndexDetails::decode(index_details.value.as_slice())?;
         let target_details = json_details.target_details.as_ref().expect_ok()?;
         let target_plugin = registry.get_plugin_by_details(target_details).unwrap();
         let target_index = target_plugin
-            .load_index(index_store, target_details, frag_reuse_index, cache)
+            .load_index(
+                index_store,
+                target_details,
+                frag_reuse_index,
+                cache,
+                metrics,
+            )
             .await?;
         Ok(Arc::new(JsonIndex::new(target_index, json_details.path)))
     }

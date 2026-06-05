@@ -26,6 +26,7 @@ pub use lance_tokenizer::Language;
 pub use scorer::{MemBM25Scorer, Scorer};
 pub use tokenizer::*;
 
+use crate::scalar::MetricsCollector;
 use crate::scalar::inverted::query::{FtsSearchParams, Tokens};
 
 /// Collect the unique terms needed to build a shared BM25 scorer.
@@ -290,6 +291,7 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
         _index_details: &prost_types::Any,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
         cache: &LanceCache,
+        _metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn ScalarIndex>> {
         Ok(
             InvertedIndex::load(index_store, frag_reuse_index, cache).await?

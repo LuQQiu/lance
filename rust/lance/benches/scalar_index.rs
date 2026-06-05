@@ -203,6 +203,7 @@ fn bench_warm_indexed(c: &mut Criterion) {
             &details,
             None,
             &LanceCache::no_cache(),
+            &NoOpMetricsCollector,
         ))
         .unwrap();
 

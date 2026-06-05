@@ -9,6 +9,7 @@ pub(crate) mod inverted;
 pub use inverted::{load_segment_details, load_segments};
 
 use std::sync::{Arc, LazyLock};
+use std::time::Instant;
 
 use crate::index::DatasetIndexExt;
 use crate::index::DatasetIndexInternalExt;
@@ -395,28 +396,38 @@ pub async fn open_scalar_index(
         .index_cache
         .for_index(&uuid_str, frag_reuse_index.as_ref().map(|f| &f.uuid));
 
-    if let Some(index) = plugin
+    let cache_lookup_start = Instant::now();
+    let cached_index = plugin
         .get_from_cache(index_store.clone(), frag_reuse_index.clone(), &index_cache)
-        .await?
-    {
+        .await?;
+    metrics.record_index_cache_lookup_time(cache_lookup_start.elapsed());
+    if let Some(index) = cached_index {
         // Compatibility check is only needed on first load; a cache hit means
         // the index was already validated when it was originally opened in
         // this session, so we can skip the extra `open_index_file` IOP.
         return Ok(index);
     }
 
+    let load_start = Instant::now();
     if index_details.type_url.ends_with("LabelListIndexDetails") {
         validate_label_list_index_compatibility(dataset, column, index, &index_store).await?;
     }
 
     let index = plugin
-        .load_index(index_store, &index_details, frag_reuse_index, &index_cache)
+        .load_index(
+            index_store,
+            &index_details,
+            frag_reuse_index,
+            &index_cache,
+            metrics,
+        )
         .await?;
 
     tracing::info!(target: TRACE_IO_EVENTS, index_uuid = uuid_str, r#type = IO_TYPE_OPEN_SCALAR, index_type = index.index_type().to_string());
     metrics.record_index_load();
 
     plugin.put_in_cache(&index_cache, index.clone()).await?;
+    metrics.record_index_load_time(load_start.elapsed());
     Ok(index)
 }
 

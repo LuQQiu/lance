@@ -2,8 +2,11 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use lance_datafusion::utils::{
-    BYTES_READ_METRIC, ExecutionPlanMetricsSetExt, INDEX_COMPARISONS_METRIC, INDICES_LOADED_METRIC,
-    IOPS_METRIC, PARTS_LOADED_METRIC, REQUESTS_METRIC,
+    BTREE_DESERIALIZE_TIME_METRIC, BTREE_LOOKUP_READ_TIME_METRIC, BTREE_LOOKUP_TIME_METRIC,
+    BTREE_PAGE_SEARCH_TIME_METRIC, BYTES_READ_METRIC, ExecutionPlanMetricsSetExt,
+    INDEX_CACHE_LOOKUP_TIME_METRIC, INDEX_COMPARISONS_METRIC, INDEX_LOAD_TIME_METRIC,
+    INDICES_LOADED_METRIC, IOPS_METRIC, PART_LOAD_TIME_METRIC, PARTS_LOADED_METRIC,
+    REQUESTS_METRIC,
 };
 use lance_index::metrics::MetricsCollector;
 use lance_io::scheduler::ScanScheduler;
@@ -12,13 +15,14 @@ use pin_project::pin_project;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use arrow_array::{RecordBatch, UInt64Array};
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::physical_plan::metrics::{
-    BaselineMetrics, Count, ExecutionPlanMetricsSet, Gauge, MetricBuilder, MetricValue,
+    BaselineMetrics, Count, ExecutionPlanMetricsSet, Gauge, MetricBuilder, MetricValue, Time,
 };
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, RecordBatchStream, SendableRecordBatchStream,
@@ -520,6 +524,13 @@ pub struct IndexMetrics {
     indices_loaded: Count,
     parts_loaded: Count,
     index_comparisons: Count,
+    index_cache_lookup_time: Time,
+    index_load_time: Time,
+    part_load_time: Time,
+    btree_lookup_time: Time,
+    btree_lookup_read_time: Time,
+    btree_deserialize_time: Time,
+    btree_page_search_time: Time,
 }
 
 impl IndexMetrics {
@@ -528,6 +539,13 @@ impl IndexMetrics {
             indices_loaded: metrics.new_count(INDICES_LOADED_METRIC, partition),
             parts_loaded: metrics.new_count(PARTS_LOADED_METRIC, partition),
             index_comparisons: metrics.new_count(INDEX_COMPARISONS_METRIC, partition),
+            index_cache_lookup_time: metrics.new_time(INDEX_CACHE_LOOKUP_TIME_METRIC, partition),
+            index_load_time: metrics.new_time(INDEX_LOAD_TIME_METRIC, partition),
+            part_load_time: metrics.new_time(PART_LOAD_TIME_METRIC, partition),
+            btree_lookup_time: metrics.new_time(BTREE_LOOKUP_TIME_METRIC, partition),
+            btree_lookup_read_time: metrics.new_time(BTREE_LOOKUP_READ_TIME_METRIC, partition),
+            btree_deserialize_time: metrics.new_time(BTREE_DESERIALIZE_TIME_METRIC, partition),
+            btree_page_search_time: metrics.new_time(BTREE_PAGE_SEARCH_TIME_METRIC, partition),
         }
     }
 }
@@ -541,6 +559,27 @@ impl MetricsCollector for IndexMetrics {
     }
     fn record_comparisons(&self, num_comparisons: usize) {
         self.index_comparisons.add(num_comparisons);
+    }
+    fn record_index_cache_lookup_time(&self, duration: Duration) {
+        self.index_cache_lookup_time.add_duration(duration);
+    }
+    fn record_index_load_time(&self, duration: Duration) {
+        self.index_load_time.add_duration(duration);
+    }
+    fn record_part_load_time(&self, duration: Duration) {
+        self.part_load_time.add_duration(duration);
+    }
+    fn record_btree_lookup_time(&self, duration: Duration) {
+        self.btree_lookup_time.add_duration(duration);
+    }
+    fn record_btree_lookup_read_time(&self, duration: Duration) {
+        self.btree_lookup_read_time.add_duration(duration);
+    }
+    fn record_btree_deserialize_time(&self, duration: Duration) {
+        self.btree_deserialize_time.add_duration(duration);
+    }
+    fn record_btree_page_search_time(&self, duration: Duration) {
+        self.btree_page_search_time.add_duration(duration);
     }
 }
 

@@ -8,6 +8,7 @@ use std::{
     fmt::{Debug, Display},
     ops::Bound,
     sync::Arc,
+    time::Instant,
 };
 
 use super::{
@@ -1259,6 +1260,7 @@ impl BTreeIndex {
         index_reader: LazyIndexReader,
         metrics: &dyn MetricsCollector,
     ) -> Result<FlatIndex> {
+        let load_start = Instant::now();
         metrics.record_part_load();
         info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_SCALAR_PART, index_type="btree", part_id=page_number);
         let index_reader = index_reader.get().await?;
@@ -1269,7 +1271,9 @@ impl BTreeIndex {
             serialized_page =
                 frag_reuse_index_ref.remap_row_ids_record_batch(serialized_page, 1)?;
         }
-        FlatIndex::try_new(serialized_page)
+        let page = FlatIndex::try_new(serialized_page)?;
+        metrics.record_part_load_time(load_start.elapsed());
+        Ok(page)
     }
 
     async fn search_page(
@@ -1283,7 +1287,8 @@ impl BTreeIndex {
             .lookup_page(matches.page_id(), index_reader, metrics)
             .await?;
 
-        match matches {
+        let search_start = Instant::now();
+        let result = match matches {
             Matches::Some(_) => {
                 // TODO: If this is an IN query we can perhaps simplify the subindex query by restricting it to the
                 // values that might be in the page.  E.g. if we are searching for X IN [5, 3, 7] and five is in pages
@@ -1296,7 +1301,9 @@ impl BTreeIndex {
                 SargableQuery::IsNull() => subindex.all_ignore_nulls(),
                 _ => subindex.all(),
             }),
-        }
+        };
+        metrics.record_btree_page_search_time(search_start.elapsed());
+        result
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -1383,11 +1390,22 @@ impl BTreeIndex {
         ))
     }
 
+    #[cfg(test)]
     async fn load(
         store: Arc<dyn IndexStore>,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
         index_cache: &LanceCache,
     ) -> Result<Arc<Self>> {
+        Self::load_with_metrics(store, frag_reuse_index, index_cache, &NoOpMetricsCollector).await
+    }
+
+    async fn load_with_metrics(
+        store: Arc<dyn IndexStore>,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        index_cache: &LanceCache,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Arc<Self>> {
+        let read_start = Instant::now();
         let (page_lookup_file, standalone_partition_page_file) =
             match store.open_index_file(BTREE_LOOKUP_NAME).await {
                 Ok(page_lookup_file) => (page_lookup_file, None),
@@ -1408,6 +1426,7 @@ impl BTreeIndex {
         let serialized_lookup = page_lookup_file
             .read_range(0..num_rows_in_lookup, None)
             .await?;
+        metrics.record_btree_lookup_read_time(read_start.elapsed());
         let file_schema = page_lookup_file.schema();
         let batch_size = file_schema
             .metadata
@@ -1456,14 +1475,17 @@ impl BTreeIndex {
             None
         };
 
-        Ok(Arc::new(Self::try_from_serialized(
+        let deserialize_start = Instant::now();
+        let index = Self::try_from_serialized(
             serialized_lookup,
             store,
             index_cache,
             batch_size,
             ranges_to_files,
             frag_reuse_index,
-        )?))
+        )?;
+        metrics.record_btree_deserialize_time(deserialize_start.elapsed());
+        Ok(Arc::new(index))
     }
 
     // For legacy reasons a btree index expects the training input to use value/_rowid
@@ -1688,6 +1710,7 @@ impl ScalarIndex for BTreeIndex {
         metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult> {
         let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
+        let lookup_start = Instant::now();
         let mut pages = match query {
             SargableQuery::Equals(val) => self
                 .page_lookup
@@ -1761,6 +1784,7 @@ impl ScalarIndex for BTreeIndex {
                 }
             }
         }
+        metrics.record_btree_lookup_time(lookup_start.elapsed());
 
         let lazy_index_reader =
             LazyIndexReader::new(self.store.clone(), self.ranges_to_files.clone());
@@ -2919,8 +2943,12 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
         _index_details: &prost_types::Any,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
         cache: &LanceCache,
+        metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        Ok(BTreeIndex::load(index_store, frag_reuse_index, cache).await? as Arc<dyn ScalarIndex>)
+        Ok(
+            BTreeIndex::load_with_metrics(index_store, frag_reuse_index, cache, metrics).await?
+                as Arc<dyn ScalarIndex>,
+        )
     }
 
     async fn get_from_cache(
@@ -5056,10 +5084,11 @@ mod tests {
             "BTree cache should return the deserialized runtime index"
         );
 
+        let metrics = LocalMetricsCollector::default();
         let result = from_cache
             .search(
                 &SargableQuery::Equals(ScalarValue::Int32(Some(7))),
-                &NoOpMetricsCollector,
+                &metrics,
             )
             .await
             .unwrap();
@@ -5073,6 +5102,15 @@ mod tests {
             other => panic!("expected Exact, got {other:?}"),
         };
         assert_eq!(row_ids, vec![7]);
+        assert!(metrics.parts_loaded.load(Ordering::Relaxed) > 0);
+        assert!(metrics.part_load_time_ns.load(Ordering::Relaxed) > 0);
+        assert!(metrics.btree_lookup_time_ns.load(Ordering::Relaxed) > 0);
+        assert!(
+            metrics
+                .btree_page_search_time_ns
+                .load(Ordering::Relaxed)
+                > 0
+        );
     }
 
     #[tokio::test]

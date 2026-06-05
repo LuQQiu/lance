@@ -12,6 +12,7 @@ use lance_core::{
     cache::{LanceCache, UnsizedCacheKey},
 };
 
+use crate::metrics::MetricsCollector;
 use crate::progress::IndexBuildProgress;
 use crate::registry::IndexPluginRegistry;
 use crate::{
@@ -160,6 +161,7 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
         index_details: &prost_types::Any,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
         cache: &LanceCache,
+        metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn ScalarIndex>>;
 
     /// Look up a previously-opened index in the cache.

@@ -505,6 +505,7 @@ mod tests {
                 &default_details::<pbold::BTreeIndexDetails>(),
                 None,
                 &LanceCache::no_cache(),
+                &NoOpMetricsCollector,
             )
             .await
             .unwrap();
@@ -570,6 +571,7 @@ mod tests {
                 &default_details::<pbold::BTreeIndexDetails>(),
                 None,
                 &LanceCache::no_cache(),
+                &NoOpMetricsCollector,
             )
             .await
             .unwrap();
@@ -598,6 +600,7 @@ mod tests {
                 &default_details::<pbold::BTreeIndexDetails>(),
                 None,
                 &LanceCache::no_cache(),
+                &NoOpMetricsCollector,
             )
             .await
             .unwrap();
@@ -686,6 +689,7 @@ mod tests {
                 &default_details::<pbold::BTreeIndexDetails>(),
                 None,
                 &LanceCache::no_cache(),
+                &NoOpMetricsCollector,
             )
             .await
             .unwrap();
@@ -930,6 +934,7 @@ mod tests {
                     &default_details::<pbold::BTreeIndexDetails>(),
                     None,
                     &LanceCache::no_cache(),
+                    &NoOpMetricsCollector,
                 )
                 .await
                 .unwrap();
@@ -989,6 +994,7 @@ mod tests {
                 &default_details::<pbold::BTreeIndexDetails>(),
                 None,
                 &LanceCache::no_cache(),
+                &NoOpMetricsCollector,
             )
             .await
             .unwrap();
@@ -1596,6 +1602,7 @@ mod tests {
                         &default_details::<pbold::LabelListIndexDetails>(),
                         None,
                         &LanceCache::no_cache(),
+                        &NoOpMetricsCollector,
                     )
                     .await
                     .unwrap();
@@ -1705,6 +1712,7 @@ mod tests {
                 &default_details::<pbold::LabelListIndexDetails>(),
                 None,
                 &LanceCache::no_cache(),
+                &NoOpMetricsCollector,
             )
             .await
             .unwrap();
@@ -1770,6 +1778,7 @@ mod tests {
                 &default_details::<pbold::LabelListIndexDetails>(),
                 None,
                 &LanceCache::no_cache(),
+                &NoOpMetricsCollector,
             )
             .await
             .unwrap();

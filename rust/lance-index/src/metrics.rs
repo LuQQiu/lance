@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::Duration;
 
 /// A trait used by the index to report metrics
 ///
@@ -43,6 +44,27 @@ pub trait MetricsCollector: Send + Sync {
     ///
     /// The goal is to provide some visibility into the compute cost of the search
     fn record_comparisons(&self, num_comparisons: usize);
+
+    /// Record time spent checking the scalar-index cache.
+    fn record_index_cache_lookup_time(&self, _duration: Duration) {}
+
+    /// Record time spent loading a scalar index after a cache miss.
+    fn record_index_load_time(&self, _duration: Duration) {}
+
+    /// Record time spent loading an index part after a part-cache miss.
+    fn record_part_load_time(&self, _duration: Duration) {}
+
+    /// Record time spent finding candidate BTree pages from the top-level lookup.
+    fn record_btree_lookup_time(&self, _duration: Duration) {}
+
+    /// Record time spent reading BTree top-level lookup data.
+    fn record_btree_lookup_read_time(&self, _duration: Duration) {}
+
+    /// Record time spent deserializing BTree top-level lookup data.
+    fn record_btree_deserialize_time(&self, _duration: Duration) {}
+
+    /// Record time spent searching BTree leaf pages.
+    fn record_btree_page_search_time(&self, _duration: Duration) {}
 }
 
 /// A no-op metrics collector that does nothing
@@ -59,6 +81,13 @@ pub struct LocalMetricsCollector {
     pub parts_loaded: AtomicUsize,
     pub index_loads: AtomicUsize,
     pub comparisons: AtomicUsize,
+    pub index_cache_lookup_time_ns: AtomicU64,
+    pub index_load_time_ns: AtomicU64,
+    pub part_load_time_ns: AtomicU64,
+    pub btree_lookup_time_ns: AtomicU64,
+    pub btree_lookup_read_time_ns: AtomicU64,
+    pub btree_deserialize_time_ns: AtomicU64,
+    pub btree_page_search_time_ns: AtomicU64,
 }
 
 impl LocalMetricsCollector {
@@ -66,6 +95,27 @@ impl LocalMetricsCollector {
         other.record_parts_loaded(self.parts_loaded.load(Ordering::Relaxed));
         other.record_index_loads(self.index_loads.load(Ordering::Relaxed));
         other.record_comparisons(self.comparisons.load(Ordering::Relaxed));
+        other.record_index_cache_lookup_time(Duration::from_nanos(
+            self.index_cache_lookup_time_ns.load(Ordering::Relaxed),
+        ));
+        other.record_index_load_time(Duration::from_nanos(
+            self.index_load_time_ns.load(Ordering::Relaxed),
+        ));
+        other.record_part_load_time(Duration::from_nanos(
+            self.part_load_time_ns.load(Ordering::Relaxed),
+        ));
+        other.record_btree_lookup_time(Duration::from_nanos(
+            self.btree_lookup_time_ns.load(Ordering::Relaxed),
+        ));
+        other.record_btree_lookup_read_time(Duration::from_nanos(
+            self.btree_lookup_read_time_ns.load(Ordering::Relaxed),
+        ));
+        other.record_btree_deserialize_time(Duration::from_nanos(
+            self.btree_deserialize_time_ns.load(Ordering::Relaxed),
+        ));
+        other.record_btree_page_search_time(Duration::from_nanos(
+            self.btree_page_search_time_ns.load(Ordering::Relaxed),
+        ));
     }
 }
 
@@ -82,4 +132,43 @@ impl MetricsCollector for LocalMetricsCollector {
         self.comparisons
             .fetch_add(num_comparisons, Ordering::Relaxed);
     }
+
+    fn record_index_cache_lookup_time(&self, duration: Duration) {
+        self.index_cache_lookup_time_ns
+            .fetch_add(duration_to_nanos(duration), Ordering::Relaxed);
+    }
+
+    fn record_index_load_time(&self, duration: Duration) {
+        self.index_load_time_ns
+            .fetch_add(duration_to_nanos(duration), Ordering::Relaxed);
+    }
+
+    fn record_part_load_time(&self, duration: Duration) {
+        self.part_load_time_ns
+            .fetch_add(duration_to_nanos(duration), Ordering::Relaxed);
+    }
+
+    fn record_btree_lookup_time(&self, duration: Duration) {
+        self.btree_lookup_time_ns
+            .fetch_add(duration_to_nanos(duration), Ordering::Relaxed);
+    }
+
+    fn record_btree_lookup_read_time(&self, duration: Duration) {
+        self.btree_lookup_read_time_ns
+            .fetch_add(duration_to_nanos(duration), Ordering::Relaxed);
+    }
+
+    fn record_btree_deserialize_time(&self, duration: Duration) {
+        self.btree_deserialize_time_ns
+            .fetch_add(duration_to_nanos(duration), Ordering::Relaxed);
+    }
+
+    fn record_btree_page_search_time(&self, duration: Duration) {
+        self.btree_page_search_time_ns
+            .fetch_add(duration_to_nanos(duration), Ordering::Relaxed);
+    }
+}
+
+fn duration_to_nanos(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
