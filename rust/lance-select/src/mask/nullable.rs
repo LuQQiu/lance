@@ -57,6 +57,13 @@ impl NullableRowAddrSet {
         self.selected.contains(row_id) && !self.nulls.contains(row_id)
     }
 
+    /// Get the selected payload — the `true_rows | null_rows` union as stored.
+    /// Borrowed reference (no clone). Use this when serializing the underlying
+    /// payload as-is on the wire instead of materializing `true_rows()`.
+    pub fn selected_with_nulls(&self) -> &RowAddrTreeMap {
+        &self.selected
+    }
+
     /// Get the null rows
     pub fn null_rows(&self) -> &RowAddrTreeMap {
         &self.nulls
