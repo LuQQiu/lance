@@ -10,6 +10,7 @@ pub(crate) mod fmindex;
 pub(crate) mod inverted;
 pub(crate) mod zonemap;
 
+pub use crate::index::scalar_logical::{load_named_scalar_segments, open_scalar_index_segments};
 pub use inverted::{load_segment_details, load_segments};
 
 use std::sync::{Arc, LazyLock};

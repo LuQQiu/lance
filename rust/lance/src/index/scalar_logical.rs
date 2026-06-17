@@ -17,6 +17,7 @@ use lance_select::NullableRowAddrSet;
 use lance_table::format::IndexMetadata;
 use roaring::RoaringBitmap;
 use serde_json::json;
+use uuid::Uuid;
 
 use crate::dataset::Dataset;
 use crate::index::scalar::fetch_index_details;
@@ -210,7 +211,14 @@ fn index_intersects_dataset(index: &IndexMetadata, dataset: &Dataset) -> bool {
         .is_some_and(|index_bitmap| index_bitmap.intersection_len(&dataset.fragment_bitmap) > 0)
 }
 
-async fn load_named_scalar_segments(
+/// List the committed, dataset-intersecting segments of a named scalar index.
+///
+/// Returns one [`IndexMetadata`] per usable segment. The result length is the
+/// segment count: `1` means a single (non-segmented) index, `> 1` means the
+/// index is split across multiple segments that a distributed engine may route
+/// to different executors. All returned segments are validated to share the
+/// same underlying index type.
+pub async fn load_named_scalar_segments(
     dataset: &Dataset,
     column: &str,
     index_name: &str,
@@ -311,6 +319,63 @@ pub async fn open_named_scalar_index(
             )?) as Arc<dyn ScalarIndex>)
         }
     }
+}
+
+/// Open an explicit subset of a named scalar index's segments and present them
+/// as one searchable [`ScalarIndex`].
+///
+/// This is the distributed counterpart of [`open_named_scalar_index`]: instead
+/// of opening every committed segment, the caller passes the specific segment
+/// UUIDs an executor is responsible for. A single UUID opens that segment
+/// directly; multiple UUIDs are wrapped in a [`LogicalScalarIndex`] whose
+/// `search` unions the per-segment results and whose fragment coverage is the
+/// union of the segments' coverage. The UUID order does not affect results.
+///
+/// Errors if `uuids` is empty or if any UUID does not name a committed segment
+/// of `index_name` on `column`.
+pub async fn open_scalar_index_segments(
+    dataset: &Dataset,
+    column: &str,
+    index_name: &str,
+    uuids: &[Uuid],
+    metrics: &dyn MetricsCollector,
+) -> Result<Arc<dyn ScalarIndex>> {
+    if uuids.is_empty() {
+        return Err(Error::invalid_input(format!(
+            "open_scalar_index_segments requires at least one segment UUID for index '{}' on column '{}'",
+            index_name, column
+        )));
+    }
+
+    // Validate that every requested UUID is a committed segment of this index.
+    let available = load_named_scalar_segments(dataset, column, index_name).await?;
+    let available_uuids: std::collections::HashSet<Uuid> =
+        available.iter().map(|index| index.uuid).collect();
+    for uuid in uuids {
+        if !available_uuids.contains(uuid) {
+            return Err(Error::invalid_input(format!(
+                "Segment {} is not a committed segment of scalar index '{}' on column '{}'",
+                uuid, index_name, column
+            )));
+        }
+    }
+
+    if uuids.len() == 1 {
+        return dataset.open_scalar_index(column, &uuids[0], metrics).await;
+    }
+
+    let segments = try_join_all(
+        uuids
+            .iter()
+            .map(|uuid| async move { dataset.open_scalar_index(column, uuid, metrics).await }),
+    )
+    .await?;
+
+    Ok(Arc::new(LogicalScalarIndex::try_new(
+        index_name.to_string(),
+        column.to_string(),
+        segments,
+    )?) as Arc<dyn ScalarIndex>)
 }
 
 #[cfg(test)]
