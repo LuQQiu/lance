@@ -44,6 +44,16 @@ pub trait MetricsCollector: Send + Sync {
     /// The goal is to provide some visibility into the compute cost of the search
     fn record_comparisons(&self, num_comparisons: usize);
 
+    /// Record one CPU search task and its wall-clock duration.
+    ///
+    /// The inverted index groups partitions into `spawn_cpu` tasks (see
+    /// `LANCE_FTS_PARTITIONS_PER_TASK`). Summing the per-task duration and
+    /// counting the tasks lets callers compute the average task time, which
+    /// reveals whether each task is doing meaningful work or is dominated by
+    /// per-task spawn/dispatch overhead. `nanos` is nanoseconds; callers that
+    /// surface it should format it in milliseconds. The default is a no-op.
+    fn record_partition_task(&self, _nanos: u64) {}
+
     /// Returns an optional sink for recording exact I/O statistics (bytes read,
     /// IOPS, and requests) performed on behalf of this collector.
     ///

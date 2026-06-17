@@ -122,6 +122,20 @@ pub const POSITIONS_CODEC_VARINT_DOC_DELTA_V2: &str = "varint_doc_delta_v2";
 pub const POSITIONS_CODEC_PACKED_DELTA_V1: &str = "packed_delta_v1";
 pub const DELETED_FRAGMENTS_COL: &str = "deleted_fragments";
 
+/// Number of index partitions whose WAND search is grouped into a single
+/// `spawn_cpu` task during `bm25_search`. Default `1` preserves the historical
+/// one-task-per-partition behavior. Larger values reduce per-task spawn/dispatch
+/// overhead when each partition's WAND work is small (many tiny partitions),
+/// at the cost of coarser intra-query parallelism. Read once from
+/// `LANCE_FTS_PARTITIONS_PER_TASK`; invalid or zero values fall back to `1`.
+static FTS_PARTITIONS_PER_TASK: LazyLock<usize> = LazyLock::new(|| {
+    std::env::var("LANCE_FTS_PARTITIONS_PER_TASK")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(1)
+});
+
 // Just a heuristic when we need to pre-allocate memory for tokens
 pub const ESTIMATED_MAX_TOKENS_PER_ROW: usize = 4 * 1024;
 
@@ -207,15 +221,6 @@ impl FromStr for InvertedListFormatVersion {
 struct PartitionCandidates {
     tokens_by_position: Vec<String>,
     candidates: Vec<DocCandidate>,
-}
-
-impl PartitionCandidates {
-    fn empty() -> Self {
-        Self {
-            tokens_by_position: Vec::new(),
-            candidates: Vec::new(),
-        }
-    }
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Default)]
@@ -705,64 +710,98 @@ impl InvertedIndex {
         // and prunes against the running global k-th (a lower bound on the true
         // global k-th — see `Wand::shared_threshold`).
         let shared_threshold = Arc::new(AtomicU32::new(f32::NEG_INFINITY.to_bits()));
-        let parts = self
+        // Group partitions so that one `spawn_cpu` task runs the WAND search for
+        // up to `FTS_PARTITIONS_PER_TASK` partitions. With many tiny partitions
+        // each WAND call is sub-millisecond, so a task per partition makes the
+        // per-task spawn/dispatch overhead dominate; chunking amortizes it.
+        // Default `1` is the historical one-task-per-partition behavior.
+        let partitions_per_task = *FTS_PARTITIONS_PER_TASK;
+        let chunks = self
             .partitions
-            .iter()
-            .map(|part| {
-                let part = part.clone();
+            .chunks(partitions_per_task)
+            .map(|chunk| {
+                let chunk: Vec<_> = chunk.to_vec();
                 let tokens = tokens.clone();
                 let params = params.clone();
                 let mask = mask.clone();
                 let metrics = metrics.clone();
                 let shared_threshold = shared_threshold.clone();
                 async move {
-                    let postings = part
-                        .load_posting_lists(tokens.as_ref(), params.as_ref(), metrics.as_ref())
-                        .await?;
-                    if postings.is_empty() {
-                        // No hits in this partition; its DocSet stays
-                        // unloaded, so we never pay the per-doc
-                        // row_id/num_tokens download for it.
-                        return Result::Ok(PartitionCandidates::empty());
+                    // Load each partition's posting lists + WAND docs (async I/O)
+                    // before handing the whole chunk to a single CPU task.
+                    let mut loaded = Vec::with_capacity(chunk.len());
+                    for part in &chunk {
+                        let postings = part
+                            .load_posting_lists(tokens.as_ref(), params.as_ref(), metrics.as_ref())
+                            .await?;
+                        if postings.is_empty() {
+                            // No hits in this partition; its DocSet stays
+                            // unloaded, so we never pay the per-doc
+                            // row_id/num_tokens download for it.
+                            continue;
+                        }
+                        let docs_for_wand = part.docs.docs_for_wand(mask.as_ref()).await?;
+                        let max_position = postings
+                            .iter()
+                            .map(|posting| posting.term_index() as usize)
+                            .max()
+                            .unwrap_or_default();
+                        let mut tokens_by_position = vec![String::new(); max_position + 1];
+                        for posting in &postings {
+                            let idx = posting.term_index() as usize;
+                            tokens_by_position[idx] = posting.token().to_owned();
+                        }
+                        loaded.push((part.clone(), postings, docs_for_wand, tokens_by_position));
                     }
-                    let docs_for_wand = part.docs.docs_for_wand(mask.as_ref()).await?;
-                    let max_position = postings
-                        .iter()
-                        .map(|posting| posting.term_index() as usize)
-                        .max()
-                        .unwrap_or_default();
-                    let mut tokens_by_position = vec![String::new(); max_position + 1];
-                    for posting in &postings {
-                        let idx = posting.term_index() as usize;
-                        tokens_by_position[idx] = posting.token().to_owned();
+                    if loaded.is_empty() {
+                        return Result::Ok(Vec::new());
                     }
+                    // Keep cheap `Arc` partition handles for the post-compute
+                    // deferred-candidate resolution; the heavy posting lists and
+                    // doc sets move into the single CPU task below.
+                    let parts_for_resolve: Vec<_> =
+                        loaded.iter().map(|(part, ..)| part.clone()).collect();
                     let params = params.clone();
                     let mask = mask.clone();
                     let metrics = metrics.clone();
-                    let part_for_wand = part.clone();
-                    let mut partition_result = spawn_cpu(move || {
-                        let candidates = part_for_wand.bm25_search(
-                            docs_for_wand.as_ref(),
-                            params.as_ref(),
-                            operator,
-                            mask,
-                            postings,
-                            metrics.as_ref(),
-                            shared_threshold,
-                        )?;
-                        std::result::Result::<_, Error>::Ok(PartitionCandidates {
-                            tokens_by_position,
-                            candidates,
-                        })
+                    // Run every loaded partition's WAND search in a single CPU
+                    // task. Candidates still resolve per-partition afterwards.
+                    // Time the in-task work so callers can compute the average
+                    // task duration (one task = one chunk of partitions).
+                    let mut results = spawn_cpu(move || {
+                        let task_start = std::time::Instant::now();
+                        let mut out = Vec::with_capacity(loaded.len());
+                        for (part, postings, docs_for_wand, tokens_by_position) in loaded {
+                            let candidates = part.bm25_search(
+                                docs_for_wand.as_ref(),
+                                params.as_ref(),
+                                operator,
+                                mask.clone(),
+                                postings,
+                                metrics.as_ref(),
+                                shared_threshold.clone(),
+                            )?;
+                            out.push(PartitionCandidates {
+                                tokens_by_position,
+                                candidates,
+                            });
+                        }
+                        metrics.record_partition_task(task_start.elapsed().as_nanos() as u64);
+                        std::result::Result::<_, Error>::Ok(out)
                     })
                     .await?;
-                    resolve_deferred_candidates(&part.docs, &mut partition_result.candidates)
-                        .await?;
-                    Result::Ok(partition_result)
+                    // Resolve deferred candidates against each partition's docs.
+                    for (part, result) in parts_for_resolve.iter().zip(results.iter_mut()) {
+                        resolve_deferred_candidates(&part.docs, &mut result.candidates).await?;
+                    }
+                    Result::Ok(results)
                 }
             })
             .collect::<Vec<_>>();
-        let mut parts = stream::iter(parts).buffer_unordered(get_num_compute_intensive_cpus());
+        let mut parts = stream::iter(chunks)
+            .buffer_unordered(get_num_compute_intensive_cpus())
+            .map_ok(|chunk_results| stream::iter(chunk_results.into_iter().map(Result::Ok)))
+            .try_flatten();
         let mut idf_cache: HashMap<String, f32> = HashMap::new();
         while let Some(res) = parts.try_next().await? {
             if res.candidates.is_empty() {

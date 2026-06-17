@@ -21,7 +21,7 @@ use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, Pla
 use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::{Distribution, EquivalenceProperties, Partitioning};
 use datafusion_physical_plan::joins::{HashJoinExec, PartitionMode};
-use datafusion_physical_plan::metrics::{BaselineMetrics, Count};
+use datafusion_physical_plan::metrics::{BaselineMetrics, Count, Time};
 use futures::future::try_join_all;
 use futures::stream::{self};
 use futures::{FutureExt, StreamExt, TryStreamExt};
@@ -30,7 +30,10 @@ use lance_core::{
     Error, ROW_ID, Result,
     utils::{tokio::get_num_compute_intensive_cpus, tracing::StreamTracingExt},
 };
-use lance_datafusion::utils::{ExecutionPlanMetricsSetExt, MetricsExt, PARTITIONS_SEARCHED_METRIC};
+use lance_datafusion::utils::{
+    ExecutionPlanMetricsSetExt, MetricsExt, PARTITION_SEARCH_TASK_NUMBER_METRIC,
+    PARTITION_SEARCH_TASK_TIME_METRIC, PARTITIONS_SEARCHED_METRIC,
+};
 use lance_table::format::IndexMetadata;
 
 use super::PreFilterSource;
@@ -159,6 +162,12 @@ fn default_text_tokenizer() -> Box<dyn LanceTokenizer> {
 pub struct FtsIndexMetrics {
     index_metrics: IndexMetrics,
     partitions_searched: Count,
+    /// Number of `spawn_cpu` tasks that ran the partition WAND search.
+    partition_search_tasks: Count,
+    /// Total time spent inside those tasks. With `partition_search_tasks` this
+    /// yields the average task duration, revealing whether each task does
+    /// meaningful work or is dominated by per-task spawn overhead.
+    partition_search_task_time: Time,
     baseline_metrics: BaselineMetrics,
 }
 
@@ -167,6 +176,10 @@ impl FtsIndexMetrics {
         Self {
             index_metrics: IndexMetrics::new(metrics, partition),
             partitions_searched: metrics.new_count(PARTITIONS_SEARCHED_METRIC, partition),
+            partition_search_tasks: metrics
+                .new_count(PARTITION_SEARCH_TASK_NUMBER_METRIC, partition),
+            partition_search_task_time: metrics
+                .new_time(PARTITION_SEARCH_TASK_TIME_METRIC, partition),
             baseline_metrics: BaselineMetrics::new(metrics, partition),
         }
     }
@@ -187,6 +200,12 @@ impl MetricsCollector for FtsIndexMetrics {
 
     fn record_comparisons(&self, num_comparisons: usize) {
         self.index_metrics.record_comparisons(num_comparisons);
+    }
+
+    fn record_partition_task(&self, nanos: u64) {
+        self.partition_search_tasks.add(1);
+        self.partition_search_task_time
+            .add_duration(std::time::Duration::from_nanos(nanos));
     }
 }
 
