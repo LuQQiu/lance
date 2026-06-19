@@ -8129,6 +8129,109 @@ mod tests {
         );
     }
 
+    /// REPRO: hammer bm25_search concurrently (AND + base_scorer + spawn_cpu)
+    /// to reproduce the distributed-FTS hang locally. Builds a small index with
+    /// heavy common tokens (large posting lists = WAND-heavy), then spawns many
+    /// concurrent searches in a loop. If the spawn_cpu/posting-load race wedges,
+    /// the test hangs (run with a timeout to catch it).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn repro_concurrent_bm25_search_hang() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let num_docs = 5000u32;
+        let common_tokens = ["alpha", "beta", "gamma", "delta", "epsilon"];
+        let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
+        builder.group_config = PostingGroupConfig {
+            target_bytes: 4096,
+            max_tokens: 32,
+        };
+        let mut common_ids = Vec::new();
+        for tok in common_tokens {
+            let id = builder.tokens.add(tok.to_owned());
+            builder.posting_lists.push(PostingListBuilder::new(false));
+            common_ids.push(id as usize);
+        }
+        let mut rare_ids = Vec::new();
+        for d in 0..num_docs {
+            let id = builder.tokens.add(format!("r{d}"));
+            builder.posting_lists.push(PostingListBuilder::new(false));
+            rare_ids.push(id as usize);
+        }
+        for d in 0..num_docs {
+            for &cid in &common_ids {
+                builder.posting_lists[cid].add(d, PositionRecorder::Count(1));
+            }
+            builder.posting_lists[rare_ids[d as usize]].add(d, PositionRecorder::Count(1));
+            builder.docs.append(1000 + d as u64, common_tokens.len() as u32 + 1);
+        }
+        builder.write(store.as_ref()).await.unwrap();
+        let metadata = HashMap::from([
+            ("partitions".to_owned(), serde_json::to_string(&vec![0u64]).unwrap()),
+            ("params".to_owned(), serde_json::to_string(&InvertedIndexParams::default()).unwrap()),
+            (TOKEN_SET_FORMAT_KEY.to_owned(), TokenSetFormat::default().to_string()),
+        ]);
+        let mut writer = store
+            .new_index_file(METADATA_FILE, Arc::new(arrow_schema::Schema::empty()))
+            .await
+            .unwrap();
+        writer.finish_with_metadata(metadata).await.unwrap();
+
+        let cache = Arc::new(LanceCache::with_capacity(1 << 24));
+        let index = InvertedIndex::load(store.clone(), None, cache.as_ref())
+            .await
+            .unwrap();
+
+        let warm_tokens = Arc::new(Tokens::new(
+            vec!["alpha".to_string(), "beta".to_string()],
+            DocType::Text,
+        ));
+        let base = Arc::new(
+            index
+                .bm25_base_scorer(warm_tokens.as_ref(), &FtsSearchParams::new())
+                .await
+                .unwrap(),
+        );
+
+        let rounds = 200usize;
+        let conc = 128usize;
+        for round in 0..rounds {
+            let mut handles = Vec::new();
+            for c in 0..conc {
+                let index = index.clone();
+                let base = base.clone();
+                let terms = vec![
+                    common_tokens[c % common_tokens.len()].to_string(),
+                    common_tokens[(c + 1) % common_tokens.len()].to_string(),
+                    format!("r{}", (round * conc + c) % num_docs as usize),
+                ];
+                handles.push(tokio::spawn(async move {
+                    index
+                        .bm25_search(
+                            Arc::new(Tokens::new(terms, DocType::Text)),
+                            Arc::new(FtsSearchParams::new().with_limit(Some(100))),
+                            Operator::And,
+                            Arc::new(NoFilter),
+                            Arc::new(NoOpMetricsCollector),
+                            Some(base.as_ref()),
+                        )
+                        .await
+                }));
+            }
+            for h in handles {
+                let _ = h.await.unwrap();
+            }
+            if round % 20 == 0 {
+                eprintln!("repro round {round}/{rounds} ok");
+            }
+        }
+        eprintln!("repro completed all {rounds} rounds with NO hang");
+    }
+
     #[tokio::test]
     async fn flat_bm25_search_stop_word_query_over_unindexed_rows_returns_empty() {
         let schema = Arc::new(Schema::new(vec![

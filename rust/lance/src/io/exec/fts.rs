@@ -115,7 +115,8 @@ async fn search_segments(
             let metrics = metrics.clone();
             let base_scorer = base_scorer.clone();
             async move {
-                index
+                tracing::info!(target: "remote_fts", ludebug = true, stage = "bm25_call_begin", "search_segments -> index.bm25_search begin");
+                let r = index
                     .bm25_search(
                         tokens,
                         params,
@@ -124,7 +125,9 @@ async fn search_segments(
                         metrics,
                         Some(base_scorer.as_ref()),
                     )
-                    .await
+                    .await;
+                tracing::info!(target: "remote_fts", ludebug = true, stage = "bm25_call_done", ok = r.is_ok(), "search_segments -> index.bm25_search done");
+                r
             }
         })
         .collect::<Vec<_>>();
