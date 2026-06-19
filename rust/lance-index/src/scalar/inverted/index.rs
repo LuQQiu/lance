@@ -717,11 +717,9 @@ impl InvertedIndex {
                 let metrics = metrics.clone();
                 let shared_threshold = shared_threshold.clone();
                 async move {
-                    tracing::info!(target: "remote_fts", ludebug = true, stage = "bm25_load_postings_begin", "bm25_search load_posting_lists begin");
                     let postings = part
                         .load_posting_lists(tokens.as_ref(), params.as_ref(), metrics.as_ref())
                         .await?;
-                    tracing::info!(target: "remote_fts", ludebug = true, stage = "bm25_load_postings_done", n = postings.len(), "bm25_search load_posting_lists done");
                     if postings.is_empty() {
                         // No hits in this partition; its DocSet stays
                         // unloaded, so we never pay the per-doc
@@ -743,7 +741,6 @@ impl InvertedIndex {
                     let mask = mask.clone();
                     let metrics = metrics.clone();
                     let part_for_wand = part.clone();
-                    tracing::info!(target: "remote_fts", ludebug = true, stage = "bm25_spawn_cpu_begin", "bm25_search spawn_cpu WAND begin");
                     let mut partition_result = spawn_cpu(move || {
                         let candidates = part_for_wand.bm25_search(
                             docs_for_wand.as_ref(),
@@ -760,10 +757,8 @@ impl InvertedIndex {
                         })
                     })
                     .await?;
-                    tracing::info!(target: "remote_fts", ludebug = true, stage = "bm25_spawn_cpu_done", "bm25_search spawn_cpu WAND done");
                     resolve_deferred_candidates(&part.docs, &mut partition_result.candidates)
                         .await?;
-                    tracing::info!(target: "remote_fts", ludebug = true, stage = "bm25_deferred_done", "bm25_search resolve_deferred done");
                     Result::Ok(partition_result)
                 }
             })

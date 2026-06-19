@@ -439,18 +439,6 @@ impl ExecutionPlan for MatchQueryExec {
         let preset_base_scorer = self.base_scorer.clone();
         let preset_segments = self.preset_segments.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
-        tracing::info!(
-            target: "remote_fts", ludebug = true, stage = "matchexec_inputs",
-            partition,
-            terms = %query.terms,
-            column = ?query.column,
-            operator = ?query.operator,
-            fuzziness = ?query.fuzziness,
-            preset_segments = preset_segments.as_ref().map(|s| s.len()).unwrap_or(0),
-            has_preset_scorer = preset_base_scorer.is_some(),
-            limit = ?params.limit,
-            "MatchQueryExec execute inputs"
-        );
         let column = query.column.ok_or(DataFusionError::Execution(format!(
             "column not set for MatchQuery {}",
             query.terms
@@ -507,7 +495,6 @@ impl ExecutionPlan for MatchQueryExec {
                 }
             };
             let tokens = collect_query_tokens(&query.terms, &mut tokenizer);
-            tracing::info!(target: "remote_fts", ludebug = true, stage = "fts_scorer_begin", preset = preset_base_scorer.is_some(), nseg = indices.len(), "MatchQueryExec base scorer begin (None=>build_global_bm25_scorer)");
             let base_scorer = match preset_base_scorer {
                 Some(scorer) => scorer,
                 None => Arc::new(
@@ -516,8 +503,6 @@ impl ExecutionPlan for MatchQueryExec {
                         .await?,
                 ),
             };
-
-            tracing::info!(target: "remote_fts", ludebug = true, stage = "fts_scorer_done", "MatchQueryExec base scorer done, prefilter wait");
             pre_filter.wait_for_ready().await?;
             tracing::info!(target: "remote_fts", ludebug = true, stage = "fts_search_begin", "MatchQueryExec search_segments begin");
             let tokens = Arc::new(tokens);
