@@ -439,6 +439,18 @@ impl ExecutionPlan for MatchQueryExec {
         let preset_base_scorer = self.base_scorer.clone();
         let preset_segments = self.preset_segments.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
+        tracing::info!(
+            target: "remote_fts", ludebug = true, stage = "matchexec_inputs",
+            partition,
+            terms = %query.terms,
+            column = ?query.column,
+            operator = ?query.operator,
+            fuzziness = ?query.fuzziness,
+            preset_segments = preset_segments.as_ref().map(|s| s.len()).unwrap_or(0),
+            has_preset_scorer = preset_base_scorer.is_some(),
+            limit = ?params.limit,
+            "MatchQueryExec execute inputs"
+        );
         let column = query.column.ok_or(DataFusionError::Execution(format!(
             "column not set for MatchQuery {}",
             query.terms
