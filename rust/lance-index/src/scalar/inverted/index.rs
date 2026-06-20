@@ -148,6 +148,30 @@ pub fn max_supported_fts_format_version() -> InvertedListFormatVersion {
     InvertedListFormatVersion::V2
 }
 
+/// Default cap on how many partitions of a single FTS query are scored
+/// concurrently (the `buffer_unordered` width over per-partition WAND jobs).
+///
+/// Each in-flight partition spawns a CPU-bound WAND task onto the shared
+/// `spawn_cpu` blocking pool. With many partitions per segment and many
+/// concurrent queries, an unbounded fan-out (one job per partition) massively
+/// oversubscribes that pool and starves every query of CPU time. Capping the
+/// per-query fan-out keeps total in-flight WAND jobs bounded so queries make
+/// steady progress under load. Override via `LANCE_FTS_PARTITION_CONCURRENCY`.
+const DEFAULT_FTS_PARTITION_CONCURRENCY: usize = 40;
+
+/// Per-query partition scoring concurrency, read from
+/// `LANCE_FTS_PARTITION_CONCURRENCY` (default [`DEFAULT_FTS_PARTITION_CONCURRENCY`]).
+/// A value of 0 or an unparseable value falls back to the default.
+pub fn fts_partition_concurrency() -> usize {
+    match std::env::var("LANCE_FTS_PARTITION_CONCURRENCY") {
+        Ok(v) => match v.parse::<usize>() {
+            Ok(n) if n > 0 => n,
+            _ => DEFAULT_FTS_PARTITION_CONCURRENCY,
+        },
+        Err(_) => DEFAULT_FTS_PARTITION_CONCURRENCY,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum InvertedListFormatVersion {
     #[default]
@@ -763,7 +787,10 @@ impl InvertedIndex {
                 }
             })
             .collect::<Vec<_>>();
-        let mut parts = stream::iter(parts).buffer_unordered(get_num_compute_intensive_cpus());
+        // Cap per-query partition fan-out so concurrent FTS queries don't
+        // oversubscribe the shared spawn_cpu pool. See `fts_partition_concurrency`.
+        let mut parts = stream::iter(parts)
+            .buffer_unordered(fts_partition_concurrency().min(get_num_compute_intensive_cpus()));
         let mut idf_cache: HashMap<String, f32> = HashMap::new();
         while let Some(res) = parts.try_next().await? {
             if res.candidates.is_empty() {
