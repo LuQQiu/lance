@@ -241,7 +241,7 @@ impl IoQueue {
                     && !state.pending_requests.is_empty();
                 if stuck && !self.debug_deadlock_logged.swap(true, Ordering::AcqRel) {
                     let next = state.pending_requests.peek().unwrap();
-                    log::warn!(
+                    tracing::warn!(
                         "LUDEBUG: I/O loop DEADLOCK — pending work, nothing in flight to refund: \
                          iops_avail={} bytes_avail={} in_flight=0 pending={} \
                          next_task_bytes={} next_priority={} min_in_flight={} no_backpressure={}",
@@ -270,6 +270,12 @@ impl IoQueue {
         self.notify.notify_one();
     }
 
+    /// Release the backpressure budget reserved at dispatch.  This is normally
+    /// called when the consumer consumes the response (keeping the buffered-but-
+    /// unconsumed byte bound meaningful), but it is ALSO called if the consumer
+    /// future is dropped before consuming (see the `BudgetGuard` in
+    /// `submit_request_standard`) — otherwise a dropped consumer would leak the
+    /// budget and the I/O loop would park on its `Notify` forever (deadlock).
     fn on_bytes_consumed(&self, bytes: u64, priority: u128, num_reqs: usize) {
         let mut state = self.state.lock().unwrap();
         state.bytes_avail += bytes as i64;
@@ -477,11 +483,11 @@ async fn run_io_loop(tasks: Arc<IoQueue>) {
                 tokio::spawn(async move {
                     if let Err(join_err) = handle.await {
                         if join_err.is_panic() {
-                            log::error!(
+                            tracing::error!(
                                 "LUDEBUG: I/O task PANICKED (credit leaked) path={path} range={range:?}: {join_err}"
                             );
                         } else if join_err.is_cancelled() {
-                            log::error!(
+                            tracing::error!(
                                 "LUDEBUG: I/O task CANCELLED path={path} range={range:?}"
                             );
                         }
@@ -844,16 +850,68 @@ impl ScanScheduler {
     ) -> impl Future<Output = Result<Vec<Bytes>>> + Send + use<> {
         let (tx, rx) = oneshot::channel::<Response>();
 
+        // Total bytes and request count reserved by `next_task` at dispatch
+        // (debits `bytes_avail` and pushes one `priorities_in_flight` entry per
+        // IOP).  We must release exactly this much, exactly once.
+        let reserved_bytes: u64 = request.iter().map(|r| r.end - r.start).sum();
+        let num_reqs = request.len();
+
         self.do_submit_request(reader, request, tx, priority, io_queue, bypass_backpressure);
 
-        let io_queue_clone = io_queue.clone();
+        // The backpressure budget is released on the CONSUMER side so the
+        // "buffered-but-unconsumed bytes" bound stays meaningful — a slow
+        // consumer holds the budget, applying backpressure.  The bug this guard
+        // fixes: if the consumer future is DROPPED before consuming (e.g.
+        // `buffer_unordered(..).try_collect()` short-circuits on an error and
+        // drops its siblings mid-flight), the release used to never happen, so
+        // `bytes_avail` was leaked and the I/O loop parked on its `Notify`
+        // forever (deadlock).  `BudgetGuard::Drop` releases the reserved budget
+        // on EITHER path: success settles it explicitly; a drop releases it too.
+        struct BudgetGuard {
+            io_queue: Arc<IoQueue>,
+            settled: bool,
+            reserved_bytes: u64,
+            priority: u128,
+            num_reqs: usize,
+        }
+        impl Drop for BudgetGuard {
+            fn drop(&mut self) {
+                if !self.settled {
+                    // Consumer dropped before consuming — un-reserve the budget
+                    // so the I/O loop is unblocked instead of parking forever.
+                    self.io_queue.on_bytes_consumed(
+                        self.reserved_bytes,
+                        self.priority,
+                        self.num_reqs,
+                    );
+                }
+            }
+        }
 
-        rx.map(move |wrapped_rsp| {
-            // Right now, it isn't possible for I/O to be cancelled so a cancel error should
-            // not occur
-            let rsp = wrapped_rsp.unwrap();
-            io_queue_clone.on_bytes_consumed(rsp.num_bytes, rsp.priority, rsp.num_reqs);
-            rsp.data
+        let mut guard = BudgetGuard {
+            io_queue: io_queue.clone(),
+            settled: false,
+            reserved_bytes,
+            priority,
+            num_reqs,
+        };
+
+        rx.map(move |wrapped_rsp| match wrapped_rsp {
+            Ok(rsp) => {
+                // Success: release the budget with the actual response
+                // accounting and mark settled so the guard's Drop is a no-op.
+                guard.settled = true;
+                guard
+                    .io_queue
+                    .on_bytes_consumed(rsp.num_bytes, rsp.priority, rsp.num_reqs);
+                rsp.data
+            }
+            // tx dropped without sending (producing MutableBatch dropped before
+            // delivering).  Guard's Drop releases the reserved budget.  Surface a
+            // clean error instead of panicking (the old `.unwrap()` here).
+            Err(_canceled) => Err(Error::internal(
+                "I/O request was cancelled before completion".to_string(),
+            )),
         })
     }
 
@@ -1888,5 +1946,48 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(bytes_dispatched.load(Ordering::Acquire), 30);
+    }
+
+    /// Regression test for the prewarm-hang deadlock: if a read future is
+    /// dropped before it consumes its response (as `buffer_unordered(..).
+    /// try_collect()` does to its siblings when one errors), the backpressure
+    /// budget it reserved must still be released — otherwise the scheduler's
+    /// I/O loop parks on its `Notify` forever and all subsequent reads on that
+    /// scheduler hang.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_dropped_consumer_releases_budget() {
+        let some_path = Path::parse("foo").unwrap();
+        let obj_store = Arc::new(ObjectStore::memory());
+        obj_store
+            .put(&some_path, vec![0u8; 100_000].as_slice())
+            .await
+            .unwrap();
+
+        // Tiny byte budget so a single un-released read would block everything.
+        let config = SchedulerConfig {
+            io_buffer_size_bytes: 10,
+            use_lite_scheduler: Some(false),
+        };
+        let scan_scheduler = ScanScheduler::new(obj_store, config);
+        let file_scheduler = scan_scheduler
+            .open_file(&some_path, &CachedFileSize::new(100_000))
+            .await
+            .unwrap();
+
+        // Submit a read that fills the budget, then DROP its future before
+        // consuming the bytes — the pre-fix bug leaked the budget here.
+        for _ in 0..50 {
+            let fut = file_scheduler.submit_single(0..10, 0);
+            drop(fut);
+        }
+
+        // After all those drops, a fresh read must still complete promptly.
+        // Pre-fix this would hang forever (budget exhausted, I/O loop parked).
+        let result = timeout(Duration::from_secs(10), file_scheduler.submit_single(0..10, 0)).await;
+        assert!(
+            result.is_ok(),
+            "read hung: dropped consumers leaked the backpressure budget and wedged the I/O loop"
+        );
+        assert_eq!(result.unwrap().unwrap().len(), 10);
     }
 }
