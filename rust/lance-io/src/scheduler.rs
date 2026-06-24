@@ -10,7 +10,7 @@ use std::fmt::Debug;
 use std::future::Future;
 use std::num::NonZero;
 use std::ops::Range;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::Notify;
@@ -64,6 +64,14 @@ impl PrioritiesInFlight {
 
     fn min_in_flight(&self) -> u128 {
         self.in_flight.first().copied().unwrap_or(u128::MAX)
+    }
+
+    // DEBUG(prewarm-hang): number of dispatched-but-not-yet-consumed IOPs.
+    // Bumped at dispatch (push), dropped on consume (remove). If this stays > 0
+    // while iops_avail/bytes_avail are exhausted and nothing completes, a
+    // consumer was dropped mid-flight and leaked its credits.
+    fn debug_in_flight(&self) -> usize {
+        self.in_flight.len()
     }
 
     fn push(&mut self, prio: u128) {
@@ -183,6 +191,9 @@ struct IoQueue {
     state: Mutex<IoQueueState>,
     // Used to signal new I/O requests have arrived that might potentially be runnable
     notify: Notify,
+    // DEBUG(prewarm-hang): set once when we detect a true deadlock (so the warn
+    // fires at most once per stuck episode); reset when work flows again.
+    debug_deadlock_logged: AtomicBool,
 }
 
 impl IoQueue {
@@ -190,6 +201,7 @@ impl IoQueue {
         Self {
             state: Mutex::new(IoQueueState::new(io_capacity, io_buffer_size)),
             notify: Notify::new(),
+            debug_deadlock_logged: AtomicBool::new(false),
         }
     }
 
@@ -217,6 +229,32 @@ impl IoQueue {
 
                 if state.done_scheduling {
                     return None;
+                }
+
+                // DEBUG(prewarm-hang): only log the TRUE deadlock, not normal
+                // backpressure stalls. Deadlock = pending work that can't be
+                // delivered AND nothing in flight to ever refund a credit
+                // (in_flight==0). Debounced to fire at most once per stuck
+                // episode (reset when in_flight>0 again) so it can't flood the
+                // log or perturb timing during healthy operation.
+                let stuck = state.priorities_in_flight.debug_in_flight() == 0
+                    && !state.pending_requests.is_empty();
+                if stuck && !self.debug_deadlock_logged.swap(true, Ordering::AcqRel) {
+                    let next = state.pending_requests.peek().unwrap();
+                    log::warn!(
+                        "LUDEBUG: I/O loop DEADLOCK — pending work, nothing in flight to refund: \
+                         iops_avail={} bytes_avail={} in_flight=0 pending={} \
+                         next_task_bytes={} next_priority={} min_in_flight={} no_backpressure={}",
+                        state.iops_avail,
+                        state.bytes_avail,
+                        state.pending_requests.len(),
+                        next.num_bytes(),
+                        next.priority,
+                        state.priorities_in_flight.min_in_flight(),
+                        state.no_backpressure,
+                    );
+                } else if !stuck {
+                    self.debug_deadlock_logged.store(false, Ordering::Release);
                 }
             }
 
@@ -430,7 +468,25 @@ async fn run_io_loop(tasks: Arc<IoQueue>) {
         let next_task = tasks.pop().await;
         match next_task {
             Some(task) => {
-                tokio::spawn(task.run());
+                // DEBUG(prewarm-hang): wrap so a panic in task.run() (which would
+                // otherwise be silently swallowed by the dropped JoinHandle and
+                // leak an iops_avail credit -> I/O loop deadlock) is surfaced.
+                let path = task.reader.path().to_string();
+                let range = task.to_read.clone();
+                let handle = tokio::spawn(task.run());
+                tokio::spawn(async move {
+                    if let Err(join_err) = handle.await {
+                        if join_err.is_panic() {
+                            log::error!(
+                                "LUDEBUG: I/O task PANICKED (credit leaked) path={path} range={range:?}: {join_err}"
+                            );
+                        } else if join_err.is_cancelled() {
+                            log::error!(
+                                "LUDEBUG: I/O task CANCELLED path={path} range={range:?}"
+                            );
+                        }
+                    }
+                });
             }
             None => {
                 // The sender has been dropped, we are done
