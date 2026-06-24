@@ -12,7 +12,7 @@ use std::num::NonZero;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
 use lance_core::utils::io_stats::IoStatsRecorder;
@@ -160,8 +160,17 @@ impl IoQueueState {
     }
 
     fn next_task(&mut self) -> Option<IoTask> {
+        self.next_task_inner(false)
+    }
+
+    /// `force_progress`: admit the head task even if the byte budget is
+    /// exhausted (but never if the IOP slots are exhausted).  Used only when the
+    /// I/O loop would otherwise park forever — see `IoQueue::pop`.
+    fn next_task_inner(&mut self, force_progress: bool) -> Option<IoTask> {
         let task = self.pending_requests.peek()?;
-        if self.can_deliver(task) {
+        let deliver = self.can_deliver(task)
+            || (force_progress && self.iops_avail > 0);
+        if deliver {
             let skip_bytes_accounting = self.no_backpressure || task.bypass_backpressure;
             self.priorities_in_flight.push(task.priority);
             self.iops_avail -= 1;
@@ -169,8 +178,9 @@ impl IoQueueState {
                 self.bytes_avail -= task.num_bytes() as i64;
                 if self.bytes_avail < 0 {
                     // This can happen when we admit special priority requests
+                    // or force progress to avoid a backpressure deadlock.
                     log::debug!(
-                        "Backpressure throttle temporarily exceeded by {} bytes due to priority I/O",
+                        "Backpressure throttle temporarily exceeded by {} bytes due to priority/forced I/O",
                         -self.bytes_avail
                     );
                 }
@@ -220,45 +230,69 @@ impl IoQueue {
     }
 
     async fn pop(&self) -> Option<IoTask> {
+        // How long the I/O loop may sit parked with undeliverable pending work
+        // before we assume a backpressure deadlock (the consumer is wedged
+        // waiting on a pending read while holding in-flight results unconsumed)
+        // and force one task through to break it.  Normal backpressure stalls
+        // resolve in microseconds as the consumer drains, so this only triggers
+        // on a genuine deadlock.
+        const DEADLOCK_BREAK_AFTER: Duration = Duration::from_secs(5);
+        // Set only when the previous park TIMED OUT (no wakeup for
+        // DEADLOCK_BREAK_AFTER while pending work was undeliverable) — i.e. a
+        // genuine backpressure deadlock.  Then, and only then, we force one task
+        // through despite the byte budget.
+        let mut break_deadlock = false;
         loop {
             {
                 let mut state = self.state.lock().unwrap();
-                if let Some(task) = state.next_task() {
+                if let Some(task) = state.next_task_inner(break_deadlock) {
+                    // Work flowed again — re-arm the diagnostics.
+                    self.debug_deadlock_logged.store(false, Ordering::Release);
                     return Some(task);
                 }
+                break_deadlock = false;
 
                 if state.done_scheduling {
                     return None;
                 }
 
-                // DEBUG(prewarm-hang): only log the TRUE deadlock, not normal
-                // backpressure stalls. Deadlock = pending work that can't be
-                // delivered AND nothing in flight to ever refund a credit
-                // (in_flight==0). Debounced to fire at most once per stuck
-                // episode (reset when in_flight>0 again) so it can't flood the
-                // log or perturb timing during healthy operation.
-                let stuck = state.priorities_in_flight.debug_in_flight() == 0
-                    && !state.pending_requests.is_empty();
-                if stuck && !self.debug_deadlock_logged.swap(true, Ordering::AcqRel) {
-                    let next = state.pending_requests.peek().unwrap();
+                // DEBUG(prewarm-hang): log the full scheduler state whenever the
+                // I/O loop is about to park (next_task gave None, not closed),
+                // debounced to once per stuck episode (reset when work flows
+                // again so it can't flood / perturb timing).  Captures BOTH the
+                // "pending work, no credit" deadlock AND the "drained but a
+                // consumer is still waiting on a lost response" case (pending==0,
+                // in_flight may be >0).
+                let in_flight = state.priorities_in_flight.debug_in_flight();
+                let pending = state.pending_requests.len();
+                if !self.debug_deadlock_logged.swap(true, Ordering::AcqRel) {
+                    let next_bytes = state.pending_requests.peek().map(|t| t.num_bytes());
                     tracing::warn!(
-                        "LUDEBUG: I/O loop DEADLOCK — pending work, nothing in flight to refund: \
-                         iops_avail={} bytes_avail={} in_flight=0 pending={} \
-                         next_task_bytes={} next_priority={} min_in_flight={} no_backpressure={}",
+                        "LUDEBUG: I/O loop PARK iops_avail={} bytes_avail={} \
+                         in_flight={} pending={} next_task_bytes={:?} \
+                         min_in_flight={} no_backpressure={}",
                         state.iops_avail,
                         state.bytes_avail,
-                        state.pending_requests.len(),
-                        next.num_bytes(),
-                        next.priority,
+                        in_flight,
+                        pending,
+                        next_bytes,
                         state.priorities_in_flight.min_in_flight(),
                         state.no_backpressure,
                     );
-                } else if !stuck {
-                    self.debug_deadlock_logged.store(false, Ordering::Release);
                 }
             }
 
-            self.notify.notified().await;
+            // Wait for work or budget to free up.  A normal backpressure stall
+            // is woken by `notify_one` (from `on_bytes_consumed` /
+            // `on_iop_complete`) within microseconds.  If instead we wait the
+            // full DEADLOCK_BREAK_AFTER with no wakeup while pending work is
+            // undeliverable, the consumer is wedged (backpressure deadlock); set
+            // `break_deadlock` so the next `next_task_inner` admits one task
+            // despite the byte budget, unblocking the consumer.
+            match tokio::time::timeout(DEADLOCK_BREAK_AFTER, self.notify.notified()).await {
+                Ok(()) => {}            // woken normally
+                Err(_elapsed) => break_deadlock = true, // timed out -> force progress
+            }
         }
     }
 
@@ -1987,6 +2021,51 @@ mod tests {
         assert!(
             result.is_ok(),
             "read hung: dropped consumers leaked the backpressure budget and wedged the I/O loop"
+        );
+        assert_eq!(result.unwrap().unwrap().len(), 10);
+    }
+
+    /// Regression test for the backpressure deadlock observed in FTS prewarm: a
+    /// consumer holds several in-flight read results UNCONSUMED while waiting on
+    /// another read that can't dispatch because the byte budget is exhausted by
+    /// those very in-flight results.  Without the deadlock-break watchdog the
+    /// scheduler's I/O loop parks forever.  We give the watchdog a short timeout
+    /// via a test-only override so the test doesn't take 5s.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_backpressure_deadlock_is_broken() {
+        let some_path = Path::parse("foo").unwrap();
+        let obj_store = Arc::new(ObjectStore::memory());
+        obj_store
+            .put(&some_path, vec![0u8; 1_000_000].as_slice())
+            .await
+            .unwrap();
+
+        // Budget of 10 bytes: a single 10-byte read fills it.
+        let config = SchedulerConfig {
+            io_buffer_size_bytes: 10,
+            use_lite_scheduler: Some(false),
+        };
+        let scan_scheduler = ScanScheduler::new(obj_store, config);
+        let file_scheduler = scan_scheduler
+            .open_file(&some_path, &CachedFileSize::new(1_000_000))
+            .await
+            .unwrap();
+
+        // Submit several reads but DO NOT consume them — they go in-flight and
+        // hold the byte budget.  Then submit one more and await ONLY it.  The
+        // last read can't dispatch (budget exhausted), and the earlier ones are
+        // never consumed (we hold their futures unpolled), so the budget is
+        // never refunded.  The watchdog must force the last read through.
+        let _held: Vec<_> = (0..5).map(|_| file_scheduler.submit_single(0..10, 0)).collect();
+
+        let result = timeout(
+            Duration::from_secs(30),
+            file_scheduler.submit_single(0..10, 100),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "read hung: backpressure deadlock — in-flight results held the budget and the pending read never dispatched"
         );
         assert_eq!(result.unwrap().unwrap().len(), 10);
     }
