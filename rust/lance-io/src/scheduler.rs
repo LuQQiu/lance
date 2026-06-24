@@ -163,6 +163,15 @@ impl IoQueueState {
         self.next_task_inner(false)
     }
 
+    /// Whether the head pending task could be delivered within the normal
+    /// budget (i.e. `next_task` would deliver it without forcing).  Used to tell
+    /// a normal delivery from a forced one.
+    fn can_deliver_head(&self) -> bool {
+        self.pending_requests
+            .peek()
+            .is_some_and(|task| self.can_deliver(task))
+    }
+
     /// `force_progress`: admit the head task even if the byte budget is
     /// exhausted (but never if the IOP slots are exhausted).  Used only when the
     /// I/O loop would otherwise park forever — see `IoQueue::pop`.
@@ -230,30 +239,54 @@ impl IoQueue {
     }
 
     async fn pop(&self) -> Option<IoTask> {
-        // How long the I/O loop may sit parked with undeliverable pending work
-        // before we assume a backpressure deadlock (the consumer is wedged
-        // waiting on a pending read while holding in-flight results unconsumed)
-        // and force one task through to break it.  Normal backpressure stalls
-        // resolve in microseconds as the consumer drains, so this only triggers
-        // on a genuine deadlock.
-        const DEADLOCK_BREAK_AFTER: Duration = Duration::from_secs(5);
-        // Set only when the previous park TIMED OUT (no wakeup for
-        // DEADLOCK_BREAK_AFTER while pending work was undeliverable) — i.e. a
-        // genuine backpressure deadlock.  Then, and only then, we force one task
-        // through despite the byte budget.
-        let mut break_deadlock = false;
+        // How long the I/O loop may go WITHOUT delivering a task, while pending
+        // work exists that it can't deliver, before we assume a backpressure
+        // deadlock (the consumer is wedged waiting on a pending read while
+        // holding in-flight results unconsumed) and force one task through to
+        // break it.  Normal backpressure drains in microseconds as the consumer
+        // consumes, so the loop keeps delivering and this never trips; it only
+        // trips when delivery is stalled for real.
+        const DEADLOCK_BREAK_AFTER: Duration = Duration::from_secs(1);
+        // Wall-clock of the last time a task was delivered NORMALLY (within the
+        // byte budget).  Used to detect a delivery stall regardless of how many
+        // spurious `notify_one`s arrive (in-flight completions notify even while
+        // the consumer is wedged, which would otherwise reset a notify-gap timer
+        // and livelock).
+        let mut last_normal_progress = Instant::now();
+        // Once we enter the forced-progress mode (a confirmed deadlock) we stay
+        // in it until a task delivers *within budget* again — otherwise the
+        // budget can be so over-subscribed that one forced read per threshold
+        // would take ages.  Forcing keeps the consumer fed so it drains.
+        let mut forcing = false;
         loop {
             {
                 let mut state = self.state.lock().unwrap();
-                if let Some(task) = state.next_task_inner(break_deadlock) {
-                    // Work flowed again — re-arm the diagnostics.
-                    self.debug_deadlock_logged.store(false, Ordering::Release);
+                let has_pending = !state.pending_requests.is_empty();
+                // Enter forcing mode once delivery has stalled past the
+                // threshold with pending work; stay until normal flow resumes.
+                if has_pending && last_normal_progress.elapsed() >= DEADLOCK_BREAK_AFTER {
+                    forcing = true;
+                }
+                let delivered_normally = state.can_deliver_head();
+                if let Some(task) = state.next_task_inner(forcing) {
+                    if delivered_normally {
+                        // Back within budget — exit forcing and reset the timer.
+                        last_normal_progress = Instant::now();
+                        forcing = false;
+                        self.debug_deadlock_logged.store(false, Ordering::Release);
+                    }
                     return Some(task);
                 }
-                break_deadlock = false;
 
                 if state.done_scheduling {
                     return None;
+                }
+
+                // Empty queue isn't a deadlock — keep the timer fresh so a later
+                // genuine stall is measured from when pending work appeared.
+                if !has_pending {
+                    last_normal_progress = Instant::now();
+                    forcing = false;
                 }
 
                 // DEBUG(prewarm-hang): log the full scheduler state whenever the
@@ -282,17 +315,11 @@ impl IoQueue {
                 }
             }
 
-            // Wait for work or budget to free up.  A normal backpressure stall
-            // is woken by `notify_one` (from `on_bytes_consumed` /
-            // `on_iop_complete`) within microseconds.  If instead we wait the
-            // full DEADLOCK_BREAK_AFTER with no wakeup while pending work is
-            // undeliverable, the consumer is wedged (backpressure deadlock); set
-            // `break_deadlock` so the next `next_task_inner` admits one task
-            // despite the byte budget, unblocking the consumer.
-            match tokio::time::timeout(DEADLOCK_BREAK_AFTER, self.notify.notified()).await {
-                Ok(()) => {}            // woken normally
-                Err(_elapsed) => break_deadlock = true, // timed out -> force progress
-            }
+            // Wait for work or budget to free up.  Bound the wait so that even
+            // if no further `notify_one` arrives (or they all arrive before we
+            // re-check), we periodically re-evaluate the delivery-stall timer
+            // above and force a task through once it exceeds the threshold.
+            let _ = tokio::time::timeout(DEADLOCK_BREAK_AFTER, self.notify.notified()).await;
         }
     }
 
