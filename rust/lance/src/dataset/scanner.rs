@@ -2955,6 +2955,51 @@ impl Scanner {
         }
     }
 
+    /// TEMPORARY BENCH API: build a `FilteredReadExec` that materializes the
+    /// given projection for exactly `row_addrs` (the take-by-mask path used by
+    /// `_rowid IN (...)` / `take_source`). For benchmarking FilteredReadExec vs
+    /// TakeExec on the same inputs. Remove when done.
+    pub fn bench_build_filtered_read_take(
+        &self,
+        row_addrs: Vec<u64>,
+        projection: Projection,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let input = self.u64s_as_take_input(row_addrs)?;
+        let mut opts = FilteredReadOptions::new(projection);
+        if let Some(fragment) = self.fragments.as_ref() {
+            opts = opts.with_fragments(Arc::new(fragment.clone()));
+        }
+        Ok(Arc::new(FilteredReadExec::try_new(
+            self.dataset.clone(),
+            opts,
+            Some(input),
+        )?))
+    }
+
+    /// TEMPORARY BENCH API: build a `TakeExec` that materializes the given
+    /// projection for exactly `row_addrs`. The input is a one-shot batch whose
+    /// `_rowaddr` column carries the addresses (TakeExec resolves them directly).
+    /// For benchmarking FilteredReadExec vs TakeExec on the same inputs. Remove
+    /// when done.
+    pub fn bench_build_take_exec(
+        &self,
+        row_addrs: Vec<u64>,
+        projection: Projection,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        use arrow_array::UInt64Array;
+        // Input batch: a single `_rowaddr` column carrying the addresses.
+        let addr_field = ArrowField::new(ROW_ADDR, DataType::UInt64, true);
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![addr_field]));
+        let addr_array = Arc::new(UInt64Array::from(row_addrs));
+        let batch = arrow_array::RecordBatch::try_new(arrow_schema.clone(), vec![addr_array])?;
+        let stream = futures::stream::once(async move { Ok(batch) });
+        let stream = Box::pin(RecordBatchStreamAdapter::new(arrow_schema, stream));
+        let input: Arc<dyn ExecutionPlan> = Arc::new(OneShotExec::new(stream));
+        // `take` returns the input unchanged if no new columns are needed; for
+        // our full_content projection it always builds a TakeExec.
+        self.take(input, projection)
+    }
+
     fn u64s_as_take_input(&self, u64s: Vec<u64>) -> Result<Arc<dyn ExecutionPlan>> {
         let row_addrs = RowAddrTreeMap::from_iter(u64s);
         let row_addr_mask = RowAddrMask::from_allowed(row_addrs);
