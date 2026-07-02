@@ -115,6 +115,15 @@ async fn run_bench<F>(
         let _ = stream.try_collect::<Vec<_>>().await.unwrap();
     }
 
+    // Optional CPU flamegraph (LANCE_BENCH_PROFILE=1). Uses the pprof crate's
+    // in-process SIGPROF sampler (works without perf_event access).
+    let profile = std::env::var("LANCE_BENCH_PROFILE").ok().as_deref() == Some("1");
+    let guard = if profile {
+        Some(::pprof::ProfilerGuard::new(199).unwrap())
+    } else {
+        None
+    };
+
     let mut lats = Vec::with_capacity(queries.len());
     let mut total_rows = 0usize;
     let wall = Instant::now();
@@ -127,6 +136,15 @@ async fn run_bench<F>(
         total_rows += batches.iter().map(|b| b.num_rows()).sum::<usize>();
     }
     let wall = wall.elapsed().as_secs_f64();
+
+    if let Some(guard) = guard {
+        if let Ok(report) = guard.report().build() {
+            let path = format!("/tmp/flamegraph_{}.svg", name.to_lowercase());
+            let file = std::fs::File::create(&path).unwrap();
+            report.flamegraph(file).unwrap();
+            println!("  flamegraph -> {path}");
+        }
+    }
 
     lats.sort_unstable();
     let qps = queries.len() as f64 / wall;
