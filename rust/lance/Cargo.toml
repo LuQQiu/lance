@@ -104,6 +104,8 @@ protobuf-src = { version = "2.1", optional = true }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 pprof.workspace = true
+# EXPERIMENTAL (root-cause branch only): allocator A/B for the take path
+tikv-jemallocator = "0.6"
 # Need this so we can prevent dynamic linking in binaries (see cli feature)
 lzma-sys = { version = "0.1" }
 
