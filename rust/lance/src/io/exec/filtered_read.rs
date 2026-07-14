@@ -1406,6 +1406,38 @@ impl FilteredReadStream {
             })
             .transpose()?;
 
+        // EXPERIMENTAL (root-cause branch only): for take-shaped fragments,
+        // read through the same primitive the old take path uses
+        // (take_as_batch) instead of the ranged scan pipeline. Isolates the
+        // per-fragment read primitive as a single variable.
+        if std::env::var("LANCE_EXP_FRAG_TAKE").is_ok()
+            && physical_filter.is_none()
+            && !materialize_blob_v2_binary
+        {
+            let planned: u64 = fragment_read_task
+                .ranges
+                .iter()
+                .map(|r| r.end - r.start)
+                .sum();
+            if planned <= 4096 {
+                let offsets: Vec<u32> = fragment_read_task
+                    .ranges
+                    .iter()
+                    .flat_map(|r| (r.start as u32)..(r.end as u32))
+                    .collect();
+                let priority = fragment_read_task.priority;
+                let batch_fut = async move {
+                    let _t = exp_timing::T::new(&exp_timing::FR_DECODE);
+                    fragment_reader.take_as_batch(&offsets, Some(priority)).await
+                }
+                .boxed();
+                return Ok(
+                    futures::stream::once(std::future::ready(Ok(batch_fut as ReadBatchFut)))
+                        .boxed(),
+                );
+            }
+        }
+
         // We are going to count the fragment as scanned on the first batch we
         // read. This might miss empty fragments, but we assume that wouldn't be
         // used in the scan anyways.
