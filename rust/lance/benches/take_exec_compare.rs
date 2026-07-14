@@ -374,6 +374,51 @@ async fn main() {
         };
         run_bench("FilteredReadExec (mask)", &dataset, &queries, warmup, build).await;
     }
+    if arms.contains("take_rows") {
+        // Raw Dataset::take_rows — exactly what the PE take handler runs,
+        // no plan nodes. Distinguishes node overhead from the take machinery.
+        let schema = projection(&dataset, &column).into_schema_ref();
+        for q in queries.iter().take(warmup) {
+            dataset.take_rows(q, schema.clone()).await.unwrap();
+        }
+        let concurrency = env_usize("LANCE_BENCH_CONCURRENCY", 1);
+        let spawn_queries = std::env::var("LANCE_BENCH_SPAWN_QUERIES").is_ok();
+        let io0 = lance_io::iops_counter();
+        let bytes0 = lance_io::bytes_read_counter();
+        let wall = Instant::now();
+        let mut lats: Vec<u128> = futures::stream::iter(queries.iter().cloned())
+            .map(|q| {
+                let ds = dataset.clone();
+                let schema = schema.clone();
+                let fut = async move {
+                    let t = Instant::now();
+                    ds.take_rows(&q, schema).await.unwrap();
+                    t.elapsed().as_micros()
+                };
+                async move {
+                    if spawn_queries {
+                        tokio::spawn(fut).await.unwrap()
+                    } else {
+                        fut.await
+                    }
+                }
+            })
+            .buffer_unordered(concurrency)
+            .collect()
+            .await;
+        let wall = wall.elapsed().as_secs_f64();
+        let iops = lance_io::iops_counter() - io0;
+        let bytes = lance_io::bytes_read_counter() - bytes0;
+        lats.sort_unstable();
+        println!(
+            "\n=== Dataset::take_rows (raw) ===\n  QPS={:.1}\n  P50={:.2}ms  P99={:.2}ms\n  IOPS_PER_QUERY={:.0}  MB_READ_PER_QUERY={:.1}",
+            queries.len() as f64 / wall,
+            pctl(&lats, 0.50),
+            pctl(&lats, 0.99),
+            iops as f64 / queries.len() as f64,
+            bytes as f64 / queries.len() as f64 / 1e6,
+        );
+    }
     if arms.contains("scan") {
         let col = column.clone();
         let build = move |ds: &Arc<Dataset>, addrs: Vec<u64>| {
