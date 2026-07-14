@@ -4,13 +4,6 @@
 // Root-cause harness: TakeExec vs FilteredReadExec (mask) vs FilteredReadExec
 // (row-stream), replaying identical scattered row addresses and reporting
 // QPS/P50 plus PHYSICAL I/O counts (lance_io global counters, post-coalescing).
-
-// EXPERIMENTAL: jemalloc to match the plan-executor process (allocator A/B);
-// build with LANCE_BENCH_JEMALLOC set has no effect — the allocator is
-// compile-time, gated by feature-less cfg below. Comment out to revert.
-#[cfg(target_os = "linux")]
-#[global_allocator]
-static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 //
 // Env:
 //   LANCE_BENCH_DATASET      path to the .lance dataset (required)
@@ -30,6 +23,12 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 // ScopedFragmentRead.batch_size to u32::MAX without touching input coalescing.
 
 #![allow(clippy::print_stdout)]
+
+// EXPERIMENTAL: jemalloc to match the plan-executor process (allocator A/B).
+// Comment out to revert to the system allocator.
+#[cfg(target_os = "linux")]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use std::sync::Arc;
 use std::time::Instant;
