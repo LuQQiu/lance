@@ -533,11 +533,16 @@ impl FilteredReadStream {
         options: FilteredReadOptions,
         metrics: &ExecutionPlanMetricsSet,
         plan: FilteredReadInternalPlan,
+        cached_fragments: Option<Arc<Vec<LoadedFragment>>>,
     ) -> DataFusionResult<Self> {
         let global_metrics = Arc::new(FilteredReadGlobalMetrics::new(metrics));
-        let loaded_fragments = {
-            let _t = exp_timing::T::new(&exp_timing::MASK_LOAD_STREAM);
-            Self::load_all_fragments(&dataset, &options).await?
+        let loaded_fragments = match cached_fragments {
+            // Planning already loaded every fragment; don't repeat it
+            Some(loaded) => loaded,
+            None => {
+                let _t = exp_timing::T::new(&exp_timing::MASK_LOAD_STREAM);
+                Arc::new(Self::load_all_fragments(&dataset, &options).await?)
+            }
         };
         let scan_scheduler = {
             let _t = exp_timing::T::new(&exp_timing::MASK_SCHED);
@@ -1855,6 +1860,21 @@ impl FilteredReadOptions {
 /// In the future, we may introduce high-level cardinality statistics similar to those used by query
 /// engines like Postgres.  This might allow us to know, without executing an index search, that a scan
 /// would be better.  In that case we accept the force_scan hint to skip the index search.
+/// A resolved plan together with the fragment metadata loaded to compute it,
+/// so stream construction reuses the load instead of repeating it. The
+/// distributed path (`with_plan`, plan computed on another node) carries no
+/// fragments and the stream loads them itself.
+struct PlannedRead {
+    plan: FilteredReadInternalPlan,
+    loaded_fragments: Option<Arc<Vec<LoadedFragment>>>,
+}
+
+impl std::fmt::Debug for PlannedRead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PlannedRead").finish()
+    }
+}
+
 #[derive(Debug)]
 pub struct FilteredReadExec {
     dataset: Arc<Dataset>,
@@ -1863,7 +1883,7 @@ pub struct FilteredReadExec {
     metrics: ExecutionPlanMetricsSet,
     input: RowSelector,
     // Precomputed internal plan
-    plan: Arc<OnceCell<FilteredReadInternalPlan>>,
+    plan: Arc<OnceCell<PlannedRead>>,
     // When execute is first called we will initialize the FilteredReadStream.  In order to support
     // multiple partitions, each partition will share the stream.
     running_stream: Arc<AsyncMutex<Option<FilteredReadStream>>>,
@@ -2226,7 +2246,10 @@ impl FilteredReadExec {
             scan_range_after_filter: plan.scan_range_after_filter,
         };
         let plan_cell = Arc::new(OnceCell::new());
-        let _ = plan_cell.set(internal_plan);
+        let _ = plan_cell.set(PlannedRead {
+            plan: internal_plan,
+            loaded_fragments: None,
+        });
         Ok(Self {
             plan: plan_cell,
             ..self
@@ -2235,13 +2258,13 @@ impl FilteredReadExec {
 
     /// Get or create the internal plan
     async fn get_or_create_plan_impl<'a>(
-        plan_cell: &'a OnceCell<FilteredReadInternalPlan>,
+        plan_cell: &'a OnceCell<PlannedRead>,
         dataset: Arc<Dataset>,
         options: &FilteredReadOptions,
         index_input: Option<&Arc<dyn ExecutionPlan>>,
         partition: usize,
         ctx: Arc<TaskContext>,
-    ) -> Result<&'a FilteredReadInternalPlan> {
+    ) -> Result<&'a PlannedRead> {
         plan_cell
             .get_or_try_init(|| async {
                 // Execute index if present
@@ -2282,13 +2305,15 @@ impl FilteredReadExec {
                     .await?;
                 drop(_t_load);
 
-                // Plan the scan
+                // Plan the scan; keep the loaded fragments so stream
+                // construction doesn't reload every fragment
                 let _t = exp_timing::T::new(&exp_timing::MASK_PLAN_SCAN);
-                Ok(FilteredReadStream::plan_scan(
-                    &loaded_fragments,
-                    &evaluated_index,
-                    options,
-                ))
+                let plan =
+                    FilteredReadStream::plan_scan(&loaded_fragments, &evaluated_index, options);
+                Ok(PlannedRead {
+                    plan,
+                    loaded_fragments: Some(Arc::new(loaded_fragments)),
+                })
             })
             .await
     }
@@ -2311,7 +2336,7 @@ impl FilteredReadExec {
             ctx,
         )
         .await?;
-        Ok(internal_plan.to_external_plan())
+        Ok(internal_plan.plan.to_external_plan())
     }
 
     fn obtain_stream(
@@ -2356,10 +2381,15 @@ impl FilteredReadExec {
                 )
                 .await
                 .map_err(|e| DataFusionError::External(e.into()))?;
-                let new_running_stream =
-                    FilteredReadStream::try_new(dataset, options, &metrics, plan.clone())
-                        .await
-                        .map_err(|e| DataFusionError::External(e.into()))?;
+                let new_running_stream = FilteredReadStream::try_new(
+                    dataset,
+                    options,
+                    &metrics,
+                    plan.plan.clone(),
+                    plan.loaded_fragments.clone(),
+                )
+                .await
+                .map_err(|e| DataFusionError::External(e.into()))?;
                 let first_stream = new_running_stream.get_stream(&metrics, partition);
                 *running_stream = Some(new_running_stream);
                 first_stream
@@ -2467,7 +2497,7 @@ impl FilteredReadExec {
 
     /// Return the pre-computed plan if one exists, without triggering initialization.
     pub fn plan(&self) -> Option<FilteredReadPlan> {
-        self.plan.get().map(|p| p.to_external_plan())
+        self.plan.get().map(|p| p.plan.to_external_plan())
     }
 
     fn execute_row_stream(
