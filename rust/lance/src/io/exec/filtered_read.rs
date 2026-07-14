@@ -2324,6 +2324,43 @@ impl FilteredReadExec {
             } else {
                 None
             };
+            // EXPERIMENTAL ABLATION (root-cause branch only): drain a sparse
+            // masked plan exactly like one row-stream window — SpawnedTask +
+            // lock-once try_buffered + single concat — bypassing the
+            // unfold/mutex-per-item drain, per-batch metrics, Coalescer, and
+            // pump channel. Isolates the drain layer as a single variable.
+            if consolidate.is_some() && std::env::var("LANCE_EXP_MASK_DIRECT").is_ok() {
+                let running = running_stream.as_ref().unwrap();
+                let schema = running.output_schema.clone();
+                let task_stream = running.task_stream.clone();
+                let decode_parallelism = match running.threading_mode {
+                    FilteredReadThreadingMode::OnePartitionMultipleThreads(n) => n,
+                    FilteredReadThreadingMode::MultiplePartitions(n) => n,
+                }
+                .max(1);
+                drop(running_stream);
+                let concat_schema = schema.clone();
+                let batch = SpawnedTask::spawn(async move {
+                    let mut ts = task_stream.lock().await;
+                    let batches: Vec<RecordBatch> = (&mut *ts)
+                        .try_buffered(decode_parallelism)
+                        .try_collect()
+                        .await?;
+                    Result::Ok(arrow::compute::concat_batches(
+                        &concat_schema,
+                        batches.iter(),
+                    )?)
+                })
+                .map(|thread_result| thread_result.unwrap())
+                .await
+                .map_err(|e| DataFusionError::External(e.into()))?;
+                return DataFusionResult::<SendableRecordBatchStream>::Ok(Box::pin(
+                    RecordBatchStreamAdapter::new(
+                        schema,
+                        futures::stream::once(std::future::ready(Ok(batch))),
+                    ),
+                ));
+            }
             drop(running_stream);
 
             let stream = match (consolidate, batch_size_bytes) {
