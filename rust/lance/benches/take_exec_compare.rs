@@ -418,6 +418,10 @@ async fn main() {
             iops as f64 / queries.len() as f64,
             bytes as f64 / queries.len() as f64 / 1e6,
         );
+        let stage_report = lance::io::exec::filtered_read::exp_timing::report_and_reset();
+        if !stage_report.is_empty() {
+            print!("{stage_report}");
+        }
     }
     if arms.contains("scan") {
         let col = column.clone();
