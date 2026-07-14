@@ -2339,6 +2339,49 @@ impl FilteredReadExec {
         Ok(internal_plan.plan.to_external_plan())
     }
 
+    /// EXPERIMENTAL (root-cause branch only): read a sparse masked plan the
+    /// way Dataset::take_rows does — one flat future per fragment, no
+    /// streaming pipeline.
+    async fn exp_flat_take(
+        dataset: Arc<Dataset>,
+        options: &FilteredReadOptions,
+        plan: &FilteredReadInternalPlan,
+    ) -> Result<RecordBatch> {
+        let projection = &options.projection;
+        let schema = Arc::new(projection.to_bare_schema());
+        let with_row_id = projection.with_row_id;
+        let with_row_addr = projection.with_row_addr;
+        let futs = plan
+            .rows
+            .iter()
+            .filter(|(_, ranges)| !ranges.is_empty())
+            .map(|(fragment_id, ranges)| {
+                let fragment = dataset.get_fragment(*fragment_id as usize).ok_or_else(|| {
+                    Error::internal(format!("flat take: fragment {} not found", fragment_id))
+                })?;
+                let offsets: Vec<u32> = ranges
+                    .iter()
+                    .flat_map(|range| (range.start as u32)..(range.end as u32))
+                    .collect();
+                let schema = schema.clone();
+                Ok(async move {
+                    fragment
+                        .take_rows(&offsets, &schema, with_row_id, with_row_addr, false, false)
+                        .await
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let batches: Vec<RecordBatch> = futures::stream::iter(futs)
+            .buffered(dataset.object_store.io_parallelism())
+            .try_collect()
+            .await?;
+        let first_schema = batches
+            .first()
+            .map(|batch| batch.schema())
+            .ok_or_else(|| Error::internal("flat take: empty plan".to_string()))?;
+        Ok(arrow::compute::concat_batches(&first_schema, batches.iter())?)
+    }
+
     fn obtain_stream(
         &self,
         partition: usize,
@@ -2381,6 +2424,41 @@ impl FilteredReadExec {
                 )
                 .await
                 .map_err(|e| DataFusionError::External(e.into()))?;
+                // EXPERIMENTAL ABLATION (root-cause branch only): sparse
+                // (take-shaped) masked plans execute as flat per-fragment
+                // futures — the same structure as Dataset::take_rows — with
+                // no SpawnedTask/stream/two-level-driving pipeline at all.
+                if index_input.is_some() && std::env::var("LANCE_EXP_FLAT_TAKE").is_ok() {
+                    let (touched, planned_rows) = plan.plan.rows.values().fold(
+                        (0usize, 0u64),
+                        |(fragments, rows), ranges| {
+                            let fragment_rows: u64 =
+                                ranges.iter().map(|range| range.end - range.start).sum();
+                            if fragment_rows > 0 {
+                                (fragments + 1, rows + fragment_rows)
+                            } else {
+                                (fragments, rows)
+                            }
+                        },
+                    );
+                    let sparse = touched >= CONSOLIDATE_MIN_FRAGMENTS
+                        && planned_rows
+                            < touched as u64 * CONSOLIDATE_MAX_AVG_PLANNED_ROWS_PER_FRAGMENT
+                        && plan.plan.filters.is_empty()
+                        && !options.with_deleted_rows;
+                    if sparse {
+                        let batch = Self::exp_flat_take(dataset, &options, &plan.plan)
+                            .await
+                            .map_err(|e| DataFusionError::External(e.into()))?;
+                        let schema = batch.schema();
+                        return DataFusionResult::<SendableRecordBatchStream>::Ok(Box::pin(
+                            RecordBatchStreamAdapter::new(
+                                schema,
+                                futures::stream::once(std::future::ready(Ok(batch))),
+                            ),
+                        ));
+                    }
+                }
                 let new_running_stream = FilteredReadStream::try_new(
                     dataset,
                     options,
