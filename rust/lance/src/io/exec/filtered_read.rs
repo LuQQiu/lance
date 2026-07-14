@@ -19,7 +19,7 @@ use datafusion::common::stats::Precision;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::stream::{RecordBatchReceiverStream, RecordBatchStreamAdapter};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
     execution_plan::{Boundedness, EmissionType},
@@ -334,6 +334,11 @@ struct FilteredReadStream {
     scan_scheduler: Arc<ScanScheduler>,
     /// The global metrics for the scan
     metrics: Arc<FilteredReadGlobalMetrics>,
+    /// Take-shaped plan: every fragment yields less than one output batch,
+    /// so the output side consolidates the tiny per-fragment batches
+    sparse_plan: bool,
+    /// Rows per output batch (explicit option → env default → 8192)
+    batch_target_rows: usize,
     /// The number of partitions currently running
     ///
     /// We need to know when the final partition completes so that we can
@@ -439,6 +444,22 @@ impl FilteredReadStream {
             .buffered(fragment_readahead);
         let task_stream = fragment_streams.try_flatten().boxed();
 
+        // Take-shaped plans (every fragment yields less than a batch) emit a
+        // flurry of tiny per-fragment batches; mark them so the output side
+        // can consolidate. Dense scans keep their streaming batch boundaries.
+        let batch_target_rows = options
+            .batch_size
+            .map(|batch_size| batch_size as usize)
+            .unwrap_or_else(|| get_default_batch_size().unwrap_or(BATCH_SIZE_FALLBACK));
+        let sparse_plan = !plan.rows.is_empty()
+            && plan.rows.values().all(|ranges| {
+                ranges
+                    .iter()
+                    .map(|range| range.end - range.start)
+                    .sum::<u64>()
+                    < batch_target_rows as u64
+            });
+
         Self {
             output_schema,
             task_stream: Arc::new(AsyncMutex::new(task_stream)),
@@ -447,6 +468,8 @@ impl FilteredReadStream {
             active_partitions_counter: Arc::new(AtomicUsize::new(0)),
             threading_mode,
             scan_range_after_filter,
+            sparse_plan,
+            batch_target_rows,
         }
     }
 
@@ -2086,49 +2109,84 @@ impl FilteredReadExec {
         let index_input = self.input.row_set_plan().cloned();
         let plan_cell = self.plan.clone();
 
+        let schema = self.schema();
         let stream = futures::stream::once(async move {
-            let mut running_stream = running_stream_lock.lock().await;
-            let inner = if let Some(running_stream) = &*running_stream {
-                running_stream.get_stream(&metrics, partition)
-            } else {
-                let plan = Self::get_or_create_plan_impl(
-                    &plan_cell,
-                    dataset.clone(),
-                    &options,
-                    index_input.as_ref(),
-                    partition,
-                    context.clone(),
-                )
-                .await
-                .map_err(|e| DataFusionError::External(e.into()))?;
-                let new_running_stream =
-                    FilteredReadStream::try_new(dataset, options, &metrics, plan.clone())
-                        .await
-                        .map_err(|e| DataFusionError::External(e.into()))?;
-                let first_stream = new_running_stream.get_stream(&metrics, partition);
-                *running_stream = Some(new_running_stream);
-                first_stream
+            let (inner, consolidate) = {
+                let mut running_stream = running_stream_lock.lock().await;
+                let inner = if let Some(running_stream) = &*running_stream {
+                    running_stream.get_stream(&metrics, partition)
+                } else {
+                    let plan = Self::get_or_create_plan_impl(
+                        &plan_cell,
+                        dataset.clone(),
+                        &options,
+                        index_input.as_ref(),
+                        partition,
+                        context.clone(),
+                    )
+                    .await
+                    .map_err(|e| DataFusionError::External(e.into()))?;
+                    let new_running_stream =
+                        FilteredReadStream::try_new(dataset, options, &metrics, plan.clone())
+                            .await
+                            .map_err(|e| DataFusionError::External(e.into()))?;
+                    let first_stream = new_running_stream.get_stream(&metrics, partition);
+                    *running_stream = Some(new_running_stream);
+                    first_stream
+                };
+                // Take-shaped masked reads (a row set where every fragment
+                // yields less than one batch) get consolidated off-task;
+                // everything else streams inline exactly as before.
+                let consolidate = if index_input.is_some() && batch_size_bytes.is_none() {
+                    running_stream.as_ref().and_then(|running| {
+                        running.sparse_plan.then_some(running.batch_target_rows)
+                    })
+                } else {
+                    None
+                };
+                (inner, consolidate)
             };
-            let stream: SendableRecordBatchStream = match batch_size_bytes {
-                Some(target) => {
-                    let schema = inner.schema();
-                    Box::pin(RecordBatchStreamAdapter::new(
-                        schema.clone(),
-                        lance_arrow::stream::rechunk_stream_by_size(
-                            inner,
-                            schema,
-                            0,
-                            target as usize,
-                        ),
-                    ))
+            let stream: SendableRecordBatchStream = if let Some(target) = consolidate {
+                // The per-batch pipeline work (task polling, decode driving)
+                // otherwise executes inline in whichever task polls this
+                // output; many small concurrent reads then serialize on a
+                // shared consumer. Pump on a spawned task and hand the
+                // consumer whole batches (merge-only, order preserved).
+                let mut builder = RecordBatchReceiverStream::builder(inner.schema(), 4);
+                let tx = builder.tx();
+                builder.spawn(async move {
+                    let mut stream = coalesce_batches(inner, target).boxed();
+                    while let Some(item) = stream.next().await {
+                        if tx.send(item).await.is_err() {
+                            // Receiver dropped: the query was cancelled
+                            break;
+                        }
+                    }
+                    Ok(())
+                });
+                builder.build()
+            } else {
+                match batch_size_bytes {
+                    Some(target) => {
+                        let schema = inner.schema();
+                        Box::pin(RecordBatchStreamAdapter::new(
+                            schema.clone(),
+                            lance_arrow::stream::rechunk_stream_by_size(
+                                inner,
+                                schema,
+                                0,
+                                target as usize,
+                            ),
+                        ))
+                    }
+                    None => inner,
                 }
-                None => inner,
             };
             DataFusionResult::<SendableRecordBatchStream>::Ok(stream)
         })
         .try_flatten();
 
-        Box::pin(RecordBatchStreamAdapter::new(self.schema(), stream))
+        Box::pin(RecordBatchStreamAdapter::new(schema, stream))
     }
 
     pub fn dataset(&self) -> &Arc<Dataset> {
