@@ -1695,8 +1695,16 @@ impl FileFragment {
                 .clone();
             read_config = read_config.with_scan_scheduler(scheduler);
         }
-        let reader = self.open(projection, read_config).await?;
+        let reader = {
+            let _t = crate::io::exec::filtered_read::exp_timing::T::new(
+                &crate::io::exec::filtered_read::exp_timing::TAKE_OPEN,
+            );
+            self.open(projection, read_config).await?
+        };
 
+        let _t = crate::io::exec::filtered_read::exp_timing::T::new(
+            &crate::io::exec::filtered_read::exp_timing::TAKE_DECODE,
+        );
         if row_offsets.len() > 1 && Self::row_ids_contiguous(row_offsets) {
             let range =
                 (row_offsets[0] as usize)..(row_offsets[row_offsets.len() - 1] as usize + 1);

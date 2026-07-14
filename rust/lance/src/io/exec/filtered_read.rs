@@ -498,6 +498,11 @@ pub mod exp_timing {
         RS_PLAN_BATCH,
         RS_READ,
         RS_ATTACH,
+        FR_OPEN,
+        FR_SCHED,
+        FR_DECODE,
+        TAKE_OPEN,
+        TAKE_DECODE,
     );
 
     pub struct T(std::time::Instant, &'static AtomicU64);
@@ -1375,10 +1380,13 @@ impl FilteredReadStream {
         if materialize_blob_v2_binary {
             frag_read_config = frag_read_config.with_row_address(true);
         }
-        let mut fragment_reader = fragment_read_task
-            .fragment
-            .open(&read_schema, frag_read_config)
-            .await?;
+        let mut fragment_reader = {
+            let _t = exp_timing::T::new(&exp_timing::FR_OPEN);
+            fragment_read_task
+                .fragment
+                .open(&read_schema, frag_read_config)
+                .await?
+        };
 
         if fragment_read_task.with_deleted_rows {
             fragment_reader.with_make_deletions_null();
@@ -1406,16 +1414,25 @@ impl FilteredReadStream {
             fragment_read_task.ranges.clone(),
         )));
 
-        let fragment_stream = fragment_reader
-            .read_ranges(
-                fragment_read_task.ranges.into(),
-                fragment_read_task.batch_size,
-            )
-            .await?
+        let ranges_stream = {
+            let _t = exp_timing::T::new(&exp_timing::FR_SCHED);
+            fragment_reader
+                .read_ranges(
+                    fragment_read_task.ranges.into(),
+                    fragment_read_task.batch_size,
+                )
+                .await?
+        };
+        let fragment_stream = ranges_stream
             .map(move |batch_fut: ReadBatchFut| {
                 let global_metrics = global_metrics.clone();
                 let fragment_counted = fragment_counted.clone();
                 let range_tracker = range_tracker.clone();
+                let batch_fut = async move {
+                    let _t = exp_timing::T::new(&exp_timing::FR_DECODE);
+                    batch_fut.await
+                }
+                .boxed();
                 let batch_fut = batch_fut
                     .inspect_ok(move |batch| {
                         let num_rows = batch.num_rows();
