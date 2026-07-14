@@ -1675,16 +1675,27 @@ impl FileFragment {
         with_row_created_at_version: bool,
         with_row_last_updated_at_version: bool,
     ) -> Result<RecordBatch> {
-        let reader = self
-            .open(
-                projection,
-                FragReadConfig::default()
-                    .with_row_id(with_row_id)
-                    .with_row_address(with_row_address)
-                    .with_row_created_at_version(with_row_created_at_version)
-                    .with_row_last_updated_at_version(with_row_last_updated_at_version),
-            )
-            .await?;
+        let mut read_config = FragReadConfig::default()
+            .with_row_id(with_row_id)
+            .with_row_address(with_row_address)
+            .with_row_created_at_version(with_row_created_at_version)
+            .with_row_last_updated_at_version(with_row_last_updated_at_version);
+        // EXPERIMENTAL (root-cause branch only): force the take path through a
+        // single process-wide ScanScheduler instead of one per fragment, to
+        // test whether scheduler topology explains take-vs-filtered-read QPS
+        if std::env::var("LANCE_EXP_TAKE_SHARED_SCHED").is_ok() {
+            static SHARED: std::sync::OnceLock<Arc<ScanScheduler>> = std::sync::OnceLock::new();
+            let scheduler = SHARED
+                .get_or_init(|| {
+                    ScanScheduler::new(
+                        self.dataset.object_store.clone(),
+                        SchedulerConfig::max_bandwidth(&self.dataset.object_store),
+                    )
+                })
+                .clone();
+            read_config = read_config.with_scan_scheduler(scheduler);
+        }
+        let reader = self.open(projection, read_config).await?;
 
         if row_offsets.len() > 1 && Self::row_ids_contiguous(row_offsets) {
             let range =

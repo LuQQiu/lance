@@ -461,6 +461,59 @@ pub fn coalesce_batches(
     })
 }
 
+/// EXPERIMENTAL (root-cause branch only): per-stage wall-time accumulators
+/// for the mask-vs-row-stream take investigation. Not for merge.
+#[doc(hidden)]
+pub mod exp_timing {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    macro_rules! stages {
+        ($($name:ident),* $(,)?) => {
+            $(pub static $name: AtomicU64 = AtomicU64::new(0);)*
+            pub fn report_and_reset() -> String {
+                let mut out = String::new();
+                $(
+                    let v = $name.swap(0, Relaxed);
+                    if v > 0 {
+                        out.push_str(&format!(
+                            "  EXPTIME {}={:.1}ms\n",
+                            stringify!($name),
+                            v as f64 / 1_000_000.0
+                        ));
+                    }
+                )*
+                out
+            }
+        };
+    }
+
+    stages!(
+        MASK_INPUT,
+        MASK_LOAD_PLAN,
+        MASK_PLAN_SCAN,
+        MASK_LOAD_STREAM,
+        MASK_SCHED,
+        MASK_TOTAL,
+        RS_LOAD,
+        RS_PLAN_BATCH,
+        RS_READ,
+        RS_ATTACH,
+    );
+
+    pub struct T(std::time::Instant, &'static AtomicU64);
+    impl T {
+        pub fn new(counter: &'static AtomicU64) -> Self {
+            Self(std::time::Instant::now(), counter)
+        }
+    }
+    impl Drop for T {
+        fn drop(&mut self) {
+            self.1
+                .fetch_add(self.0.elapsed().as_nanos() as u64, Relaxed);
+        }
+    }
+}
+
 impl std::fmt::Debug for FilteredReadStream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FilteredReadStream").finish()
@@ -477,8 +530,14 @@ impl FilteredReadStream {
         plan: FilteredReadInternalPlan,
     ) -> DataFusionResult<Self> {
         let global_metrics = Arc::new(FilteredReadGlobalMetrics::new(metrics));
-        let loaded_fragments = Self::load_all_fragments(&dataset, &options).await?;
-        let scan_scheduler = Self::make_scan_scheduler(&dataset, &options);
+        let loaded_fragments = {
+            let _t = exp_timing::T::new(&exp_timing::MASK_LOAD_STREAM);
+            Self::load_all_fragments(&dataset, &options).await?
+        };
+        let scan_scheduler = {
+            let _t = exp_timing::T::new(&exp_timing::MASK_SCHED);
+            Self::make_scan_scheduler(&dataset, &options)
+        };
         Ok(Self::new_shared(
             dataset,
             options,
@@ -2139,6 +2198,7 @@ impl FilteredReadExec {
                 // Execute index if present
                 let mut evaluated_index = None;
                 if let Some(index_input) = index_input {
+                    let _t = exp_timing::T::new(&exp_timing::MASK_INPUT);
                     let mut index_search = index_input.execute(partition, ctx)?;
                     let index_search_result = index_search.next().await.ok_or_else(|| {
                         Error::internal("Index search did not yield any results".to_string())
@@ -2149,6 +2209,7 @@ impl FilteredReadExec {
                 }
 
                 // Load fragments to compute the plan
+                let _t_load = exp_timing::T::new(&exp_timing::MASK_LOAD_PLAN);
                 let io_parallelism = dataset.object_store.io_parallelism();
                 let fragments = options
                     .fragments
@@ -2170,8 +2231,10 @@ impl FilteredReadExec {
                     .try_buffered(io_parallelism)
                     .try_collect::<Vec<_>>()
                     .await?;
+                drop(_t_load);
 
                 // Plan the scan
+                let _t = exp_timing::T::new(&exp_timing::MASK_PLAN_SCAN);
                 Ok(FilteredReadStream::plan_scan(
                     &loaded_fragments,
                     &evaluated_index,
@@ -2282,6 +2345,17 @@ impl FilteredReadExec {
             DataFusionResult::<SendableRecordBatchStream>::Ok(stream)
         })
         .try_flatten();
+
+        // EXPERIMENTAL: total stream lifetime for masked reads
+        let total_timer = self
+            .input
+            .row_set_plan()
+            .is_some()
+            .then(|| exp_timing::T::new(&exp_timing::MASK_TOTAL));
+        let stream = stream.chain(futures::stream::poll_fn(move |_| {
+            let _keep = &total_timer;
+            std::task::Poll::Ready(None)
+        }));
 
         Box::pin(RecordBatchStreamAdapter::new(self.schema(), stream))
     }
@@ -2407,6 +2481,7 @@ impl RowStreamRead {
     async fn load_fragments(&self) -> Result<&StreamFragments> {
         self.loaded_fragments
             .get_or_try_init(|| async {
+                let _t = exp_timing::T::new(&exp_timing::RS_LOAD);
                 let fragments = FilteredReadStream::load_all_fragments(
                     &self.dataset,
                     &self.source.read_options,
@@ -2532,6 +2607,7 @@ impl RowStreamRead {
         &self,
         keys: &arrow_array::PrimitiveArray<UInt64Type>,
     ) -> DataFusionResult<FilteredReadInternalPlan> {
+        let _t = exp_timing::T::new(&exp_timing::RS_PLAN_BATCH);
         let compute_timer = self.baseline_metrics.elapsed_compute().timer();
         // Null keys are excluded; attach_columns drops their rows
         let batch_keys = if keys.null_count() == 0 {
@@ -2559,6 +2635,7 @@ impl RowStreamRead {
         internal_plan: FilteredReadInternalPlan,
         batch_index: u32,
     ) -> DataFusionResult<RecordBatch> {
+        let _t = exp_timing::T::new(&exp_timing::RS_READ);
         let fragments = &self.load_fragments().await?.fragments;
         // I/O priority: earlier batches strictly first (output emits in batch
         // order), fragments keep dataset order within a batch
@@ -2590,6 +2667,7 @@ impl RowStreamRead {
         batch: RecordBatch,
         read_data: RecordBatch,
     ) -> DataFusionResult<RecordBatch> {
+        let _t = exp_timing::T::new(&exp_timing::RS_ATTACH);
         let _compute_timer = self.baseline_metrics.elapsed_compute().timer();
         let keys = self.key_array(&batch, "input")?;
         let read_keys = self.key_array(&read_data, "read")?;

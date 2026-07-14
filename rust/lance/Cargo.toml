@@ -325,3 +325,7 @@ harness = false
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "take_exec_compare"
+harness = false
