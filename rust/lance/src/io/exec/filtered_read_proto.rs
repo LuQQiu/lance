@@ -46,15 +46,9 @@ pub async fn filtered_read_exec_to_proto(
     exec: &FilteredReadExec,
     state: &SessionState,
 ) -> Result<pb::FilteredReadExecProto> {
-    if exec.row_stream_input().is_some() {
-        // TODO: define a proto representation for row-stream sources so these
-        // reads can participate in distributed plan pushdown
-        return Err(Error::not_supported_source(
-            "a FilteredReadExec with a row-stream source cannot be serialized"
-                .to_string()
-                .into(),
-        ));
-    }
+    // Row-stream sources need no extra fields: the input plan is serialized
+    // as the node's child by the codec, and deserialization re-derives the
+    // RowSelector from the child's schema (keys batch → row stream).
     let table = table_identifier_from_dataset(exec.dataset()).await?;
     // Use the pruned dataset schema for filter encoding — filters can reference columns
     // outside the projection (e.g. SELECT name WHERE age > 10), and some dataset columns
