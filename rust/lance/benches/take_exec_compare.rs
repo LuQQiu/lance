@@ -188,15 +188,25 @@ async fn run_bench<F>(
     let io0 = lance_io::iops_counter();
     let bytes0 = lance_io::bytes_read_counter();
     let wall = Instant::now();
+    // LANCE_BENCH_SPAWN_QUERIES=1: poll each query from its own tokio task
+    // (multi-task consumer, like a server) instead of one block_on thread
+    let spawn_queries = std::env::var("LANCE_BENCH_SPAWN_QUERIES").is_ok();
     let results: Vec<(u128, usize)> = futures::stream::iter(queries.iter().cloned())
         .map(|q| {
             let plan = build(dataset, q);
-            async move {
+            let fut = async move {
                 let t = Instant::now();
                 let stream = execute_plan(plan, LanceExecutionOptions::default()).unwrap();
                 let batches = stream.try_collect::<Vec<_>>().await.unwrap();
                 let rows = batches.iter().map(|b| b.num_rows()).sum::<usize>();
                 (t.elapsed().as_micros(), rows)
+            };
+            async move {
+                if spawn_queries {
+                    tokio::spawn(fut).await.unwrap()
+                } else {
+                    fut.await
+                }
             }
         })
         .buffer_unordered(concurrency)
