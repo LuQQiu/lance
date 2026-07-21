@@ -548,6 +548,16 @@ impl DeepSizeOf for InvertedIndex {
 /// Resolve any `Pending` candidates that wand emitted via the
 /// deferred-row_id path. After this returns, every entry in
 /// `candidates` carries a real row_id.
+// ---- ablation switches (perf experiments; results are intentionally wrong when on) ----
+fn fts_skip_resolve() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("LANCE_FTS_SKIP_RESOLVE").is_ok())
+}
+fn fts_fake_scorer() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("LANCE_FTS_FAKE_SCORER").is_ok())
+}
+
 async fn resolve_deferred_candidates(
     docs: &LazyDocSet,
     candidates: &mut [DocCandidate],
@@ -749,9 +759,17 @@ impl InvertedIndex {
             }
         }
         let mut token_docs = HashMap::with_capacity(terms.len());
-        for term in &terms {
-            let df = self.df_for_term(term).await?;
-            token_docs.insert(term.clone(), df);
+        if fts_fake_scorer() {
+            // ABLATION: skip the per-term df fetch (df_for_term x terms x partitions).
+            // Scores become wrong; this isolates the scorer-build cost.
+            for term in &terms {
+                token_docs.insert(term.clone(), 1000usize);
+            }
+        } else {
+            for term in &terms {
+                let df = self.df_for_term(term).await?;
+                token_docs.insert(term.clone(), df);
+            }
         }
         Ok(MemBM25Scorer::new(total_tokens, num_docs, token_docs))
     }
@@ -908,11 +926,14 @@ impl InvertedIndex {
         // The outer aggregation below consults `scorer.query_weight`, which
         // hits per-token `posting_len`; building a `MemBM25Scorer` with
         // precomputed per-term IDFs avoids the v2 bulk metadata pull.
+        let scorer_build_t0 = std::time::Instant::now();
+        let mut scorer_build_ns: u128 = 0;
         let local_scorer;
         let scorer: &MemBM25Scorer = if let Some(base_scorer) = base_scorer {
             base_scorer
         } else {
             local_scorer = self.bm25_scorer_for_final_tokens(tokens.as_ref()).await?;
+            scorer_build_ns = scorer_build_t0.elapsed().as_nanos();
             &local_scorer
         };
         let impact_scorer = Arc::new(scorer.clone());
@@ -932,10 +953,15 @@ impl InvertedIndex {
             // carries a real row_id at this point.
             let row_id = match addr {
                 CandidateAddr::RowId(r) => r,
-                CandidateAddr::Pending(_) => {
-                    return Err(Error::internal(
-                        "bm25_search post-condition: deferred candidate left unresolved",
-                    ));
+                CandidateAddr::Pending(d) => {
+                    if fts_skip_resolve() {
+                        // ABLATION: emit the raw doc id as a fake row id.
+                        d as u64
+                    } else {
+                        return Err(Error::internal(
+                            "bm25_search post-condition: deferred candidate left unresolved",
+                        ));
+                    }
                 }
             };
 
@@ -957,7 +983,30 @@ impl InvertedIndex {
         // global k-th - see `Wand::shared_threshold`).
         let impact_shared_threshold = Arc::new(AtomicU32::new(f32::NEG_INFINITY.to_bits()));
         let legacy_shared_threshold = Arc::new(AtomicU32::new(f32::NEG_INFINITY.to_bits()));
-        let parts = self
+        // ===== 3-stage streaming pipeline (mirrors vector v2 #6475/#7680) =====
+        //   Task A (spawned) LOAD:   load+prep partitions (buffered) -> ch1
+        //   Task B (spawned) SCORE:  greedy-batch ch1 -> ONE spawn_cpu per batch -> ch2
+        //   Main (this fn) RESOLVE:  recv scored batches, resolve concurrently, merge.
+        // Stages overlap: while main resolves batch N, task B scores N+1, task A loads N+2.
+        // Channel send/recv stays in async code; spawn_cpu closures are pure CPU (#7642 rule).
+        // Knobs: LANCE_FTS_BATCH (default 16), LANCE_FTS_PREPARE_PARALLELISM (default cpus-2),
+        //        LANCE_FTS_TIMING=1 prints per-stage wall + resolve IO counters.
+        let batch_size: usize = std::env::var("LANCE_FTS_BATCH")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(16usize)
+            .max(1);
+        let prep_parallelism: usize = std::env::var("LANCE_FTS_PREPARE_PARALLELISM")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(get_num_compute_intensive_cpus)
+            .max(1);
+        let timing = std::env::var("LANCE_FTS_TIMING").is_ok();
+        let load_ns = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let score_ns = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut resolve_ns: u128 = 0;
+
+        let prep_futures: Vec<_> = self
             .partitions
             .iter()
             .map(|part| {
@@ -985,10 +1034,7 @@ impl InvertedIndex {
                         impact_safe,
                     } = loaded_postings;
                     if postings.is_empty() {
-                        // No hits in this partition; its DocSet stays
-                        // unloaded, so we never pay the per-doc
-                        // row_id/num_tokens download for it.
-                        return Result::Ok(PartitionCandidates::empty());
+                        return Result::Ok(None);
                     }
                     let docs_for_wand = part.docs.docs_for_wand(mask.as_ref()).await?;
                     let max_position = postings
@@ -1001,10 +1047,6 @@ impl InvertedIndex {
                         let idx = posting.term_index() as usize;
                         tokens_by_position[idx] = posting.token().to_owned();
                     }
-                    let params = params.clone();
-                    let mask = mask.clone();
-                    let metrics = metrics.clone();
-                    let part_for_wand = part.clone();
                     let has_grouped_expansions = !grouped_expansions.is_empty();
                     let use_impact_path = impact_safe && !has_grouped_expansions;
                     let wand_params = if has_grouped_expansions {
@@ -1018,39 +1060,157 @@ impl InvertedIndex {
                     let partition_threshold = if has_grouped_expansions {
                         Arc::new(AtomicU32::new(f32::NEG_INFINITY.to_bits()))
                     } else if use_impact_path {
-                        impact_shared_threshold
+                        impact_shared_threshold.clone()
                     } else {
-                        legacy_shared_threshold
+                        legacy_shared_threshold.clone()
                     };
                     let wand_scorer = use_impact_path.then(|| impact_scorer.clone());
-                    let candidates = spawn_cpu(move || {
-                        let candidates = part_for_wand.bm25_search(
-                            docs_for_wand.as_ref(),
-                            wand_params.as_ref(),
-                            operator,
+                    Result::Ok(Some((
+                        part,
+                        docs_for_wand,
+                        wand_params,
+                        mask.clone(),
+                        postings,
+                        wand_scorer,
+                        metrics.clone(),
+                        partition_threshold,
+                        tokens_by_position,
+                        grouped_expansions,
+                    )))
+                }
+            })
+            .collect();
+
+        // ---- Task A: producer (load+prep). Runs ahead of scoring; ch1 buffers one batch. ----
+        let (prep_tx, mut prep_rx) = tokio::sync::mpsc::channel(batch_size);
+        let producer_load_ns = load_ns.clone();
+        tokio::spawn(async move {
+            let t0 = std::time::Instant::now();
+            let mut prep_stream = stream::iter(prep_futures).buffered(prep_parallelism);
+            while let Some(item) = prep_stream.next().await {
+                match item {
+                    Ok(None) => continue, // partition with no hits
+                    Ok(Some(prepared)) => {
+                        if prep_tx.send(Ok(prepared)).await.is_err() {
+                            break; // consumer gone (query cancelled or errored)
+                        }
+                    }
+                    Err(err) => {
+                        let _ = prep_tx.send(Err(err)).await;
+                        break;
+                    }
+                }
+            }
+            producer_load_ns.store(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        });
+
+        // ---- Task B: score. Greedy-batch prepared partitions; ONE spawn_cpu per batch. ----
+        let (scored_tx, mut scored_rx) = tokio::sync::mpsc::channel(2);
+        let scorer_score_ns = score_ns.clone();
+        tokio::spawn(async move {
+            loop {
+                if scored_tx.is_closed() {
+                    return;
+                }
+                let mut batch = Vec::with_capacity(batch_size);
+                let mut prep_error = None;
+                let mut producer_done = false;
+                match prep_rx.recv().await {
+                    Some(Ok(prepared)) => batch.push(prepared),
+                    Some(Err(err)) => prep_error = Some(err),
+                    None => producer_done = true,
+                }
+                // Greedy drain: take whatever is already prepared, up to batch_size,
+                // without waiting for a full batch (vector v2 pattern).
+                while prep_error.is_none() && !producer_done && batch.len() < batch_size {
+                    match prep_rx.try_recv() {
+                        Ok(Ok(prepared)) => batch.push(prepared),
+                        Ok(Err(err)) => prep_error = Some(err),
+                        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                            producer_done = true;
+                        }
+                    }
+                }
+                if let Some(err) = prep_error {
+                    let _ = scored_tx.send(Err(err)).await;
+                    return;
+                }
+                if !batch.is_empty() {
+                    let t0 = std::time::Instant::now();
+                    let scored = spawn_cpu(move || {
+                        let mut out = Vec::with_capacity(batch.len());
+                        for (
+                            part,
+                            docs_for_wand,
+                            wand_params,
                             mask,
                             postings,
                             wand_scorer,
-                            metrics.as_ref(),
+                            metrics,
                             partition_threshold,
-                        )?;
-                        std::result::Result::<_, Error>::Ok(candidates)
+                            tokens_by_position,
+                            grouped_expansions,
+                        ) in batch
+                        {
+                            let candidates = part.bm25_search(
+                                docs_for_wand.as_ref(),
+                                wand_params.as_ref(),
+                                operator,
+                                mask,
+                                postings,
+                                wand_scorer,
+                                metrics.as_ref(),
+                                partition_threshold,
+                            )?;
+                            out.push((part, tokens_by_position, grouped_expansions, candidates));
+                        }
+                        std::result::Result::<_, Error>::Ok(out)
                     })
-                    .await?;
+                    .await;
+                    scorer_score_ns.fetch_add(
+                        t0.elapsed().as_nanos() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    if scored_tx.send(scored).await.is_err() {
+                        return;
+                    }
+                }
+                if producer_done {
+                    return;
+                }
+            }
+        });
+
+        // ---- Main: resolve each scored batch (concurrently within the batch), collect for merge.
+        // While this resolves batch N, task B is scoring N+1 and task A is loading N+2.
+        let mut merged_results: Vec<PartitionCandidates> = Vec::new();
+        while let Some(scored_batch) = scored_rx.recv().await {
+            let scored_batch = scored_batch?;
+            let t0 = std::time::Instant::now();
+            let resolved: Vec<PartitionCandidates> = stream::iter(scored_batch.into_iter().map(
+                |(part, tokens_by_position, grouped_expansions, candidates)| async move {
                     let mut partition_result = PartitionCandidates {
                         tokens_by_position,
                         grouped_expansions,
                         candidates,
                     };
-                    resolve_deferred_candidates(&part.docs, &mut partition_result.candidates)
-                        .await?;
+                    if !fts_skip_resolve() {
+                        resolve_deferred_candidates(&part.docs, &mut partition_result.candidates)
+                            .await?;
+                    }
                     Result::Ok(partition_result)
-                }
-            })
-            .collect::<Vec<_>>();
-        let mut parts = stream::iter(parts).buffer_unordered(get_num_compute_intensive_cpus());
+                },
+            ))
+            .buffer_unordered(batch_size)
+            .try_collect()
+            .await?;
+            resolve_ns += t0.elapsed().as_nanos();
+            merged_results.extend(resolved);
+        }
         let mut idf_cache: HashMap<String, f32> = HashMap::new();
-        while let Some(res) = parts.try_next().await? {
+        let merge_body_t0 = std::time::Instant::now();
+        for res in merged_results {
             if res.candidates.is_empty() {
                 continue;
             }
@@ -1128,6 +1288,22 @@ impl InvertedIndex {
                     push_scored_candidate(&mut candidates, limit, addr, score)?;
                 }
             }
+        }
+
+        let merge_body_ns = merge_body_t0.elapsed().as_nanos();
+        if timing {
+            let ro = super::lazy_docset::RESOLVE_OPENS.swap(0, std::sync::atomic::Ordering::Relaxed);
+            let rr = super::lazy_docset::RESOLVE_READS.swap(0, std::sync::atomic::Ordering::Relaxed);
+            let rd = super::lazy_docset::RESOLVE_DOCS.swap(0, std::sync::atomic::Ordering::Relaxed);
+            let rf = super::lazy_docset::RESOLVE_FAST.swap(0, std::sync::atomic::Ordering::Relaxed);
+            eprintln!(
+                "FTS_TIMING batch_size={batch_size} scorer_ms={:.1} load_ms={:.1} score_ms={:.1} resolve_ms={:.1} merge_ms={:.1} resolve_opens={ro} resolve_reads={rr} resolve_docs={rd} resolve_fast={rf}",
+                scorer_build_ns as f64 / 1e6,
+                load_ns.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6,
+                score_ns.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6,
+                resolve_ns as f64 / 1e6,
+                merge_body_ns as f64 / 1e6,
+            );
         }
 
         Ok(candidates
@@ -7943,6 +8119,120 @@ mod tests {
             row_ids.iter().any(|&id| id >= 200),
             "Should contain row_id from partition 1"
         );
+    }
+
+    #[tokio::test]
+    async fn test_bm25_search_streaming_pipeline_many_partitions() {
+        // Exercises the 3-stage streaming pipeline (producer load -> batched
+        // spawn_cpu score -> main-consumer resolve/merge) across MULTIPLE
+        // batches: 40 scoring partitions is > 2x the default LANCE_FTS_BATCH
+        // of 16, so results must flow through several greedy channel batches
+        // and still merge into an exact, complete top-k. Also includes one
+        // partition with no matching token to exercise the empty-partition
+        // skip path in the producer.
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        const NUM_MATCHING_PARTITIONS: u64 = 40;
+        let mut expected_row_ids: Vec<u64> = Vec::new();
+        for pid in 0..NUM_MATCHING_PARTITIONS {
+            let mut builder = InnerBuilder::new(pid, false, TokenSetFormat::default());
+            builder.tokens.add("pipeline".to_owned());
+            builder.posting_lists.push(PostingListBuilder::new(false));
+            // Partition pid holds (pid % 3) + 1 matching docs.
+            let ndocs = (pid % 3) + 1;
+            for d in 0..ndocs {
+                builder.posting_lists[0].add(d as u32, PositionRecorder::Count(1));
+                let row_id = pid * 1000 + d;
+                builder.docs.append(row_id, 1);
+                expected_row_ids.push(row_id);
+            }
+            builder.write(store.as_ref()).await.unwrap();
+        }
+        // One extra partition whose only token does NOT match the query:
+        // its prep future must yield None and be skipped by the producer.
+        let mut empty_builder = InnerBuilder::new(
+            NUM_MATCHING_PARTITIONS,
+            false,
+            TokenSetFormat::default(),
+        );
+        empty_builder.tokens.add("unrelated".to_owned());
+        empty_builder
+            .posting_lists
+            .push(PostingListBuilder::new(false));
+        empty_builder.posting_lists[0].add(0, PositionRecorder::Count(1));
+        empty_builder.docs.append(999_999, 1);
+        empty_builder.write(store.as_ref()).await.unwrap();
+
+        let all_partitions: Vec<u64> = (0..=NUM_MATCHING_PARTITIONS).collect();
+        let metadata = std::collections::HashMap::from_iter(vec![
+            (
+                "partitions".to_owned(),
+                serde_json::to_string(&all_partitions).unwrap(),
+            ),
+            (
+                "params".to_owned(),
+                serde_json::to_string(&InvertedIndexParams::default()).unwrap(),
+            ),
+            (
+                TOKEN_SET_FORMAT_KEY.to_owned(),
+                TokenSetFormat::default().to_string(),
+            ),
+        ]);
+        let mut writer = store
+            .new_index_file(METADATA_FILE, Arc::new(arrow_schema::Schema::empty()))
+            .await
+            .unwrap();
+        writer.finish_with_metadata(metadata).await.unwrap();
+
+        let cache = Arc::new(LanceCache::with_capacity(64 * 1024 * 1024));
+        let index = InvertedIndex::load(store.clone(), None, cache.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(index.partitions.len(), 41);
+
+        // 1) Unbounded-ish limit: every matching doc must come back exactly once,
+        //    across all pipeline batches.
+        let tokens = Arc::new(Tokens::new(vec!["pipeline".to_owned()], DocType::Text));
+        let params = Arc::new(FtsSearchParams::new().with_limit(Some(1000)));
+        let prefilter = Arc::new(NoFilter);
+        let metrics = Arc::new(NoOpMetricsCollector);
+        let (row_ids, scores) = index
+            .bm25_search(
+                tokens.clone(),
+                params,
+                Operator::Or,
+                prefilter.clone(),
+                metrics.clone(),
+                None,
+            )
+            .await
+            .unwrap();
+        let mut got = row_ids.clone();
+        got.sort_unstable();
+        let mut want = expected_row_ids.clone();
+        want.sort_unstable();
+        assert_eq!(
+            got, want,
+            "streaming pipeline must return every matching doc exactly once"
+        );
+        assert_eq!(scores.len(), row_ids.len());
+        assert!(scores.iter().all(|s| *s > 0.0));
+
+        // 2) Top-k smaller than the total: exactly k results survive the
+        //    cross-batch merge.
+        let params_k = Arc::new(FtsSearchParams::new().with_limit(Some(7)));
+        let (row_ids_k, scores_k) = index
+            .bm25_search(tokens, params_k, Operator::Or, prefilter, metrics, None)
+            .await
+            .unwrap();
+        assert_eq!(row_ids_k.len(), 7);
+        assert_eq!(scores_k.len(), 7);
+        assert!(row_ids_k.iter().all(|id| expected_row_ids.contains(id)));
     }
 
     #[tokio::test]

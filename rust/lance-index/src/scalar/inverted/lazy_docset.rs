@@ -21,6 +21,12 @@ use arrow::array::AsArray;
 use arrow::datatypes::{UInt32Type, UInt64Type};
 use arrow_array::{UInt32Array, UInt64Array};
 use lance_core::ROW_ID;
+
+// ---- FTS resolve IO instrumentation (LANCE_FTS_TIMING) ----
+pub static RESOLVE_OPENS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static RESOLVE_READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static RESOLVE_DOCS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static RESOLVE_FAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 use lance_core::Result;
 use tokio::sync::OnceCell;
 
@@ -256,6 +262,7 @@ impl DeferredDocSet {
     /// Open a fresh docs-file reader. Dropped by the caller once its read
     /// completes, so no handle is pinned across the partition's lifetime.
     async fn reader(&self) -> Result<Arc<dyn IndexReader>> {
+        RESOLVE_OPENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.store.open_index_file(&self.docs_path).await
     }
 
@@ -357,15 +364,17 @@ impl DeferredDocSet {
             return Ok(doc_ids.iter().map(|&d| full.row_id(d)).collect());
         }
         if let Some(arr) = self.row_ids_col.get() {
+            RESOLVE_FAST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Ok(doc_ids.iter().map(|&d| arr.value(d as usize)).collect());
         }
-        let ranges: Vec<std::ops::Range<usize>> = doc_ids
-            .iter()
-            .map(|&d| d as usize..d as usize + 1)
-            .collect();
-        let reader = self.reader().await?;
-        let batch = reader.read_ranges(&ranges, Some(&[ROW_ID])).await?;
-        let arr = batch[ROW_ID].as_primitive::<UInt64Type>();
-        Ok((0..arr.len()).map(|i| arr.value(i)).collect())
+        RESOLVE_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        RESOLVE_DOCS.fetch_add(doc_ids.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        // FIX (option A): load the whole ROW_ID column ONCE via row_ids_column()
+        // (single sequential read, cached in the OnceCell) instead of a fresh
+        // reader open + scattered single-row read_ranges on EVERY resolve.
+        // Cost: ~8B/doc resident (~2.5MB per 312k-doc partition), same
+        // accounting semantics as the existing lazily-populated columns.
+        let arr = self.row_ids_column().await?;
+        Ok(doc_ids.iter().map(|&d| arr.value(d as usize)).collect())
     }
 }
