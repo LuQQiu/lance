@@ -98,6 +98,45 @@ pub const INVERT_LIST_FILE: &str = "invert.lance";
 pub const DOCS_FILE: &str = "docs.lance";
 pub const METADATA_FILE: &str = "metadata.lance";
 
+/// Weak fast path in front of an index-cache entry. Hits upgrade a `Weak` —
+/// no cache traffic, no read-op bookkeeping — and every `TOUCH_PERIOD`-th
+/// hit deliberately misses so the caller reads through the cache and keeps
+/// the entry's LRU recency fresh. The `Weak` never keeps the value alive,
+/// so eviction and accounting semantics are unchanged.
+pub(super) struct WeakSlot<T> {
+    slot: std::sync::RwLock<std::sync::Weak<T>>,
+    hits: AtomicU32,
+}
+
+impl<T> Default for WeakSlot<T> {
+    fn default() -> Self {
+        Self {
+            slot: std::sync::RwLock::new(std::sync::Weak::new()),
+            hits: AtomicU32::new(1),
+        }
+    }
+}
+
+impl<T> WeakSlot<T> {
+    const TOUCH_PERIOD: u32 = 64;
+
+    pub(super) fn get(&self) -> Option<Arc<T>> {
+        let value = self.slot.read().unwrap().upgrade()?;
+        if self
+            .hits
+            .fetch_add(1, Ordering::Relaxed)
+            .is_multiple_of(Self::TOUCH_PERIOD)
+        {
+            return None;
+        }
+        Some(value)
+    }
+
+    pub(super) fn store(&self, value: &Arc<T>) {
+        *self.slot.write().unwrap() = Arc::downgrade(value);
+    }
+}
+
 /// Partitions searched per cpu-pool task in `bm25_search`. Chunking bounds
 /// the task rate and lets the shared top-k floor propagate between the
 /// partitions a thread scores back-to-back. `LANCE_FTS_SEARCH_CHUNK=1`
@@ -2872,6 +2911,8 @@ impl TokenSet {
     }
 }
 
+type GroupHotSlots = std::sync::RwLock<HashMap<(u32, u32), Arc<WeakSlot<PostingListGroup>>>>;
+
 pub struct PostingListReader {
     reader: Arc<dyn IndexReader>,
 
@@ -2892,6 +2933,9 @@ pub struct PostingListReader {
     grouping: PostingGrouping,
 
     index_cache: WeakLanceCache,
+
+    /// Weak fast path per posting group, in front of the index cache.
+    group_hot: GroupHotSlots,
 }
 
 /// Per-token metadata (max_score, length) needed by the BM25 query and stats
@@ -3009,7 +3053,20 @@ impl PostingListReader {
             positions_layout,
             grouping,
             index_cache: WeakLanceCache::from(index_cache),
+            group_hot: GroupHotSlots::default(),
         })
+    }
+
+    fn group_hot_slot(&self, start: u32, end: u32) -> Arc<WeakSlot<PostingListGroup>> {
+        if let Some(slot) = self.group_hot.read().unwrap().get(&(start, end)) {
+            return slot.clone();
+        }
+        self.group_hot
+            .write()
+            .unwrap()
+            .entry((start, end))
+            .or_default()
+            .clone()
     }
 
     // for legacy format
@@ -3243,17 +3300,25 @@ impl PostingListReader {
             // Grouped path (issue #7040): one cache entry covers rows
             // [start, end), so neighbouring rare terms share a single read.
             Some((start, end)) => {
-                let group = self
-                    .index_cache
-                    .get_or_insert_with_key(
-                        posting_list_group_cache_key(start, end, self.has_impacts),
-                        || async move {
-                            metrics.record_part_load();
-                            info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_SCALAR_PART, index_type="inverted", part_id=start);
-                            self.load_posting_list_group(start, end).await
-                        },
-                    )
-                    .await?;
+                let hot = self.group_hot_slot(start, end);
+                let group = match hot.get() {
+                    Some(group) => group,
+                    None => {
+                        let group = self
+                            .index_cache
+                            .get_or_insert_with_key(
+                                posting_list_group_cache_key(start, end, self.has_impacts),
+                                || async move {
+                                    metrics.record_part_load();
+                                    info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_SCALAR_PART, index_type="inverted", part_id=start);
+                                    self.load_posting_list_group(start, end).await
+                                },
+                            )
+                            .await?;
+                        hot.store(&group);
+                        group
+                    }
+                };
                 let (max_score, length) = if group.needs_external_metadata() {
                     self.posting_metadata_for_token(token_id).await?
                 } else {

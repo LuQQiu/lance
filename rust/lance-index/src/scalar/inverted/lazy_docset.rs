@@ -34,7 +34,7 @@ use lance_core::deepsize::DeepSizeOf;
 use tokio::sync::OnceCell;
 
 use crate::scalar::RowIdRemapper;
-use crate::scalar::inverted::index::{DocSet, NUM_TOKEN_COL};
+use crate::scalar::inverted::index::{DocSet, NUM_TOKEN_COL, WeakSlot};
 use crate::scalar::inverted::query::Operator;
 use crate::scalar::inverted::wand::should_flat_search;
 use crate::scalar::{IndexReader, IndexStore};
@@ -129,6 +129,8 @@ pub struct DeferredDocSet {
     quantized_scoring: bool,
     /// Doc count cached at construction so `len()` stays sync + IO-free.
     num_rows: usize,
+    /// Weak fast path in front of the [`DocRowIdsKey`] cache entry.
+    row_ids_hot: WeakSlot<CachedDocRowIds>,
     /// `NUM_TOKEN_COL` and its zero-copy scoring view carrying the cached sum,
     /// published together on first read.
     num_tokens: OnceCell<NumTokensSnapshot>,
@@ -204,6 +206,7 @@ impl LazyDocSet {
             frag_reuse_index,
             quantized_scoring,
             num_rows,
+            row_ids_hot: WeakSlot::default(),
             num_tokens: OnceCell::new(),
             resident: OnceCell::new(),
         }))
@@ -395,6 +398,9 @@ impl DeferredDocSet {
     /// so the memory is accounted for at insert time and evictable under
     /// pressure. Concurrent loads are deduped by the cache backend.
     async fn row_ids_column(&self) -> Result<Arc<UInt64Array>> {
+        if let Some(cached) = self.row_ids_hot.get() {
+            return Ok(cached.row_ids.clone());
+        }
         let store = self.store.clone();
         let docs_path = self.docs_path.clone();
         let num_rows = self.num_rows;
@@ -413,6 +419,7 @@ impl DeferredDocSet {
                 },
             )
             .await?;
+        self.row_ids_hot.store(&cached);
         Ok(cached.row_ids.clone())
     }
 
