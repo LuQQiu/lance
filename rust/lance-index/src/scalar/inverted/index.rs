@@ -935,58 +935,73 @@ impl InvertedIndex {
                 let impact_shared_threshold = impact_shared_threshold.clone();
                 let legacy_shared_threshold = legacy_shared_threshold.clone();
                 async move {
-                    let mut loaded = Vec::with_capacity(chunk.len());
-                    for part in chunk {
-                        let loaded_postings = part
-                            .load_posting_lists(
-                                tokens.as_ref(),
-                                params.as_ref(),
-                                operator,
-                                impact_scorer.as_ref(),
-                                metrics.as_ref(),
-                            )
-                            .await?;
-                        let LoadedPostings {
-                            postings,
-                            grouped_expansions,
-                            impact_safe,
-                            exact_scoring_required,
-                        } = loaded_postings;
-                        if postings.is_empty() {
-                            // No hits in this partition; its DocSet stays
-                            // unloaded, so we never pay the per-doc
-                            // row_id/num_tokens download for it.
-                            continue;
+                    // Load the chunk's partitions concurrently; only the
+                    // search below is batched onto one cpu task.
+                    let loads = chunk.into_iter().map(|part| {
+                        let tokens = tokens.clone();
+                        let params = params.clone();
+                        let mask = mask.clone();
+                        let metrics = metrics.clone();
+                        let impact_scorer = impact_scorer.clone();
+                        let impact_shared_threshold = impact_shared_threshold.clone();
+                        let legacy_shared_threshold = legacy_shared_threshold.clone();
+                        async move {
+                            let loaded_postings = part
+                                .load_posting_lists(
+                                    tokens.as_ref(),
+                                    params.as_ref(),
+                                    operator,
+                                    impact_scorer.as_ref(),
+                                    metrics.as_ref(),
+                                )
+                                .await?;
+                            let LoadedPostings {
+                                postings,
+                                grouped_expansions,
+                                impact_safe,
+                                exact_scoring_required,
+                            } = loaded_postings;
+                            if postings.is_empty() {
+                                // No hits in this partition; its DocSet stays
+                                // unloaded, so we never pay the per-doc
+                                // row_id/num_tokens download for it.
+                                return Result::Ok(None);
+                            }
+                            let docs_for_wand =
+                                part.docs.docs_for_wand(operator, mask.as_ref()).await?;
+                            let max_position = postings
+                                .iter()
+                                .map(|posting| posting.term_index() as usize)
+                                .max()
+                                .unwrap_or_default();
+                            let mut tokens_by_position = vec![String::new(); max_position + 1];
+                            for posting in &postings {
+                                let idx = posting.term_index() as usize;
+                                tokens_by_position[idx] = posting.token().to_owned();
+                            }
+                            let use_global_scorer = impact_safe || exact_scoring_required;
+                            let partition_threshold = if use_global_scorer {
+                                impact_shared_threshold
+                            } else {
+                                legacy_shared_threshold
+                            };
+                            let wand_scorer = use_global_scorer.then(|| impact_scorer.clone());
+                            Result::Ok(Some((
+                                part,
+                                docs_for_wand,
+                                postings,
+                                wand_scorer,
+                                partition_threshold,
+                                tokens_by_position,
+                                grouped_expansions,
+                            )))
                         }
-                        let docs_for_wand =
-                            part.docs.docs_for_wand(operator, mask.as_ref()).await?;
-                        let max_position = postings
-                            .iter()
-                            .map(|posting| posting.term_index() as usize)
-                            .max()
-                            .unwrap_or_default();
-                        let mut tokens_by_position = vec![String::new(); max_position + 1];
-                        for posting in &postings {
-                            let idx = posting.term_index() as usize;
-                            tokens_by_position[idx] = posting.token().to_owned();
-                        }
-                        let use_global_scorer = impact_safe || exact_scoring_required;
-                        let partition_threshold = if use_global_scorer {
-                            impact_shared_threshold.clone()
-                        } else {
-                            legacy_shared_threshold.clone()
-                        };
-                        let wand_scorer = use_global_scorer.then(|| impact_scorer.clone());
-                        loaded.push((
-                            part,
-                            docs_for_wand,
-                            postings,
-                            wand_scorer,
-                            partition_threshold,
-                            tokens_by_position,
-                            grouped_expansions,
-                        ));
-                    }
+                    });
+                    let loaded: Vec<_> = futures::future::try_join_all(loads)
+                        .await?
+                        .into_iter()
+                        .flatten()
+                        .collect();
                     if loaded.is_empty() {
                         return Result::Ok(Vec::new());
                     }
