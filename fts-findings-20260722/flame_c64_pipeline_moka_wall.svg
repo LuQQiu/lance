@@ -1,0 +1,491 @@
+<?xml version="1.0" standalone="no"?><!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd"><svg version="1.1" width="1200" height="582" onload="init(evt)" viewBox="0 0 1200 582" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns:fg="http://github.com/jonhoo/inferno"><!--Flame graph stack visualization. See https://github.com/brendangregg/FlameGraph for latest version, and http://www.brendangregg.com/flamegraphs.html for examples.--><!--NOTES: --><defs><linearGradient id="background" y1="0" y2="1" x1="0" x2="0"><stop stop-color="#eeeeee" offset="5%"/><stop stop-color="#eeeeb0" offset="95%"/></linearGradient></defs><style type="text/css">
+text { font-family:monospace; font-size:12px }
+#title { text-anchor:middle; font-size:17px; }
+#matched { text-anchor:end; }
+#search { text-anchor:end; opacity:0.1; cursor:pointer; }
+#search:hover, #search.show { opacity:1; }
+#subtitle { text-anchor:middle; font-color:rgb(160,160,160); }
+#unzoom { cursor:pointer; }
+#frames > *:hover { stroke:black; stroke-width:0.5; cursor:pointer; }
+.hide { display:none; }
+.parent { opacity:0.5; }
+</style><script type="text/ecmascript"><![CDATA[
+        var nametype = 'Function:';
+        var fontsize = 12;
+        var fontwidth = 0.59;
+        var xpad = 10;
+        var inverted = false;
+        var searchcolor = 'rgb(230,0,230)';
+        var fluiddrawing = true;
+        var truncate_text_right = false;
+    ]]><![CDATA["use strict";
+var details, searchbtn, unzoombtn, matchedtxt, svg, searching, frames, known_font_width;
+function init(evt) {
+    details = document.getElementById("details").firstChild;
+    searchbtn = document.getElementById("search");
+    unzoombtn = document.getElementById("unzoom");
+    matchedtxt = document.getElementById("matched");
+    svg = document.getElementsByTagName("svg")[0];
+    frames = document.getElementById("frames");
+    known_font_width = get_monospace_width(frames);
+    total_samples = parseInt(frames.attributes.total_samples.value);
+    searching = 0;
+
+    // Use GET parameters to restore a flamegraph's state.
+    var restore_state = function() {
+        var params = get_params();
+        if (params.x && params.y)
+            zoom(find_group(document.querySelector('[*|x="' + params.x + '"][y="' + params.y + '"]')));
+        if (params.s)
+            search(params.s);
+    };
+
+    if (fluiddrawing) {
+        // Make width dynamic so the SVG fits its parent's width.
+        svg.removeAttribute("width");
+        // Edge requires us to have a viewBox that gets updated with size changes.
+        var isEdge = /Edge\/\d./i.test(navigator.userAgent);
+        if (!isEdge) {
+            svg.removeAttribute("viewBox");
+        }
+        var update_for_width_change = function() {
+            if (isEdge) {
+                svg.attributes.viewBox.value = "0 0 " + svg.width.baseVal.value + " " + svg.height.baseVal.value;
+            }
+
+            // Keep consistent padding on left and right of frames container.
+            frames.attributes.width.value = svg.width.baseVal.value - xpad * 2;
+
+            // Text truncation needs to be adjusted for the current width.
+            update_text_for_elements(frames.children);
+
+            // Keep search elements at a fixed distance from right edge.
+            var svgWidth = svg.width.baseVal.value;
+            searchbtn.attributes.x.value = svgWidth - xpad;
+            matchedtxt.attributes.x.value = svgWidth - xpad;
+        };
+        window.addEventListener('resize', function() {
+            update_for_width_change();
+        });
+        // This needs to be done asynchronously for Safari to work.
+        setTimeout(function() {
+            unzoom();
+            update_for_width_change();
+            restore_state();
+        }, 0);
+    } else {
+        restore_state();
+    }
+}
+// event listeners
+window.addEventListener("click", function(e) {
+    var target = find_group(e.target);
+    if (target) {
+        if (target.nodeName == "a") {
+            if (e.ctrlKey === false) return;
+            e.preventDefault();
+        }
+        if (target.classList.contains("parent")) unzoom();
+        zoom(target);
+
+        // set parameters for zoom state
+        var el = target.querySelector("rect");
+        if (el && el.attributes && el.attributes.y && el.attributes["fg:x"]) {
+            var params = get_params()
+            params.x = el.attributes["fg:x"].value;
+            params.y = el.attributes.y.value;
+            history.replaceState(null, null, parse_params(params));
+        }
+    }
+    else if (e.target.id == "unzoom") {
+        unzoom();
+
+        // remove zoom state
+        var params = get_params();
+        if (params.x) delete params.x;
+        if (params.y) delete params.y;
+        history.replaceState(null, null, parse_params(params));
+    }
+    else if (e.target.id == "search") search_prompt();
+}, false)
+// mouse-over for info
+// show
+window.addEventListener("mouseover", function(e) {
+    var target = find_group(e.target);
+    if (target) details.nodeValue = nametype + " " + g_to_text(target);
+}, false)
+// clear
+window.addEventListener("mouseout", function(e) {
+    var target = find_group(e.target);
+    if (target) details.nodeValue = ' ';
+}, false)
+// ctrl-F for search
+window.addEventListener("keydown",function (e) {
+    if (e.keyCode === 114 || (e.ctrlKey && e.keyCode === 70)) {
+        e.preventDefault();
+        search_prompt();
+    }
+}, false)
+// functions
+function get_params() {
+    var params = {};
+    var paramsarr = window.location.search.substr(1).split('&');
+    for (var i = 0; i < paramsarr.length; ++i) {
+        var tmp = paramsarr[i].split("=");
+        if (!tmp[0] || !tmp[1]) continue;
+        params[tmp[0]]  = decodeURIComponent(tmp[1]);
+    }
+    return params;
+}
+function parse_params(params) {
+    var uri = "?";
+    for (var key in params) {
+        uri += key + '=' + encodeURIComponent(params[key]) + '&';
+    }
+    if (uri.slice(-1) == "&")
+        uri = uri.substring(0, uri.length - 1);
+    if (uri == '?')
+        uri = window.location.href.split('?')[0];
+    return uri;
+}
+function find_child(node, selector) {
+    var children = node.querySelectorAll(selector);
+    if (children.length) return children[0];
+    return;
+}
+function find_group(node) {
+    var parent = node.parentElement;
+    if (!parent) return;
+    if (parent.id == "frames") return node;
+    return find_group(parent);
+}
+function orig_save(e, attr, val) {
+    if (e.attributes["fg:orig_" + attr] != undefined) return;
+    if (e.attributes[attr] == undefined) return;
+    if (val == undefined) val = e.attributes[attr].value;
+    e.setAttribute("fg:orig_" + attr, val);
+}
+function orig_load(e, attr) {
+    if (e.attributes["fg:orig_"+attr] == undefined) return;
+    e.attributes[attr].value = e.attributes["fg:orig_" + attr].value;
+    e.removeAttribute("fg:orig_" + attr);
+}
+function g_to_text(e) {
+    var text = find_child(e, "title").firstChild.nodeValue;
+    return (text)
+}
+function g_to_func(e) {
+    var func = g_to_text(e);
+    // if there's any manipulation we want to do to the function
+    // name before it's searched, do it here before returning.
+    return (func);
+}
+function get_monospace_width(frames) {
+    // Given the id="frames" element, return the width of text characters if
+    // this is a monospace font, otherwise return 0.
+    text = find_child(frames.children[0], "text");
+    originalContent = text.textContent;
+    text.textContent = "!";
+    bangWidth = text.getComputedTextLength();
+    text.textContent = "W";
+    wWidth = text.getComputedTextLength();
+    text.textContent = originalContent;
+    if (bangWidth === wWidth) {
+        return bangWidth;
+    } else {
+        return 0;
+    }
+}
+function update_text_for_elements(elements) {
+    // In order to render quickly in the browser, you want to do one pass of
+    // reading attributes, and one pass of mutating attributes. See
+    // https://web.dev/avoid-large-complex-layouts-and-layout-thrashing/ for details.
+
+    // Fall back to inefficient calculation, if we're variable-width font.
+    // TODO This should be optimized somehow too.
+    if (known_font_width === 0) {
+        for (var i = 0; i < elements.length; i++) {
+            update_text(elements[i]);
+        }
+        return;
+    }
+
+    var textElemNewAttributes = [];
+    for (var i = 0; i < elements.length; i++) {
+        var e = elements[i];
+        var r = find_child(e, "rect");
+        var t = find_child(e, "text");
+        var w = parseFloat(r.attributes.width.value) * frames.attributes.width.value / 100 - 3;
+        var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+        var newX = format_percent((parseFloat(r.attributes.x.value) + (100 * 3 / frames.attributes.width.value)));
+
+        // Smaller than this size won't fit anything
+        if (w < 2 * known_font_width) {
+            textElemNewAttributes.push([newX, ""]);
+            continue;
+        }
+
+        // Fit in full text width
+        if (txt.length * known_font_width < w) {
+            textElemNewAttributes.push([newX, txt]);
+            continue;
+        }
+
+        var substringLength = Math.floor(w / known_font_width) - 2;
+        if (truncate_text_right) {
+            // Truncate the right side of the text.
+            textElemNewAttributes.push([newX, txt.substring(0, substringLength) + ".."]);
+            continue;
+        } else {
+            // Truncate the left side of the text.
+            textElemNewAttributes.push([newX, ".." + txt.substring(txt.length - substringLength, txt.length)]);
+            continue;
+        }
+    }
+
+    console.assert(textElemNewAttributes.length === elements.length, "Resize failed, please file a bug at https://github.com/jonhoo/inferno/");
+
+    // Now that we know new textContent, set it all in one go so we don't refresh a bazillion times.
+    for (var i = 0; i < elements.length; i++) {
+        var e = elements[i];
+        var values = textElemNewAttributes[i];
+        var t = find_child(e, "text");
+        t.attributes.x.value = values[0];
+        t.textContent = values[1];
+    }
+}
+
+function update_text(e) {
+    var r = find_child(e, "rect");
+    var t = find_child(e, "text");
+    var w = parseFloat(r.attributes.width.value) * frames.attributes.width.value / 100 - 3;
+    var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+    t.attributes.x.value = format_percent((parseFloat(r.attributes.x.value) + (100 * 3 / frames.attributes.width.value)));
+
+    // Smaller than this size won't fit anything
+    if (w < 2 * fontsize * fontwidth) {
+        t.textContent = "";
+        return;
+    }
+    t.textContent = txt;
+    // Fit in full text width
+    if (t.getComputedTextLength() < w)
+        return;
+    if (truncate_text_right) {
+        // Truncate the right side of the text.
+        for (var x = txt.length - 2; x > 0; x--) {
+            if (t.getSubStringLength(0, x + 2) <= w) {
+                t.textContent = txt.substring(0, x) + "..";
+                return;
+            }
+        }
+    } else {
+        // Truncate the left side of the text.
+        for (var x = 2; x < txt.length; x++) {
+            if (t.getSubStringLength(x - 2, txt.length) <= w) {
+                t.textContent = ".." + txt.substring(x, txt.length);
+                return;
+            }
+        }
+    }
+    t.textContent = "";
+}
+// zoom
+function zoom_reset(e) {
+    if (e.tagName == "rect") {
+        e.attributes.x.value = format_percent(100 * parseInt(e.attributes["fg:x"].value) / total_samples);
+        e.attributes.width.value = format_percent(100 * parseInt(e.attributes["fg:w"].value) / total_samples);
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_reset(c[i]);
+    }
+}
+function zoom_child(e, x, zoomed_width_samples) {
+    if (e.tagName == "text") {
+        var parent_x = parseFloat(find_child(e.parentNode, "rect[x]").attributes.x.value);
+        e.attributes.x.value = format_percent(parent_x + (100 * 3 / frames.attributes.width.value));
+    } else if (e.tagName == "rect") {
+        e.attributes.x.value = format_percent(100 * (parseInt(e.attributes["fg:x"].value) - x) / zoomed_width_samples);
+        e.attributes.width.value = format_percent(100 * parseInt(e.attributes["fg:w"].value) / zoomed_width_samples);
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_child(c[i], x, zoomed_width_samples);
+    }
+}
+function zoom_parent(e) {
+    if (e.attributes) {
+        if (e.attributes.x != undefined) {
+            e.attributes.x.value = "0.0%";
+        }
+        if (e.attributes.width != undefined) {
+            e.attributes.width.value = "100.0%";
+        }
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_parent(c[i]);
+    }
+}
+function zoom(node) {
+    var attr = find_child(node, "rect").attributes;
+    var width = parseInt(attr["fg:w"].value);
+    var xmin = parseInt(attr["fg:x"].value);
+    var xmax = xmin + width;
+    var ymin = parseFloat(attr.y.value);
+    unzoombtn.classList.remove("hide");
+    var el = frames.children;
+    var to_update_text = [];
+    for (var i = 0; i < el.length; i++) {
+        var e = el[i];
+        var a = find_child(e, "rect").attributes;
+        var ex = parseInt(a["fg:x"].value);
+        var ew = parseInt(a["fg:w"].value);
+        // Is it an ancestor
+        if (!inverted) {
+            var upstack = parseFloat(a.y.value) > ymin;
+        } else {
+            var upstack = parseFloat(a.y.value) < ymin;
+        }
+        if (upstack) {
+            // Direct ancestor
+            if (ex <= xmin && (ex+ew) >= xmax) {
+                e.classList.add("parent");
+                zoom_parent(e);
+                to_update_text.push(e);
+            }
+            // not in current path
+            else
+                e.classList.add("hide");
+        }
+        // Children maybe
+        else {
+            // no common path
+            if (ex < xmin || ex >= xmax) {
+                e.classList.add("hide");
+            }
+            else {
+                zoom_child(e, xmin, width);
+                to_update_text.push(e);
+            }
+        }
+    }
+    update_text_for_elements(to_update_text);
+}
+function unzoom() {
+    unzoombtn.classList.add("hide");
+    var el = frames.children;
+    for(var i = 0; i < el.length; i++) {
+        el[i].classList.remove("parent");
+        el[i].classList.remove("hide");
+        zoom_reset(el[i]);
+    }
+    update_text_for_elements(el);
+}
+// search
+function reset_search() {
+    var el = document.querySelectorAll("#frames rect");
+    for (var i = 0; i < el.length; i++) {
+        orig_load(el[i], "fill")
+    }
+    var params = get_params();
+    delete params.s;
+    history.replaceState(null, null, parse_params(params));
+}
+function search_prompt() {
+    if (!searching) {
+        var term = prompt("Enter a search term (regexp " +
+            "allowed, eg: ^ext4_)", "");
+        if (term != null) {
+            search(term)
+        }
+    } else {
+        reset_search();
+        searching = 0;
+        searchbtn.classList.remove("show");
+        searchbtn.firstChild.nodeValue = "Search"
+        matchedtxt.classList.add("hide");
+        matchedtxt.firstChild.nodeValue = ""
+    }
+}
+function search(term) {
+    var re = new RegExp(term);
+    var el = frames.children;
+    var matches = new Object();
+    var maxwidth = 0;
+    for (var i = 0; i < el.length; i++) {
+        var e = el[i];
+        // Skip over frames which are either not visible, or below the zoomed-to frame
+        if (e.classList.contains("hide") || e.classList.contains("parent")) {
+            continue;
+        }
+        var func = g_to_func(e);
+        var rect = find_child(e, "rect");
+        if (func == null || rect == null)
+            continue;
+        // Save max width. Only works as we have a root frame
+        var w = parseInt(rect.attributes["fg:w"].value);
+        if (w > maxwidth)
+            maxwidth = w;
+        if (func.match(re)) {
+            // highlight
+            var x = parseInt(rect.attributes["fg:x"].value);
+            orig_save(rect, "fill");
+            rect.attributes.fill.value = searchcolor;
+            // remember matches
+            if (matches[x] == undefined) {
+                matches[x] = w;
+            } else {
+                if (w > matches[x]) {
+                    // overwrite with parent
+                    matches[x] = w;
+                }
+            }
+            searching = 1;
+        }
+    }
+    if (!searching)
+        return;
+    var params = get_params();
+    params.s = term;
+    history.replaceState(null, null, parse_params(params));
+
+    searchbtn.classList.add("show");
+    searchbtn.firstChild.nodeValue = "Reset Search";
+    // calculate percent matched, excluding vertical overlap
+    var count = 0;
+    var lastx = -1;
+    var lastw = 0;
+    var keys = Array();
+    for (k in matches) {
+        if (matches.hasOwnProperty(k))
+            keys.push(k);
+    }
+    // sort the matched frames by their x location
+    // ascending, then width descending
+    keys.sort(function(a, b){
+        return a - b;
+    });
+    // Step through frames saving only the biggest bottom-up frames
+    // thanks to the sort order. This relies on the tree property
+    // where children are always smaller than their parents.
+    for (var k in keys) {
+        var x = parseInt(keys[k]);
+        var w = matches[keys[k]];
+        if (x >= lastx + lastw) {
+            count += w;
+            lastx = x;
+            lastw = w;
+        }
+    }
+    // display matched percent
+    matchedtxt.classList.remove("hide");
+    var pct = 100 * count / maxwidth;
+    if (pct != 100) pct = pct.toFixed(1);
+    matchedtxt.firstChild.nodeValue = "Matched: " + pct + "%";
+}
+function format_percent(n) {
+    return n.toFixed(4) + "%";
+}
+]]></script><rect x="0" y="0" width="100%" height="582" fill="url(#background)"/><text id="title" fill="rgb(0,0,0)" x="50.0000%" y="24.00">Flame Graph</text><text id="details" fill="rgb(0,0,0)" x="10" y="565.00"> </text><text id="unzoom" class="hide" fill="rgb(0,0,0)" x="10" y="24.00">Reset Zoom</text><text id="search" fill="rgb(0,0,0)" x="1190" y="24.00">Search</text><text id="matched" fill="rgb(0,0,0)" x="1190" y="565.00"> </text><svg id="frames" x="10" width="1180" total_samples="30767"><g><title>&lt;alloc::collections::binary_heap::BinaryHeap&lt;core::cmp::Reverse&lt;(lance_index::scalar::inverted::builder::ScoredDoc, u32, u64, u32)&gt;&gt;&gt;::pop (11 samples, 0.04%)</title><rect x="3.9783%" y="389" width="0.0358%" height="15" fill="rgb(227,0,7)" fg:x="1224" fg:w="11"/><text x="4.2283%" y="399.50"></text></g><g><title>&lt;alloc::collections::binary_heap::BinaryHeap&lt;core::cmp::Reverse&lt;(lance_index::scalar::inverted::builder::ScoredDoc, u32, u64, u32)&gt;&gt;&gt;::push (13 samples, 0.04%)</title><rect x="4.0140%" y="389" width="0.0423%" height="15" fill="rgb(217,0,24)" fg:x="1235" fg:w="13"/><text x="4.2640%" y="399.50"></text></g><g><title>&lt;alloc::vec::Vec&lt;(u32, u32)&gt; as alloc::vec::spec_extend::SpecExtend&lt;(u32, u32), core::iter::adapters::filter_map::FilterMap&lt;core::iter::adapters::enumerate::Enumerate&lt;core::slice::iter::Iter&lt;&lt;lance_index::scalar::inverted::wand::Wand&lt;_&gt;&gt;::maxscore_search::MaxScoreClause&gt;&gt;, &lt;lance_index::scalar::inverted::wand::Wand&lt;alloc::sync::Arc&lt;lance_index::scalar::inverted::scorer::MemBM25Scorer&gt;&gt;&gt;::maxscore_search::{closure#13}&gt;&gt;&gt;::spec_extend (7 samples, 0.02%)</title><rect x="4.0563%" y="389" width="0.0228%" height="15" fill="rgb(221,193,54)" fg:x="1248" fg:w="7"/><text x="4.3063%" y="399.50"></text></g><g><title>&lt;lance_index::scalar::inverted::wand::PostingIterator&gt;::block_idx_for_doc (20 samples, 0.07%)</title><rect x="4.0823%" y="389" width="0.0650%" height="15" fill="rgb(248,212,6)" fg:x="1256" fg:w="20"/><text x="4.3323%" y="399.50"></text></g><g><title>&lt;std::sync::once_lock::OnceLock&lt;alloc::boxed::Box&lt;[u32]&gt;&gt;&gt;::initialize::&lt;&lt;std::sync::once_lock::OnceLock&lt;alloc::boxed::Box&lt;[u32]&gt;&gt;&gt;::get_or_init&lt;&lt;lance_index::scalar::inverted::index::CompressedPostingList&gt;::block_first_docs::{closure#0}&gt;::{closure#0}, !&gt; (9 samples, 0.03%)</title><rect x="4.1180%" y="373" width="0.0293%" height="15" fill="rgb(208,68,35)" fg:x="1267" fg:w="9"/><text x="4.3680%" y="383.50"></text></g><g><title>&lt;std::sys::sync::once::futex::Once&gt;::call (9 samples, 0.03%)</title><rect x="4.1180%" y="357" width="0.0293%" height="15" fill="rgb(232,128,0)" fg:x="1267" fg:w="9"/><text x="4.3680%" y="367.50"></text></g><g><title>&lt;std::sync::once::Once&gt;::call_once_force::&lt;&lt;std::sync::once_lock::OnceLock&lt;alloc::boxed::Box&lt;[u32]&gt;&gt;&gt;::initialize&lt;&lt;std::sync::once_lock::OnceLock&lt;alloc::boxed::Box&lt;[u32]&gt;&gt;&gt;::get_or_init&lt;&lt;lance_index::scalar::inverted::index::CompressedPostingList&gt;::block_first_docs::{closure#0}&gt;::{closure#0}, !&gt;::{closure#0}&gt;::{closure#0} (9 samples, 0.03%)</title><rect x="4.1180%" y="341" width="0.0293%" height="15" fill="rgb(207,160,47)" fg:x="1267" fg:w="9"/><text x="4.3680%" y="351.50"></text></g><g><title>&lt;lance_index::scalar::inverted::wand::PostingIterator&gt;::block_max_score_up_to_with_stats::&lt;alloc::sync::Arc&lt;lance_index::scalar::inverted::scorer::MemBM25Scorer&gt;&gt; (34 samples, 0.11%)</title><rect x="4.1473%" y="389" width="0.1105%" height="15" fill="rgb(228,23,34)" fg:x="1276" fg:w="34"/><text x="4.3973%" y="399.50"></text></g><g><title>&lt;lance_index::scalar::inverted::impact::ImpactScoreCache&gt;::bounds::&lt;alloc::sync::Arc&lt;lance_index::scalar::inverted::scorer::MemBM25Scorer&gt;&gt; (21 samples, 0.07%)</title><rect x="4.1896%" y="373" width="0.0683%" height="15" fill="rgb(218,30,26)" fg:x="1289" fg:w="21"/><text x="4.4396%" y="383.50"></text></g><g><title>lance_bitpacking::bitpacker_internal::bitpacker8x::avx2::decompress_to::&lt;lance_bitpacking::bitpacker_internal::bitpacker8x::avx2::DeltaIntegrate&gt; (40 samples, 0.13%)</title><rect x="4.3066%" y="357" width="0.1300%" height="15" fill="rgb(220,122,19)" fg:x="1325" fg:w="40"/><text x="4.5566%" y="367.50"></text></g><g><title>lance_bitpacking::bitpacker_internal::bitpacker8x::avx2::decompress_to::&lt;lance_bitpacking::bitpacker_internal::bitpacker8x::avx2::Store&gt; (16 samples, 0.05%)</title><rect x="4.4366%" y="357" width="0.0520%" height="15" fill="rgb(250,228,42)" fg:x="1365" fg:w="16"/><text x="4.6866%" y="367.50"></text></g><g><title>lance_index::scalar::inverted::encoding::decompress_posting_block (70 samples, 0.23%)</title><rect x="4.2708%" y="373" width="0.2275%" height="15" fill="rgb(240,193,28)" fg:x="1314" fg:w="70"/><text x="4.5208%" y="383.50"></text></g><g><title>&lt;lance_index::scalar::inverted::wand::PostingIterator&gt;::ensure_compressed_block_ptr (84 samples, 0.27%)</title><rect x="4.2578%" y="389" width="0.2730%" height="15" fill="rgb(216,20,37)" fg:x="1310" fg:w="84"/><text x="4.5078%" y="399.50"></text></g><g><title>lance_index::scalar::inverted::encoding::decompress_posting_remainder (10 samples, 0.03%)</title><rect x="4.4983%" y="373" width="0.0325%" height="15" fill="rgb(206,188,39)" fg:x="1384" fg:w="10"/><text x="4.7483%" y="383.50"></text></g><g><title>&lt;lance_index::scalar::inverted::wand::PostingIterator&gt;::block_idx_for_doc (51 samples, 0.17%)</title><rect x="5.7237%" y="373" width="0.1658%" height="15" fill="rgb(217,207,13)" fg:x="1761" fg:w="51"/><text x="5.9737%" y="383.50"></text></g><g><title>lance_bitpacking::bitpacker_internal::bitpacker8x::avx2::decompress_to::&lt;lance_bitpacking::bitpacker_internal::bitpacker8x::avx2::DeltaIntegrate&gt; (51 samples, 0.17%)</title><rect x="6.0064%" y="341" width="0.1658%" height="15" fill="rgb(231,73,38)" fg:x="1848" fg:w="51"/><text x="6.2564%" y="351.50"></text></g><g><title>lance_bitpacking::bitpacker_internal::bitpacker8x::avx2::decompress_to::&lt;lance_bitpacking::bitpacker_internal::bitpacker8x::avx2::Store&gt; (11 samples, 0.04%)</title><rect x="6.1722%" y="341" width="0.0358%" height="15" fill="rgb(225,20,46)" fg:x="1899" fg:w="11"/><text x="6.4222%" y="351.50"></text></g><g><title>lance_index::scalar::inverted::encoding::decompress_posting_block (78 samples, 0.25%)</title><rect x="5.9674%" y="357" width="0.2535%" height="15" fill="rgb(210,31,41)" fg:x="1836" fg:w="78"/><text x="6.2174%" y="367.50"></text></g><g><title>lance_index::scalar::inverted::encoding::decode_varint_u32 (4 samples, 0.01%)</title><rect x="6.2080%" y="341" width="0.0130%" height="15" fill="rgb(221,200,47)" fg:x="1910" fg:w="4"/><text x="6.4580%" y="351.50"></text></g><g><title>&lt;lance_index::scalar::inverted::wand::PostingIterator&gt;::next (530 samples, 1.72%)</title><rect x="4.5308%" y="389" width="1.7226%" height="15" fill="rgb(226,26,5)" fg:x="1394" fg:w="530"/><text x="4.7808%" y="399.50"></text></g><g><title>&lt;lance_index::scalar::inverted::wand::PostingIterator&gt;::ensure_compressed_block_ptr (112 samples, 0.36%)</title><rect x="5.8894%" y="373" width="0.3640%" height="15" fill="rgb(249,33,26)" fg:x="1812" fg:w="112"/><text x="6.1394%" y="383.50"></text></g><g><title>lance_index::scalar::inverted::encoding::decompress_posting_remainder (10 samples, 0.03%)</title><rect x="6.2210%" y="357" width="0.0325%" height="15" fill="rgb(235,183,28)" fg:x="1914" fg:w="10"/><text x="6.4710%" y="367.50"></text></g><g><title>lance_index::scalar::inverted::encoding::decode_varint_u32 (4 samples, 0.01%)</title><rect x="6.2405%" y="341" width="0.0130%" height="15" fill="rgb(221,5,38)" fg:x="1920" fg:w="4"/><text x="6.4905%" y="351.50"></text></g><g><title>lance-cpu (1,928 samples, 6.27%)</title><rect x="0.0000%" y="517" width="6.2665%" height="15" fill="rgb(247,18,42)" fg:x="0" fg:w="1928"/><text x="0.2500%" y="527.50">lance-cpu</text></g><g><title>&lt;std::sys::thread::unix::Thread&gt;::new::thread_start (1,928 samples, 6.27%)</title><rect x="0.0000%" y="501" width="6.2665%" height="15" fill="rgb(241,131,45)" fg:x="0" fg:w="1928"/><text x="0.2500%" y="511.50">&lt;std::sy..</text></g><g><title>&lt;std::thread::lifecycle::spawn_unchecked&lt;&lt;tokio::runtime::blocking::pool::Spawner&gt;::spawn_thread::{closure#0}, ()&gt;::{closure#1} as core::ops::function::FnOnce&lt;()&gt;&gt;::call_once::{shim:vtable#0} (1,928 samples, 6.27%)</title><rect x="0.0000%" y="485" width="6.2665%" height="15" fill="rgb(249,31,29)" fg:x="0" fg:w="1928"/><text x="0.2500%" y="495.50">&lt;std::th..</text></g><g><title>std::sys::backtrace::__rust_begin_short_backtrace::&lt;&lt;tokio::runtime::blocking::pool::Spawner&gt;::spawn_thread::{closure#0}, ()&gt; (1,928 samples, 6.27%)</title><rect x="0.0000%" y="469" width="6.2665%" height="15" fill="rgb(225,111,53)" fg:x="0" fg:w="1928"/><text x="0.2500%" y="479.50">std::sys..</text></g><g><title>tokio::runtime::task::raw::poll::&lt;tokio::runtime::blocking::task::BlockingTask&lt;lance_core::utils::tokio::spawn_cpu&lt;lance_core::error::Error, &lt;lance_index::scalar::inverted::index::InvertedIndex&gt;::bm25_search::{closure#0}::{closure#0}::{closure#2}::{closure#0}::{closure#2}, alloc::vec::Vec&lt;(alloc::sync::Arc&lt;lance_index::scalar::inverted::index::InvertedPartition&gt;, lance_index::scalar::inverted::index::PartitionCandidates)&gt;&gt;::{closure#0}&gt;, tokio::runtime::blocking::schedule::BlockingSchedule&gt; (1,926 samples, 6.26%)</title><rect x="0.0065%" y="453" width="6.2600%" height="15" fill="rgb(238,160,17)" fg:x="2" fg:w="1926"/><text x="0.2565%" y="463.50">tokio::r..</text></g><g><title>&lt;lance_index::scalar::inverted::index::InvertedPartition&gt;::bm25_search (1,925 samples, 6.26%)</title><rect x="0.0098%" y="437" width="6.2567%" height="15" fill="rgb(214,148,48)" fg:x="3" fg:w="1925"/><text x="0.2598%" y="447.50">&lt;lance_i..</text></g><g><title>&lt;lance_index::scalar::inverted::wand::Wand&lt;alloc::sync::Arc&lt;lance_index::scalar::inverted::scorer::MemBM25Scorer&gt;&gt;&gt;::search (1,924 samples, 6.25%)</title><rect x="0.0130%" y="421" width="6.2535%" height="15" fill="rgb(232,36,49)" fg:x="4" fg:w="1924"/><text x="0.2630%" y="431.50">&lt;lance_i..</text></g><g><title>&lt;lance_index::scalar::inverted::wand::Wand&lt;alloc::sync::Arc&lt;lance_index::scalar::inverted::scorer::MemBM25Scorer&gt;&gt;&gt;::maxscore_search (1,924 samples, 6.25%)</title><rect x="0.0130%" y="405" width="6.2535%" height="15" fill="rgb(209,103,24)" fg:x="4" fg:w="1924"/><text x="0.2630%" y="415.50">&lt;lance_i..</text></g><g><title>&lt;tokio::runtime::scheduler::multi_thread::worker::Context&gt;::park_internal (5 samples, 0.02%)</title><rect x="6.3932%" y="421" width="0.0163%" height="15" fill="rgb(229,88,8)" fg:x="1967" fg:w="5"/><text x="6.6432%" y="431.50"></text></g><g><title>&lt;alloc::vec::Vec&lt;lance_table::format::index::IndexMetadata&gt; as core::clone::Clone&gt;::clone (5 samples, 0.02%)</title><rect x="6.4842%" y="133" width="0.0163%" height="15" fill="rgb(213,181,19)" fg:x="1995" fg:w="5"/><text x="6.7342%" y="143.50"></text></g><g><title>&lt;lance_table::format::index::IndexMetadata as core::clone::Clone&gt;::clone (5 samples, 0.02%)</title><rect x="6.4842%" y="117" width="0.0163%" height="15" fill="rgb(254,191,54)" fg:x="1995" fg:w="5"/><text x="6.7342%" y="127.50"></text></g><g><title>&lt;moka::future::base_cache::BaseCache&lt;lance_core::cache::backend::InternalCacheKey, lance_core::cache::moka::MokaCacheEntry&gt;&gt;::record_read_op::{closure#0} (75 samples, 0.24%)</title><rect x="6.5070%" y="85" width="0.2438%" height="15" fill="rgb(241,83,37)" fg:x="2002" fg:w="75"/><text x="6.7570%" y="95.50"></text></g><g><title>&lt;lance_core::cache::moka::MokaCacheBackend as lance_core::cache::backend::CacheBackend&gt;::get_or_insert::{closure#0} (78 samples, 0.25%)</title><rect x="6.5005%" y="133" width="0.2535%" height="15" fill="rgb(233,36,39)" fg:x="2000" fg:w="78"/><text x="6.7505%" y="143.50"></text></g><g><title>&lt;moka::future::cache::Cache&lt;lance_core::cache::backend::InternalCacheKey, lance_core::cache::moka::MokaCacheEntry&gt;&gt;::get_or_try_insert_with_hash_and_fun::&lt;&lt;lance_core::cache::moka::MokaCacheBackend as lance_core::cache::backend::CacheBackend&gt;::get_or_insert::{closure#0}::{closure#0}, lance_core::error::CloneableError&gt;::{closure#0} (78 samples, 0.25%)</title><rect x="6.5005%" y="117" width="0.2535%" height="15" fill="rgb(226,3,54)" fg:x="2000" fg:w="78"/><text x="6.7505%" y="127.50"></text></g><g><title>&lt;moka::future::base_cache::BaseCache&lt;lance_core::cache::backend::InternalCacheKey, lance_core::cache::moka::MokaCacheEntry&gt;&gt;::get_with_hash::&lt;lance_core::cache::backend::InternalCacheKey, for&lt;&apos;a&gt; fn(&amp;&apos;a lance_core::cache::moka::MokaCacheEntry) -&gt; bool&gt;::{closure#0} (77 samples, 0.25%)</title><rect x="6.5037%" y="101" width="0.2503%" height="15" fill="rgb(245,192,40)" fg:x="2001" fg:w="77"/><text x="6.7537%" y="111.50"></text></g><g><title>&lt;lance::dataset::Dataset as lance::index::DatasetIndexInternalExt&gt;::open_frag_reuse_index::{closure#0} (84 samples, 0.27%)</title><rect x="6.4842%" y="197" width="0.2730%" height="15" fill="rgb(238,167,29)" fg:x="1995" fg:w="84"/><text x="6.7342%" y="207.50"></text></g><g><title>&lt;lance::dataset::Dataset as lance::index::api::DatasetIndexExt&gt;::load_index_by_name::{closure#0} (84 samples, 0.27%)</title><rect x="6.4842%" y="181" width="0.2730%" height="15" fill="rgb(232,182,51)" fg:x="1995" fg:w="84"/><text x="6.7342%" y="191.50"></text></g><g><title>&lt;lance::dataset::Dataset as lance::index::api::DatasetIndexExt&gt;::load_indices_by_name::{closure#0} (84 samples, 0.27%)</title><rect x="6.4842%" y="165" width="0.2730%" height="15" fill="rgb(231,60,39)" fg:x="1995" fg:w="84"/><text x="6.7342%" y="175.50"></text></g><g><title>&lt;lance::dataset::Dataset as lance::index::api::DatasetIndexExt&gt;::load_indices::{closure#0} (84 samples, 0.27%)</title><rect x="6.4842%" y="149" width="0.2730%" height="15" fill="rgb(208,69,12)" fg:x="1995" fg:w="84"/><text x="6.7342%" y="159.50"></text></g><g><title>&lt;alloc::vec::Vec&lt;lance_table::format::index::IndexMetadata&gt; as core::clone::Clone&gt;::clone (6 samples, 0.02%)</title><rect x="6.7605%" y="165" width="0.0195%" height="15" fill="rgb(235,93,37)" fg:x="2080" fg:w="6"/><text x="7.0105%" y="175.50"></text></g><g><title>&lt;lance_table::format::index::IndexMetadata as core::clone::Clone&gt;::clone (6 samples, 0.02%)</title><rect x="6.7605%" y="149" width="0.0195%" height="15" fill="rgb(213,116,39)" fg:x="2080" fg:w="6"/><text x="7.0105%" y="159.50"></text></g><g><title>&lt;lance_core::cache::moka::MokaCacheBackend as lance_core::cache::backend::CacheBackend&gt;::get_or_insert::{closure#0} (69 samples, 0.22%)</title><rect x="6.7832%" y="165" width="0.2243%" height="15" fill="rgb(222,207,29)" fg:x="2087" fg:w="69"/><text x="7.0332%" y="175.50"></text></g><g><title>&lt;moka::future::cache::Cache&lt;lance_core::cache::backend::InternalCacheKey, lance_core::cache::moka::MokaCacheEntry&gt;&gt;::get_or_try_insert_with_hash_and_fun::&lt;&lt;lance_core::cache::moka::MokaCacheBackend as lance_core::cache::backend::CacheBackend&gt;::get_or_insert::{closure#0}::{closure#0}, lance_core::error::CloneableError&gt;::{closure#0} (69 samples, 0.22%)</title><rect x="6.7832%" y="149" width="0.2243%" height="15" fill="rgb(206,96,30)" fg:x="2087" fg:w="69"/><text x="7.0332%" y="159.50"></text></g><g><title>&lt;moka::future::base_cache::BaseCache&lt;lance_core::cache::backend::InternalCacheKey, lance_core::cache::moka::MokaCacheEntry&gt;&gt;::get_with_hash::&lt;lance_core::cache::backend::InternalCacheKey, for&lt;&apos;a&gt; fn(&amp;&apos;a lance_core::cache::moka::MokaCacheEntry) -&gt; bool&gt;::{closure#0} (69 samples, 0.22%)</title><rect x="6.7832%" y="133" width="0.2243%" height="15" fill="rgb(218,138,4)" fg:x="2087" fg:w="69"/><text x="7.0332%" y="143.50"></text></g><g><title>&lt;moka::future::base_cache::BaseCache&lt;lance_core::cache::backend::InternalCacheKey, lance_core::cache::moka::MokaCacheEntry&gt;&gt;::record_read_op::{closure#0} (69 samples, 0.22%)</title><rect x="6.7832%" y="117" width="0.2243%" height="15" fill="rgb(250,191,14)" fg:x="2087" fg:w="69"/><text x="7.0332%" y="127.50"></text></g><g><title>&lt;lance::dataset::Dataset as lance::index::api::DatasetIndexExt&gt;::load_index::{closure#0} (79 samples, 0.26%)</title><rect x="6.7572%" y="197" width="0.2568%" height="15" fill="rgb(239,60,40)" fg:x="2079" fg:w="79"/><text x="7.0072%" y="207.50"></text></g><g><title>&lt;lance::dataset::Dataset as lance::index::api::DatasetIndexExt&gt;::load_indices::{closure#0} (79 samples, 0.26%)</title><rect x="6.7572%" y="181" width="0.2568%" height="15" fill="rgb(206,27,48)" fg:x="2079" fg:w="79"/><text x="7.0072%" y="191.50"></text></g><g><title>&lt;lance_index::scalar::inverted::InvertedIndexPlugin as lance_index::scalar::registry::ScalarIndexPlugin&gt;::get_or_insert_in_cache::{closure#0} (67 samples, 0.22%)</title><rect x="7.0140%" y="197" width="0.2178%" height="15" fill="rgb(225,35,8)" fg:x="2158" fg:w="67"/><text x="7.2640%" y="207.50"></text></g><g><title>&lt;lance_index::scalar::bloomfilter::BloomFilterIndexPlugin as lance_index::scalar::registry::ScalarIndexPlugin&gt;::get_from_cache::{closure#0} (67 samples, 0.22%)</title><rect x="7.0140%" y="181" width="0.2178%" height="15" fill="rgb(250,213,24)" fg:x="2158" fg:w="67"/><text x="7.2640%" y="191.50"></text></g><g><title>&lt;lance_core::cache::LanceCache&gt;::get_unsized_with_key::&lt;lance_index::scalar::registry::ScalarIndexCacheKey&gt;::{closure#0} (67 samples, 0.22%)</title><rect x="7.0140%" y="165" width="0.2178%" height="15" fill="rgb(247,123,22)" fg:x="2158" fg:w="67"/><text x="7.2640%" y="175.50"></text></g><g><title>&lt;lance_core::cache::LanceCache&gt;::get_with_id::&lt;alloc::sync::Arc&lt;dyn lance_index_core::scalar::ScalarIndex&gt;&gt;::{closure#0} (67 samples, 0.22%)</title><rect x="7.0140%" y="149" width="0.2178%" height="15" fill="rgb(231,138,38)" fg:x="2158" fg:w="67"/><text x="7.2640%" y="159.50"></text></g><g><title>&lt;lance_core::cache::moka::MokaCacheBackend as lance_core::cache::backend::CacheBackend&gt;::get::{closure#0} (67 samples, 0.22%)</title><rect x="7.0140%" y="133" width="0.2178%" height="15" fill="rgb(231,145,46)" fg:x="2158" fg:w="67"/><text x="7.2640%" y="143.50"></text></g><g><title>&lt;moka::future::base_cache::BaseCache&lt;lance_core::cache::backend::InternalCacheKey, lance_core::cache::moka::MokaCacheEntry&gt;&gt;::get_with_hash::&lt;lance_core::cache::backend::InternalCacheKey, for&lt;&apos;a&gt; fn(&amp;&apos;a lance_core::cache::moka::MokaCacheEntry) -&gt; bool&gt;::{closure#0} (67 samples, 0.22%)</title><rect x="7.0140%" y="117" width="0.2178%" height="15" fill="rgb(251,118,11)" fg:x="2158" fg:w="67"/><text x="7.2640%" y="127.50"></text></g><g><title>&lt;moka::future::base_cache::BaseCache&lt;lance_core::cache::backend::InternalCacheKey, lance_core::cache::moka::MokaCacheEntry&gt;&gt;::record_read_op::{closure#0} (67 samples, 0.22%)</title><rect x="7.0140%" y="101" width="0.2178%" height="15" fill="rgb(217,147,25)" fg:x="2158" fg:w="67"/><text x="7.2640%" y="111.50"></text></g><g><title>lance::io::exec::fts::open_fts_segments::{closure#0} (234 samples, 0.76%)</title><rect x="6.4777%" y="261" width="0.7606%" height="15" fill="rgb(247,81,37)" fg:x="1993" fg:w="234"/><text x="6.7277%" y="271.50"></text></g><g><title>lance::io::exec::fts::open_fts_segment::{closure#0} (234 samples, 0.76%)</title><rect x="6.4777%" y="245" width="0.7606%" height="15" fill="rgb(209,12,38)" fg:x="1993" fg:w="234"/><text x="6.7277%" y="255.50"></text></g><g><title>&lt;lance::dataset::Dataset as lance::index::DatasetIndexInternalExt&gt;::open_scalar_index::{closure#0} (232 samples, 0.75%)</title><rect x="6.4842%" y="229" width="0.7541%" height="15" fill="rgb(227,1,9)" fg:x="1995" fg:w="232"/><text x="6.7342%" y="239.50"></text></g><g><title>&lt;lance::dataset::Dataset as lance::index::DatasetIndexInternalExt&gt;::open_scalar_index::{closure#0}::{closure#0} (232 samples, 0.75%)</title><rect x="6.4842%" y="213" width="0.7541%" height="15" fill="rgb(248,47,43)" fg:x="1995" fg:w="232"/><text x="6.7342%" y="223.50"></text></g><g><title>&lt;dashmap::DashMap&lt;alloc::string::String, alloc::sync::Arc&lt;dyn datafusion_catalog::table::TableProvider&gt;&gt;&gt;::hash_u64::&lt;&amp;str&gt; (23 samples, 0.07%)</title><rect x="8.4864%" y="229" width="0.0748%" height="15" fill="rgb(221,10,30)" fg:x="2611" fg:w="23"/><text x="8.7364%" y="239.50"></text></g><g><title>&lt;core::hash::sip::Hasher&lt;core::hash::sip::Sip13Rounds&gt; as core::hash::Hasher&gt;::write (22 samples, 0.07%)</title><rect x="8.4896%" y="213" width="0.0715%" height="15" fill="rgb(210,229,1)" fg:x="2612" fg:w="22"/><text x="8.7396%" y="223.50"></text></g><g><title>&lt;alloc::sync::Arc&lt;futures_util::stream::futures_unordered::task::Task&lt;futures_util::stream::futures_ordered::OrderWrapper&lt;&lt;lance_index::scalar::inverted::index::InvertedPartition&gt;::load_posting_lists::{closure#0}::{closure#0}::{closure#6}::{closure#0}&gt;&gt;&gt;&gt;::drop_slow (5 samples, 0.02%)</title><rect x="8.9479%" y="197" width="0.0163%" height="15" fill="rgb(222,148,37)" fg:x="2753" fg:w="5"/><text x="9.1979%" y="207.50"></text></g><g><title>&lt;futures_util::stream::futures_unordered::FuturesUnordered&lt;futures_util::stream::futures_ordered::OrderWrapper&lt;&lt;lance_index::scalar::inverted::index::InvertedPartition&gt;::load_posting_lists::{closure#0}::{closure#0}::{closure#6}::{closure#0}&gt;&gt;&gt;::release_task (5 samples, 0.02%)</title><rect x="8.9674%" y="197" width="0.0163%" height="15" fill="rgb(234,67,33)" fg:x="2759" fg:w="5"/><text x="9.2174%" y="207.50"></text></g><g><title>&lt;hashbrown::map::HashMap&lt;u32, (), std::hash::random::RandomState&gt;&gt;::insert (7 samples, 0.02%)</title><rect x="8.9869%" y="197" width="0.0228%" height="15" fill="rgb(247,98,35)" fg:x="2765" fg:w="7"/><text x="9.2369%" y="207.50"></text></g><g><title>&lt;arrow_array::record_batch::RecordBatch&gt;::column_by_name (60 samples, 0.20%)</title><rect x="9.7962%" y="181" width="0.1950%" height="15" fill="rgb(247,138,52)" fg:x="3014" fg:w="60"/><text x="10.0462%" y="191.50"></text></g><g><title>&lt;lance_core::cache::moka::MokaCacheBackend as lance_core::cache::backend::CacheBackend&gt;::get_or_insert (4 samples, 0.01%)</title><rect x="9.9912%" y="181" width="0.0130%" height="15" fill="rgb(213,79,30)" fg:x="3074" fg:w="4"/><text x="10.2412%" y="191.50"></text></g><g><title>&lt;alloc::sync::Arc&lt;lance_core::cache::backend::InternalCacheKey&gt;&gt;::drop_slow (22 samples, 0.07%)</title><rect x="10.5795%" y="149" width="0.0715%" height="15" fill="rgb(246,177,23)" fg:x="3255" fg:w="22"/><text x="10.8295%" y="159.50"></text></g><g><title>&lt;moka::common::concurrent::deques::Deques&lt;lance_core::cache::backend::InternalCacheKey&gt;&gt;::move_to_back_ao::&lt;lance_core::cache::moka::MokaCacheEntry&gt; (22 samples, 0.07%)</title><rect x="81.3761%" y="37" width="0.0715%" height="15" fill="rgb(230,62,27)" fg:x="25037" fg:w="22"/><text x="81.6261%" y="47.50"></text></g><g><title>&lt;moka::future::housekeeper::Housekeeper&gt;::do_run_pending_tasks::&lt;lance_core::cache::backend::InternalCacheKey, lance_core::cache::moka::MokaCacheEntry, std::hash::random::RandomState&gt;::{closure#0}::{closure#0} (85 samples, 0.28%)</title><rect x="81.1746%" y="69" width="0.2763%" height="15" fill="rgb(216,154,8)" fg:x="24975" fg:w="85"/><text x="81.4246%" y="79.50"></text></g><g><title>&lt;moka::future::base_cache::Inner&lt;lance_core::cache::backend::InternalCacheKey, lance_core::cache::moka::MokaCacheEntry, std::hash::random::RandomState&gt;&gt;::do_run_pending_tasks::{closure#0} (85 samples, 0.28%)</title><rect x="81.1746%" y="53" width="0.2763%" height="15" fill="rgb(244,35,45)" fg:x="24975" fg:w="85"/><text x="81.4246%" y="63.50"></text></g><g><title>&lt;moka::future::base_cache::BaseCache&lt;lance_core::cache::backend::InternalCacheKey, lance_core::cache::moka::MokaCacheEntry&gt;&gt;::record_read_op::{closure#0} (21,712 samples, 70.57%)</title><rect x="10.8850%" y="133" width="70.5691%" height="15" fill="rgb(251,115,12)" fg:x="3349" fg:w="21712"/><text x="11.1350%" y="143.50">&lt;moka::future::base_cache::BaseCache&lt;lance_core::cache::backend::InternalCacheKey, lance_core::cache::moka::MokaCache..</text></g><g><title>&lt;moka::future::housekeeper::Housekeeper&gt;::try_run_pending_tasks::&lt;lance_core::cache::backend::InternalCacheKey, lance_core::cache::moka::MokaCacheEntry, std::hash::random::RandomState&gt;::{closure#0} (90 samples, 0.29%)</title><rect x="81.1616%" y="117" width="0.2925%" height="15" fill="rgb(240,54,50)" fg:x="24971" fg:w="90"/><text x="81.4116%" y="127.50"></text></g><g><title>&lt;moka::future::housekeeper::Housekeeper&gt;::do_run_pending_tasks::&lt;lance_core::cache::backend::InternalCacheKey, lance_core::cache::moka::MokaCacheEntry, std::hash::random::RandomState&gt;::{closure#0} (87 samples, 0.28%)</title><rect x="81.1714%" y="101" width="0.2828%" height="15" fill="rgb(233,84,52)" fg:x="24974" fg:w="87"/><text x="81.4214%" y="111.50"></text></g><g><title>&lt;futures_util::future::future::shared::Shared&lt;core::pin::Pin&lt;alloc::boxed::Box&lt;dyn core::future::future::Future&lt;Output = bool&gt; + core::marker::Send&gt;&gt;&gt; as core::future::future::Future&gt;::poll (86 samples, 0.28%)</title><rect x="81.1746%" y="85" width="0.2795%" height="15" fill="rgb(207,117,47)" fg:x="24975" fg:w="86"/><text x="81.4246%" y="95.50"></text></g><g><title>&lt;moka::future::cache::Cache&lt;lance_core::cache::backend::InternalCacheKey, lance_core::cache::moka::MokaCacheEntry&gt;&gt;::get_or_try_insert_with_hash_and_fun::&lt;&lt;lance_core::cache::moka::MokaCacheBackend as lance_core::cache::backend::CacheBackend&gt;::get_or_insert::{closure#0}::{closure#0}, lance_core::error::CloneableError&gt;::{closure#0} (21,941 samples, 71.31%)</title><rect x="10.1895%" y="165" width="71.3134%" height="15" fill="rgb(249,43,39)" fg:x="3135" fg:w="21941"/><text x="10.4395%" y="175.50">&lt;moka::future::cache::Cache&lt;lance_core::cache::backend::InternalCacheKey, lance_core::cache::moka::MokaCacheEntry&gt;&gt;::g..</text></g><g><title>&lt;moka::future::base_cache::BaseCache&lt;lance_core::cache::backend::InternalCacheKey, lance_core::cache::moka::MokaCacheEntry&gt;&gt;::get_with_hash::&lt;lance_core::cache::backend::InternalCacheKey, for&lt;&apos;a&gt; fn(&amp;&apos;a lance_core::cache::moka::MokaCacheEntry) -&gt; bool&gt;::{closure#0} (21,799 samples, 70.85%)</title><rect x="10.6510%" y="149" width="70.8519%" height="15" fill="rgb(209,38,44)" fg:x="3277" fg:w="21799"/><text x="10.9010%" y="159.50">&lt;moka::future::base_cache::BaseCache&lt;lance_core::cache::backend::InternalCacheKey, lance_core::cache::moka::MokaCacheE..</text></g><g><title>crossbeam_epoch::default::with_handle::&lt;crossbeam_epoch::default::pin::{closure#0}, crossbeam_epoch::guard::Guard&gt; (12 samples, 0.04%)</title><rect x="81.4639%" y="133" width="0.0390%" height="15" fill="rgb(236,212,23)" fg:x="25064" fg:w="12"/><text x="81.7139%" y="143.50"></text></g><g><title>&lt;std::hash::random::RandomState as core::hash::BuildHasher&gt;::hash_one::&lt;&amp;lance_core::cache::backend::InternalCacheKey&gt; (24 samples, 0.08%)</title><rect x="81.5029%" y="165" width="0.0780%" height="15" fill="rgb(242,79,21)" fg:x="25076" fg:w="24"/><text x="81.7529%" y="175.50"></text></g><g><title>&lt;core::hash::sip::Hasher&lt;core::hash::sip::Sip13Rounds&gt; as core::hash::Hasher&gt;::write (21 samples, 0.07%)</title><rect x="81.5127%" y="149" width="0.0683%" height="15" fill="rgb(211,96,35)" fg:x="25079" fg:w="21"/><text x="81.7627%" y="159.50"></text></g><g><title>&lt;lance_core::cache::moka::MokaCacheBackend as lance_core::cache::backend::CacheBackend&gt;::get_or_insert::{closure#0} (22,030 samples, 71.60%)</title><rect x="10.0042%" y="181" width="71.6027%" height="15" fill="rgb(253,215,40)" fg:x="3078" fg:w="22030"/><text x="10.2542%" y="191.50">&lt;lance_core::cache::moka::MokaCacheBackend as lance_core::cache::backend::CacheBackend&gt;::get_or_insert::{closure#0}</text></g><g><title>core::ptr::drop_glue::&lt;&lt;lance_core::cache::moka::MokaCacheBackend as lance_core::cache::backend::CacheBackend&gt;::get_or_insert::{closure#0}::{closure#0}&gt; (8 samples, 0.03%)</title><rect x="81.5809%" y="165" width="0.0260%" height="15" fill="rgb(211,81,21)" fg:x="25100" fg:w="8"/><text x="81.8309%" y="175.50"></text></g><g><title>&lt;alloc::string::String as core::fmt::Write&gt;::write_str.4462 (12 samples, 0.04%)</title><rect x="81.6557%" y="133" width="0.0390%" height="15" fill="rgb(208,190,38)" fg:x="25123" fg:w="12"/><text x="81.9057%" y="143.50"></text></g><g><title>&lt;alloc::raw_vec::RawVecInner&lt;_&gt;&gt;::reserve::do_reserve_and_handle::&lt;alloc::alloc::Global&gt; (8 samples, 0.03%)</title><rect x="81.6687%" y="117" width="0.0260%" height="15" fill="rgb(235,213,38)" fg:x="25127" fg:w="8"/><text x="81.9187%" y="127.50"></text></g><g><title>&lt;alloc::raw_vec::RawVecInner&gt;::finish_grow (7 samples, 0.02%)</title><rect x="81.6719%" y="101" width="0.0228%" height="15" fill="rgb(237,122,38)" fg:x="25128" fg:w="7"/><text x="81.9219%" y="111.50"></text></g><g><title>&lt;lance_index::scalar::inverted::index::ImpactAwareCacheKey&lt;lance_index::scalar::inverted::index::PostingListGroupKey&gt; as lance_core::cache::CacheKey&gt;::key (37 samples, 0.12%)</title><rect x="81.6069%" y="181" width="0.1203%" height="15" fill="rgb(244,218,35)" fg:x="25108" fg:w="37"/><text x="81.8569%" y="191.50"></text></g><g><title>alloc::fmt::format::format_inner (36 samples, 0.12%)</title><rect x="81.6102%" y="165" width="0.1170%" height="15" fill="rgb(240,68,47)" fg:x="25109" fg:w="36"/><text x="81.8602%" y="175.50"></text></g><g><title>core::fmt::write (27 samples, 0.09%)</title><rect x="81.6394%" y="149" width="0.0878%" height="15" fill="rgb(210,16,53)" fg:x="25118" fg:w="27"/><text x="81.8894%" y="159.50"></text></g><g><title>&lt;u32 as core::fmt::Display&gt;::fmt (9 samples, 0.03%)</title><rect x="81.6979%" y="133" width="0.0293%" height="15" fill="rgb(235,124,12)" fg:x="25136" fg:w="9"/><text x="81.9479%" y="143.50"></text></g><g><title>&lt;alloc::sync::Arc&lt;dyn object_store::ObjectStore&gt;&gt;::drop_slow (30 samples, 0.10%)</title><rect x="82.2505%" y="165" width="0.0975%" height="15" fill="rgb(224,169,11)" fg:x="25306" fg:w="30"/><text x="82.5005%" y="175.50"></text></g><g><title>core::ptr::drop_glue::&lt;arrow_array::array::byte_array::GenericByteArray&lt;arrow_array::types::GenericBinaryType&lt;i32&gt;&gt;&gt; (22 samples, 0.07%)</title><rect x="82.2765%" y="149" width="0.0715%" height="15" fill="rgb(250,166,2)" fg:x="25314" fg:w="22"/><text x="82.5265%" y="159.50"></text></g><g><title>&lt;arrow_array::array::byte_array::GenericByteArray&lt;arrow_array::types::GenericBinaryType&lt;i64&gt;&gt; as arrow_array::array::Array&gt;::slice (152 samples, 0.49%)</title><rect x="82.3480%" y="165" width="0.4940%" height="15" fill="rgb(242,216,29)" fg:x="25336" fg:w="152"/><text x="82.5980%" y="175.50"></text></g><g><title>&lt;arrow_buffer::buffer::scalar::ScalarBuffer&lt;f64&gt;&gt;::new (10 samples, 0.03%)</title><rect x="82.8095%" y="149" width="0.0325%" height="15" fill="rgb(230,116,27)" fg:x="25478" fg:w="10"/><text x="83.0595%" y="159.50"></text></g><g><title>&lt;arrow_array::array::list_array::GenericListArray&lt;i32&gt;&gt;::value (36 samples, 0.12%)</title><rect x="82.8550%" y="165" width="0.1170%" height="15" fill="rgb(228,99,48)" fg:x="25492" fg:w="36"/><text x="83.1050%" y="175.50"></text></g><g><title>&lt;arrow_array::record_batch::RecordBatch&gt;::column_by_name (17 samples, 0.06%)</title><rect x="82.9720%" y="165" width="0.0553%" height="15" fill="rgb(253,11,6)" fg:x="25528" fg:w="17"/><text x="83.2220%" y="175.50"></text></g><g><title>&lt;lance_index::scalar::inverted::impact::ImpactSkipData as core::clone::Clone&gt;::clone (84 samples, 0.27%)</title><rect x="83.0273%" y="165" width="0.2730%" height="15" fill="rgb(247,143,39)" fg:x="25545" fg:w="84"/><text x="83.2773%" y="175.50"></text></g><g><title>&lt;lance_index::scalar::inverted::index::CompressedPostingList&gt;::new (4 samples, 0.01%)</title><rect x="83.3003%" y="165" width="0.0130%" height="15" fill="rgb(236,97,10)" fg:x="25629" fg:w="4"/><text x="83.5503%" y="175.50"></text></g><g><title>&lt;lance_index::scalar::inverted::index::CompressedPostingList&gt;::with_packed_first_docs (6 samples, 0.02%)</title><rect x="83.3133%" y="165" width="0.0195%" height="15" fill="rgb(233,208,19)" fg:x="25633" fg:w="6"/><text x="83.5633%" y="175.50"></text></g><g><title>&lt;lance_index::scalar::inverted::index::PostingListGroup&gt;::posting_list (500 samples, 1.63%)</title><rect x="81.7304%" y="181" width="1.6251%" height="15" fill="rgb(216,164,2)" fg:x="25146" fg:w="500"/><text x="81.9804%" y="191.50"></text></g><g><title>&lt;std::sync::once_lock::OnceLock&lt;alloc::boxed::Box&lt;lance_index::scalar::inverted::impact::ImpactSkipData&gt;&gt;&gt;::initialize::&lt;&lt;std::sync::once_lock::OnceLock&lt;alloc::boxed::Box&lt;lance_index::scalar::inverted::impact::ImpactSkipData&gt;&gt;&gt;::get_or_init&lt;&lt;lance_index::scalar::inverted::index::PostingListGroup&gt;::posting_list::{closure#8}&gt;::{closure#0}, !&gt; (7 samples, 0.02%)</title><rect x="83.3328%" y="165" width="0.0228%" height="15" fill="rgb(220,129,5)" fg:x="25639" fg:w="7"/><text x="83.5828%" y="175.50"></text></g><g><title>&lt;std::sys::sync::once::futex::Once&gt;::call (7 samples, 0.02%)</title><rect x="83.3328%" y="149" width="0.0228%" height="15" fill="rgb(242,17,10)" fg:x="25639" fg:w="7"/><text x="83.5828%" y="159.50"></text></g><g><title>&lt;std::sync::once::Once&gt;::call_once_force::&lt;&lt;std::sync::once_lock::OnceLock&lt;alloc::boxed::Box&lt;lance_index::scalar::inverted::impact::ImpactSkipData&gt;&gt;&gt;::initialize&lt;&lt;std::sync::once_lock::OnceLock&lt;alloc::boxed::Box&lt;lance_index::scalar::inverted::impact::ImpactSkipData&gt;&gt;&gt;::get_or_init&lt;&lt;lance_index::scalar::inverted::index::PostingListGroup&gt;::posting_list::{closure#8}&gt;::{closure#0}, !&gt;::{closure#0}&gt;::{closure#0} (6 samples, 0.02%)</title><rect x="83.3360%" y="133" width="0.0195%" height="15" fill="rgb(242,107,0)" fg:x="25640" fg:w="6"/><text x="83.5860%" y="143.50"></text></g><g><title>&lt;lance_index::scalar::inverted::impact::ImpactSkipData&gt;::new (6 samples, 0.02%)</title><rect x="83.3360%" y="117" width="0.0195%" height="15" fill="rgb(251,28,31)" fg:x="25640" fg:w="6"/><text x="83.5860%" y="127.50"></text></g><g><title>&lt;lance_index::scalar::inverted::index::PostingListReader&gt;::posting_metadata_for_token::{closure#0} (7 samples, 0.02%)</title><rect x="83.3555%" y="181" width="0.0228%" height="15" fill="rgb(233,223,10)" fg:x="25646" fg:w="7"/><text x="83.6055%" y="191.50"></text></g><g><title>&lt;lance_index::scalar::lance_format::CurrentIndexReader as lance_index_core::scalar::IndexReader&gt;::num_rows (15 samples, 0.05%)</title><rect x="83.3783%" y="181" width="0.0488%" height="15" fill="rgb(215,21,27)" fg:x="25653" fg:w="15"/><text x="83.6283%" y="191.50"></text></g><g><title>&lt;lance_index::scalar::inverted::index::PostingListReader&gt;::posting_list::{closure#0}::{closure#0} (22,920 samples, 74.50%)</title><rect x="9.0097%" y="197" width="74.4954%" height="15" fill="rgb(232,23,21)" fg:x="2772" fg:w="22920"/><text x="9.2597%" y="207.50">&lt;lance_index::scalar::inverted::index::PostingListReader&gt;::posting_list::{closure#0}::{closure#0}</text></g><g><title>lance_core::cache::build_key (24 samples, 0.08%)</title><rect x="83.4270%" y="181" width="0.0780%" height="15" fill="rgb(244,5,23)" fg:x="25668" fg:w="24"/><text x="83.6770%" y="191.50"></text></g><g><title>&lt;fst::raw::node::Node&gt;::find_input.21034 (13 samples, 0.04%)</title><rect x="83.6383%" y="181" width="0.0423%" height="15" fill="rgb(226,81,46)" fg:x="25733" fg:w="13"/><text x="83.8883%" y="191.50"></text></g><g><title>&lt;lance_index::scalar::inverted::index::TokenSet&gt;::get (291 samples, 0.95%)</title><rect x="83.5051%" y="197" width="0.9458%" height="15" fill="rgb(247,70,30)" fg:x="25692" fg:w="291"/><text x="83.7551%" y="207.50"></text></g><g><title>&lt;fst::raw::node::Node&gt;::new (237 samples, 0.77%)</title><rect x="83.6806%" y="181" width="0.7703%" height="15" fill="rgb(212,68,19)" fg:x="25746" fg:w="237"/><text x="83.9306%" y="191.50"></text></g><g><title>&lt;lance_index::scalar::inverted::scorer::MemBM25Scorer as lance_index::scalar::inverted::scorer::Scorer&gt;::query_weight (9 samples, 0.03%)</title><rect x="84.4509%" y="197" width="0.0293%" height="15" fill="rgb(240,187,13)" fg:x="25983" fg:w="9"/><text x="84.7009%" y="207.50"></text></g><g><title>&lt;std::hash::random::RandomState as core::hash::BuildHasher&gt;::hash_one::&lt;&amp;str&gt; (5 samples, 0.02%)</title><rect x="84.4639%" y="181" width="0.0163%" height="15" fill="rgb(223,113,26)" fg:x="25987" fg:w="5"/><text x="84.7139%" y="191.50"></text></g><g><title>lance_bitpacking::bitpacker_internal::bitpacker8x::avx2::decompress_to::&lt;lance_bitpacking::bitpacker_internal::bitpacker8x::avx2::DeltaIntegrate&gt; (63 samples, 0.20%)</title><rect x="85.1822%" y="149" width="0.2048%" height="15" fill="rgb(206,192,2)" fg:x="26208" fg:w="63"/><text x="85.4322%" y="159.50"></text></g><g><title>lance_bitpacking::bitpacker_internal::bitpacker8x::avx2::decompress_to::&lt;lance_bitpacking::bitpacker_internal::bitpacker8x::avx2::Store&gt; (11 samples, 0.04%)</title><rect x="85.3869%" y="149" width="0.0358%" height="15" fill="rgb(241,108,4)" fg:x="26271" fg:w="11"/><text x="85.6369%" y="159.50"></text></g><g><title>&lt;lance_index::scalar::inverted::wand::PostingIterator&gt;::with_query_weight (294 samples, 0.96%)</title><rect x="84.4801%" y="197" width="0.9556%" height="15" fill="rgb(247,173,49)" fg:x="25992" fg:w="294"/><text x="84.7301%" y="207.50"></text></g><g><title>&lt;lance_index::scalar::inverted::wand::PostingIterator&gt;::ensure_compressed_block_ptr (262 samples, 0.85%)</title><rect x="84.5841%" y="181" width="0.8516%" height="15" fill="rgb(224,114,35)" fg:x="26024" fg:w="262"/><text x="84.8341%" y="191.50"></text></g><g><title>lance_index::scalar::inverted::encoding::decompress_posting_block (241 samples, 0.78%)</title><rect x="84.6524%" y="165" width="0.7833%" height="15" fill="rgb(245,159,27)" fg:x="26045" fg:w="241"/><text x="84.9024%" y="175.50"></text></g><g><title>lance_index::scalar::inverted::encoding::decode_varint_u32 (4 samples, 0.01%)</title><rect x="85.4227%" y="149" width="0.0130%" height="15" fill="rgb(245,172,44)" fg:x="26282" fg:w="4"/><text x="85.6727%" y="159.50"></text></g><g><title>&lt;lance_io::object_store::ObjectStore&gt;::io_parallelism (15 samples, 0.05%)</title><rect x="85.4454%" y="197" width="0.0488%" height="15" fill="rgb(236,23,11)" fg:x="26289" fg:w="15"/><text x="85.6954%" y="207.50"></text></g><g><title>std::env::_var (15 samples, 0.05%)</title><rect x="85.4454%" y="181" width="0.0488%" height="15" fill="rgb(205,117,38)" fg:x="26289" fg:w="15"/><text x="85.6954%" y="191.50"></text></g><g><title>std::sys::env::unix::getenv::{closure#0} (15 samples, 0.05%)</title><rect x="85.4454%" y="165" width="0.0488%" height="15" fill="rgb(237,72,25)" fg:x="26289" fg:w="15"/><text x="85.6954%" y="175.50"></text></g><g><title>&lt;lance_index::scalar::inverted::index::InvertedPartition&gt;::load_posting_lists::{closure#0}::{closure#0} (23,650 samples, 76.87%)</title><rect x="8.6489%" y="213" width="76.8681%" height="15" fill="rgb(244,70,9)" fg:x="2661" fg:w="23650"/><text x="8.8989%" y="223.50">&lt;lance_index::scalar::inverted::index::InvertedPartition&gt;::load_posting_lists::{closure#0}::{closure#0}</text></g><g><title>core::ptr::drop_glue::&lt;futures_util::stream::try_stream::try_collect::TryCollect&lt;futures_util::stream::stream::buffered::Buffered&lt;futures_util::stream::stream::map::Map&lt;futures_util::stream::iter::Iter&lt;alloc::vec::into_iter::IntoIter&lt;(u32, alloc::string::String, u32)&gt;&gt;, &lt;lance_index::scalar::inverted::index::InvertedPartition&gt;::load_posting_lists::{closure#0}::{closure#0}::{closure#6}&gt;&gt;, alloc::vec::Vec&lt;(u32, alloc::string::String, u32, lance_index::scalar::inverted::index::PostingList)&gt;&gt;&gt; (4 samples, 0.01%)</title><rect x="85.5039%" y="197" width="0.0130%" height="15" fill="rgb(217,125,39)" fg:x="26307" fg:w="4"/><text x="85.7539%" y="207.50"></text></g><g><title>&lt;alloc::sync::Arc&lt;futures_util::stream::futures_unordered::ready_to_run_queue::ReadyToRunQueue&lt;futures_util::stream::futures_ordered::OrderWrapper&lt;&lt;lance_index::scalar::inverted::index::InvertedPartition&gt;::load_posting_lists::{closure#0}::{closure#0}::{closure#6}::{closure#0}&gt;&gt;&gt;&gt;::drop_slow (4 samples, 0.01%)</title><rect x="85.5039%" y="181" width="0.0130%" height="15" fill="rgb(235,36,10)" fg:x="26307" fg:w="4"/><text x="85.7539%" y="191.50"></text></g><g><title>&lt;lance_index::scalar::inverted::lazy_docset::LazyDocSet&gt;::ensure_num_tokens_loaded::{closure#0} (13 samples, 0.04%)</title><rect x="85.5169%" y="213" width="0.0423%" height="15" fill="rgb(251,123,47)" fg:x="26311" fg:w="13"/><text x="85.7669%" y="223.50"></text></g><g><title>&lt;futures_util::stream::try_stream::try_next::TryNext&lt;futures_util::stream::try_stream::try_flatten::TryFlatten&lt;futures_util::stream::try_stream::MapOk&lt;futures_util::stream::stream::buffer_unordered::BufferUnordered&lt;futures_util::stream::iter::Iter&lt;alloc::vec::into_iter::IntoIter&lt;&lt;lance_index::scalar::inverted::index::InvertedIndex&gt;::bm25_search::{closure#0}::{closure#0}::{closure#2}::{closure#0}&gt;&gt;&gt;, &lt;lance_index::scalar::inverted::index::InvertedIndex&gt;::bm25_search::{closure#0}::{closure#0}::{closure#3}&gt;&gt;&gt; as core::future::future::Future&gt;::poll (23,697 samples, 77.02%)</title><rect x="8.5611%" y="229" width="77.0208%" height="15" fill="rgb(221,13,13)" fg:x="2634" fg:w="23697"/><text x="8.8111%" y="239.50">&lt;futures_util::stream::try_stream::try_next::TryNext&lt;futures_util::stream::try_stream::try_flatten::TryFlatten&lt;futures_util::str..</text></g><g><title>&lt;tokio::runtime::blocking::pool::Spawner&gt;::spawn_task (7 samples, 0.02%)</title><rect x="85.5592%" y="213" width="0.0228%" height="15" fill="rgb(238,131,9)" fg:x="26324" fg:w="7"/><text x="85.8092%" y="223.50"></text></g><g><title>&lt;lance_index::scalar::inverted::index::InvertedIndex&gt;::bm25_search::{closure#0}::{closure#0}::push_scored_candidate (42 samples, 0.14%)</title><rect x="85.5852%" y="229" width="0.1365%" height="15" fill="rgb(211,50,8)" fg:x="26332" fg:w="42"/><text x="85.8352%" y="239.50"></text></g><g><title>&lt;moka::future::base_cache::BaseCache&lt;lance_core::cache::backend::InternalCacheKey, lance_core::cache::moka::MokaCacheEntry&gt;&gt;::record_read_op::{closure#0} (4,192 samples, 13.62%)</title><rect x="85.9947%" y="165" width="13.6250%" height="15" fill="rgb(245,182,24)" fg:x="26458" fg:w="4192"/><text x="86.2447%" y="175.50">&lt;moka::future::base_c..</text></g><g><title>&lt;moka::future::housekeeper::Housekeeper&gt;::try_run_pending_tasks::&lt;lance_core::cache::backend::InternalCacheKey, lance_core::cache::moka::MokaCacheEntry, std::hash::random::RandomState&gt;::{closure#0} (17 samples, 0.06%)</title><rect x="99.5645%" y="149" width="0.0553%" height="15" fill="rgb(242,14,37)" fg:x="30633" fg:w="17"/><text x="99.8145%" y="159.50"></text></g><g><title>&lt;moka::future::housekeeper::Housekeeper&gt;::do_run_pending_tasks::&lt;lance_core::cache::backend::InternalCacheKey, lance_core::cache::moka::MokaCacheEntry, std::hash::random::RandomState&gt;::{closure#0} (17 samples, 0.06%)</title><rect x="99.5645%" y="133" width="0.0553%" height="15" fill="rgb(246,228,12)" fg:x="30633" fg:w="17"/><text x="99.8145%" y="143.50"></text></g><g><title>&lt;futures_util::future::future::shared::Shared&lt;core::pin::Pin&lt;alloc::boxed::Box&lt;dyn core::future::future::Future&lt;Output = bool&gt; + core::marker::Send&gt;&gt;&gt; as core::future::future::Future&gt;::poll (17 samples, 0.06%)</title><rect x="99.5645%" y="117" width="0.0553%" height="15" fill="rgb(213,55,15)" fg:x="30633" fg:w="17"/><text x="99.8145%" y="127.50"></text></g><g><title>&lt;moka::future::housekeeper::Housekeeper&gt;::do_run_pending_tasks::&lt;lance_core::cache::backend::InternalCacheKey, lance_core::cache::moka::MokaCacheEntry, std::hash::random::RandomState&gt;::{closure#0}::{closure#0} (17 samples, 0.06%)</title><rect x="99.5645%" y="101" width="0.0553%" height="15" fill="rgb(209,9,3)" fg:x="30633" fg:w="17"/><text x="99.8145%" y="111.50"></text></g><g><title>&lt;moka::future::base_cache::Inner&lt;lance_core::cache::backend::InternalCacheKey, lance_core::cache::moka::MokaCacheEntry, std::hash::random::RandomState&gt;&gt;::do_run_pending_tasks::{closure#0} (17 samples, 0.06%)</title><rect x="99.5645%" y="85" width="0.0553%" height="15" fill="rgb(230,59,30)" fg:x="30633" fg:w="17"/><text x="99.8145%" y="95.50"></text></g><g><title>&lt;moka::common::concurrent::deques::Deques&lt;lance_core::cache::backend::InternalCacheKey&gt;&gt;::move_to_back_ao::&lt;lance_core::cache::moka::MokaCacheEntry&gt; (4 samples, 0.01%)</title><rect x="99.6067%" y="69" width="0.0130%" height="15" fill="rgb(209,121,21)" fg:x="30646" fg:w="4"/><text x="99.8567%" y="79.50"></text></g><g><title>&lt;moka::future::cache::Cache&lt;lance_core::cache::backend::InternalCacheKey, lance_core::cache::moka::MokaCacheEntry&gt;&gt;::get_or_try_insert_with_hash_and_fun::&lt;&lt;lance_core::cache::moka::MokaCacheBackend as lance_core::cache::backend::CacheBackend&gt;::get_or_insert::{closure#0}::{closure#0}, lance_core::error::CloneableError&gt;::{closure#0} (4,238 samples, 13.77%)</title><rect x="85.8615%" y="197" width="13.7745%" height="15" fill="rgb(220,109,13)" fg:x="26417" fg:w="4238"/><text x="86.1115%" y="207.50">&lt;moka::future::cache:..</text></g><g><title>&lt;moka::future::base_cache::BaseCache&lt;lance_core::cache::backend::InternalCacheKey, lance_core::cache::moka::MokaCacheEntry&gt;&gt;::get_with_hash::&lt;lance_core::cache::backend::InternalCacheKey, for&lt;&apos;a&gt; fn(&amp;&apos;a lance_core::cache::moka::MokaCacheEntry) -&gt; bool&gt;::{closure#0} (4,213 samples, 13.69%)</title><rect x="85.9427%" y="181" width="13.6932%" height="15" fill="rgb(232,18,1)" fg:x="26442" fg:w="4213"/><text x="86.1927%" y="191.50">&lt;moka::future::base_c..</text></g><g><title>crossbeam_epoch::default::with_handle::&lt;crossbeam_epoch::default::pin::{closure#0}, crossbeam_epoch::guard::Guard&gt; (4 samples, 0.01%)</title><rect x="99.6230%" y="165" width="0.0130%" height="15" fill="rgb(215,41,42)" fg:x="30651" fg:w="4"/><text x="99.8730%" y="175.50"></text></g><g><title>&lt;std::hash::random::RandomState as core::hash::BuildHasher&gt;::hash_one::&lt;&amp;lance_core::cache::backend::InternalCacheKey&gt; (10 samples, 0.03%)</title><rect x="99.6360%" y="197" width="0.0325%" height="15" fill="rgb(224,123,36)" fg:x="30655" fg:w="10"/><text x="99.8860%" y="207.50"></text></g><g><title>&lt;core::hash::sip::Hasher&lt;core::hash::sip::Sip13Rounds&gt; as core::hash::Hasher&gt;::write (9 samples, 0.03%)</title><rect x="99.6392%" y="181" width="0.0293%" height="15" fill="rgb(240,125,3)" fg:x="30656" fg:w="9"/><text x="99.8892%" y="191.50"></text></g><g><title>&lt;lance_core::cache::moka::MokaCacheBackend as lance_core::cache::backend::CacheBackend&gt;::get_or_insert::{closure#0} (4,262 samples, 13.85%)</title><rect x="85.8322%" y="213" width="13.8525%" height="15" fill="rgb(205,98,50)" fg:x="26408" fg:w="4262"/><text x="86.0822%" y="223.50">&lt;lance_core::cache::m..</text></g><g><title>core::ptr::drop_glue::&lt;&lt;lance_core::cache::moka::MokaCacheBackend as lance_core::cache::backend::CacheBackend&gt;::get_or_insert::{closure#0}::{closure#0}&gt; (5 samples, 0.02%)</title><rect x="99.6685%" y="197" width="0.0163%" height="15" fill="rgb(205,185,37)" fg:x="30665" fg:w="5"/><text x="99.9185%" y="207.50"></text></g><g><title>&lt;lance_index::scalar::inverted::lazy_docset::DeferredDocSet&gt;::row_ids_column::{closure#0} (4,308 samples, 14.00%)</title><rect x="85.7217%" y="229" width="14.0020%" height="15" fill="rgb(238,207,15)" fg:x="26374" fg:w="4308"/><text x="85.9717%" y="239.50">&lt;lance_index::scalar:..</text></g><g><title>lance_core::cache::build_key (11 samples, 0.04%)</title><rect x="99.6880%" y="213" width="0.0358%" height="15" fill="rgb(213,199,42)" fg:x="30671" fg:w="11"/><text x="99.9380%" y="223.50"></text></g><g><title>core::ptr::drop_glue::&lt;&lt;futures_util::stream::futures_unordered::FuturesUnordered&lt;_&gt; as futures_core::stream::Stream&gt;::poll_next::Bomb&lt;&lt;lance_index::scalar::inverted::index::InvertedIndex&gt;::bm25_search::{closure#0}::{closure#0}::{closure#6}::{closure#0}&gt;&gt; (4 samples, 0.01%)</title><rect x="99.7335%" y="229" width="0.0130%" height="15" fill="rgb(235,201,11)" fg:x="30685" fg:w="4"/><text x="99.9835%" y="239.50"></text></g><g><title>lance::io::exec::fts::search_segments::{closure#0} (28,465 samples, 92.52%)</title><rect x="7.2383%" y="261" width="92.5180%" height="15" fill="rgb(207,46,11)" fg:x="2227" fg:w="28465"/><text x="7.4883%" y="271.50">lance::io::exec::fts::search_segments::{closure#0}</text></g><g><title>&lt;lance_index::scalar::inverted::index::InvertedIndex&gt;::bm25_search::{closure#0}::{closure#0} (28,456 samples, 92.49%)</title><rect x="7.2675%" y="245" width="92.4887%" height="15" fill="rgb(241,35,35)" fg:x="2236" fg:w="28456"/><text x="7.5175%" y="255.50">&lt;lance_index::scalar::inverted::index::InvertedIndex&gt;::bm25_search::{closure#0}::{closure#0}</text></g><g><title>&lt;lance_index::scalar::inverted::index::TokenSet&gt;::get (50 samples, 0.16%)</title><rect x="99.7887%" y="213" width="0.1625%" height="15" fill="rgb(243,32,47)" fg:x="30702" fg:w="50"/><text x="100.0387%" y="223.50"></text></g><g><title>&lt;fst::raw::node::Node&gt;::new (43 samples, 0.14%)</title><rect x="99.8115%" y="197" width="0.1398%" height="15" fill="rgb(247,202,23)" fg:x="30709" fg:w="43"/><text x="100.0615%" y="207.50"></text></g><g><title>&lt;lance_index::scalar::inverted::index::InvertedIndex&gt;::df_for_term::{closure#0} (61 samples, 0.20%)</title><rect x="99.7562%" y="229" width="0.1983%" height="15" fill="rgb(219,102,11)" fg:x="30692" fg:w="61"/><text x="100.0062%" y="239.50"></text></g><g><title>&lt;futures_util::stream::try_stream::try_collect::TryCollect&lt;lance::dataset::scanner::DatasetRecordBatchStream, alloc::vec::Vec&lt;arrow_array::record_batch::RecordBatch&gt;&gt; as core::future::future::Future&gt;::poll (28,772 samples, 93.52%)</title><rect x="6.4420%" y="357" width="93.5158%" height="15" fill="rgb(243,110,44)" fg:x="1982" fg:w="28772"/><text x="6.6920%" y="367.50">&lt;futures_util::stream::try_stream::try_collect::TryCollect&lt;lance::dataset::scanner::DatasetRecordBatchStream, alloc::vec::Vec&lt;arrow_array::record_batch::Rec..</text></g><g><title>&lt;datafusion_physical_plan::stream::RecordBatchStreamAdapter&lt;lance_core::utils::futures::FinallyStream&lt;core::pin::Pin&lt;alloc::boxed::Box&lt;dyn datafusion_execution::stream::RecordBatchStream&lt;Item = core::result::Result&lt;arrow_array::record_batch::RecordBatch, datafusion_common::error::DataFusionError&gt;&gt; + core::marker::Send&gt;&gt;, lance_datafusion::exec::execute_plan::{closure#0}&gt;&gt; as futures_core::stream::Stream&gt;::poll_next (28,772 samples, 93.52%)</title><rect x="6.4420%" y="341" width="93.5158%" height="15" fill="rgb(222,74,54)" fg:x="1982" fg:w="28772"/><text x="6.6920%" y="351.50">&lt;datafusion_physical_plan::stream::RecordBatchStreamAdapter&lt;lance_core::utils::futures::FinallyStream&lt;core::pin::Pin&lt;alloc::boxed::Box&lt;dyn datafusion_execut..</text></g><g><title>&lt;datafusion_physical_plan::projection::ProjectionStream as futures_core::stream::Stream&gt;::poll_next (28,771 samples, 93.51%)</title><rect x="6.4452%" y="325" width="93.5125%" height="15" fill="rgb(216,99,12)" fg:x="1983" fg:w="28771"/><text x="6.6952%" y="335.50">&lt;datafusion_physical_plan::projection::ProjectionStream as futures_core::stream::Stream&gt;::poll_next</text></g><g><title>&lt;datafusion_physical_plan::limit::LimitStream as futures_core::stream::Stream&gt;::poll_next (28,771 samples, 93.51%)</title><rect x="6.4452%" y="309" width="93.5125%" height="15" fill="rgb(226,22,26)" fg:x="1983" fg:w="28771"/><text x="6.6952%" y="319.50">&lt;datafusion_physical_plan::limit::LimitStream as futures_core::stream::Stream&gt;::poll_next</text></g><g><title>&lt;datafusion_physical_plan::stream::RecordBatchStreamAdapter&lt;core::pin::Pin&lt;alloc::boxed::Box&lt;dyn futures_core::stream::Stream&lt;Item = core::result::Result&lt;arrow_array::record_batch::RecordBatch, datafusion_common::error::DataFusionError&gt;&gt; + core::marker::Send&gt;&gt;&gt; as futures_core::stream::Stream&gt;::poll_next (28,770 samples, 93.51%)</title><rect x="6.4485%" y="293" width="93.5093%" height="15" fill="rgb(217,163,10)" fg:x="1984" fg:w="28770"/><text x="6.6985%" y="303.50">&lt;datafusion_physical_plan::stream::RecordBatchStreamAdapter&lt;core::pin::Pin&lt;alloc::boxed::Box&lt;dyn futures_core::stream::Stream&lt;Item = core::result::Result&lt;ar..</text></g><g><title>&lt;lance_core::utils::tracing::InstrumentedStream&lt;futures_util::stream::once::Once&lt;&lt;lance::io::exec::fts::MatchQueryExec as datafusion_physical_plan::execution_plan::ExecutionPlan&gt;::execute::{closure#0}&gt;&gt; as futures_core::stream::Stream&gt;::poll_next (28,770 samples, 93.51%)</title><rect x="6.4485%" y="277" width="93.5093%" height="15" fill="rgb(213,25,53)" fg:x="1984" fg:w="28770"/><text x="6.6985%" y="287.50">&lt;lance_core::utils::tracing::InstrumentedStream&lt;futures_util::stream::once::Once&lt;&lt;lance::io::exec::fts::MatchQueryExec as datafusion_physical_plan::executio..</text></g><g><title>lance_index::scalar::inverted::build_global_bm25_scorer::{closure#0} (62 samples, 0.20%)</title><rect x="99.7562%" y="261" width="0.2015%" height="15" fill="rgb(252,105,26)" fg:x="30692" fg:w="62"/><text x="100.0062%" y="271.50"></text></g><g><title>&lt;lance_index::scalar::inverted::index::InvertedIndex&gt;::bm25_stats_for_terms::{closure#0} (62 samples, 0.20%)</title><rect x="99.7562%" y="245" width="0.2015%" height="15" fill="rgb(220,39,43)" fg:x="30692" fg:w="62"/><text x="100.0062%" y="255.50"></text></g><g><title>&lt;lance::dataset::scanner::Scanner&gt;::fts::{closure#0} (8 samples, 0.03%)</title><rect x="99.9675%" y="309" width="0.0260%" height="15" fill="rgb(229,68,48)" fg:x="30757" fg:w="8"/><text x="100.2175%" y="319.50"></text></g><g><title>&lt;lance::dataset::scanner::Scanner&gt;::plan_fts::{closure#0} (5 samples, 0.02%)</title><rect x="99.9772%" y="293" width="0.0163%" height="15" fill="rgb(252,8,32)" fg:x="30760" fg:w="5"/><text x="100.2272%" y="303.50"></text></g><g><title>&lt;lance::dataset::scanner::Scanner&gt;::plan_match_query::{closure#0} (5 samples, 0.02%)</title><rect x="99.9772%" y="277" width="0.0163%" height="15" fill="rgb(223,20,43)" fg:x="30760" fg:w="5"/><text x="100.2272%" y="287.50"></text></g><g><title>&lt;tokio::runtime::scheduler::multi_thread::worker::Context&gt;::run_task (28,794 samples, 93.59%)</title><rect x="6.4095%" y="421" width="93.5873%" height="15" fill="rgb(229,81,49)" fg:x="1972" fg:w="28794"/><text x="6.6595%" y="431.50">&lt;tokio::runtime::scheduler::multi_thread::worker::Context&gt;::run_task</text></g><g><title>tokio::runtime::task::raw::poll::&lt;fts_qps::main::{closure#0}::{closure#5}, alloc::sync::Arc&lt;tokio::runtime::scheduler::multi_thread::handle::Handle&gt;&gt; (28,788 samples, 93.57%)</title><rect x="6.4290%" y="405" width="93.5678%" height="15" fill="rgb(236,28,36)" fg:x="1978" fg:w="28788"/><text x="6.6790%" y="415.50">tokio::runtime::task::raw::poll::&lt;fts_qps::main::{closure#0}::{closure#5}, alloc::sync::Arc&lt;tokio::runtime::scheduler::multi_thread::handle::Handle&gt;&gt;</text></g><g><title>fts_qps::main::{closure#0}::{closure#5} (28,787 samples, 93.56%)</title><rect x="6.4322%" y="389" width="93.5645%" height="15" fill="rgb(249,185,26)" fg:x="1979" fg:w="28787"/><text x="6.6822%" y="399.50">fts_qps::main::{closure#0}::{closure#5}</text></g><g><title>fts_qps::run_one::{closure#0} (28,785 samples, 93.56%)</title><rect x="6.4387%" y="373" width="93.5580%" height="15" fill="rgb(249,174,33)" fg:x="1981" fg:w="28785"/><text x="6.6887%" y="383.50">fts_qps::run_one::{closure#0}</text></g><g><title>&lt;lance::dataset::scanner::Scanner&gt;::try_into_stream::{closure#0} (11 samples, 0.04%)</title><rect x="99.9610%" y="357" width="0.0358%" height="15" fill="rgb(233,201,37)" fg:x="30755" fg:w="11"/><text x="100.2110%" y="367.50"></text></g><g><title>&lt;lance::dataset::scanner::Scanner&gt;::create_plan::{closure#0} (11 samples, 0.04%)</title><rect x="99.9610%" y="341" width="0.0358%" height="15" fill="rgb(221,78,26)" fg:x="30755" fg:w="11"/><text x="100.2110%" y="351.50"></text></g><g><title>&lt;lance::dataset::scanner::Scanner&gt;::create_plan::{closure#0}::{closure#0} (11 samples, 0.04%)</title><rect x="99.9610%" y="325" width="0.0358%" height="15" fill="rgb(250,127,30)" fg:x="30755" fg:w="11"/><text x="100.2110%" y="335.50"></text></g><g><title>all (30,767 samples, 100%)</title><rect x="0.0000%" y="533" width="100.0000%" height="15" fill="rgb(230,49,44)" fg:x="0" fg:w="30767"/><text x="0.2500%" y="543.50"></text></g><g><title>tokio-rt-worker (28,839 samples, 93.73%)</title><rect x="6.2665%" y="517" width="93.7335%" height="15" fill="rgb(229,67,23)" fg:x="1928" fg:w="28839"/><text x="6.5165%" y="527.50">tokio-rt-worker</text></g><g><title>&lt;std::sys::thread::unix::Thread&gt;::new::thread_start (28,839 samples, 93.73%)</title><rect x="6.2665%" y="501" width="93.7335%" height="15" fill="rgb(249,83,47)" fg:x="1928" fg:w="28839"/><text x="6.5165%" y="511.50">&lt;std::sys::thread::unix::Thread&gt;::new::thread_start</text></g><g><title>&lt;std::thread::lifecycle::spawn_unchecked&lt;&lt;tokio::runtime::blocking::pool::Spawner&gt;::spawn_thread::{closure#0}, ()&gt;::{closure#1} as core::ops::function::FnOnce&lt;()&gt;&gt;::call_once::{shim:vtable#0} (28,839 samples, 93.73%)</title><rect x="6.2665%" y="485" width="93.7335%" height="15" fill="rgb(215,43,3)" fg:x="1928" fg:w="28839"/><text x="6.5165%" y="495.50">&lt;std::thread::lifecycle::spawn_unchecked&lt;&lt;tokio::runtime::blocking::pool::Spawner&gt;::spawn_thread::{closure#0}, ()&gt;::{closure#1} as core::ops::function::FnOn..</text></g><g><title>std::sys::backtrace::__rust_begin_short_backtrace::&lt;&lt;tokio::runtime::blocking::pool::Spawner&gt;::spawn_thread::{closure#0}, ()&gt; (28,839 samples, 93.73%)</title><rect x="6.2665%" y="469" width="93.7335%" height="15" fill="rgb(238,154,13)" fg:x="1928" fg:w="28839"/><text x="6.5165%" y="479.50">std::sys::backtrace::__rust_begin_short_backtrace::&lt;&lt;tokio::runtime::blocking::pool::Spawner&gt;::spawn_thread::{closure#0}, ()&gt;</text></g><g><title>tokio::runtime::task::raw::poll::&lt;tokio::runtime::blocking::task::BlockingTask&lt;&lt;tokio::runtime::scheduler::multi_thread::worker::Launch&gt;::launch::{closure#0}&gt;, tokio::runtime::blocking::schedule::BlockingSchedule&gt; (28,839 samples, 93.73%)</title><rect x="6.2665%" y="453" width="93.7335%" height="15" fill="rgb(219,56,2)" fg:x="1928" fg:w="28839"/><text x="6.5165%" y="463.50">tokio::runtime::task::raw::poll::&lt;tokio::runtime::blocking::task::BlockingTask&lt;&lt;tokio::runtime::scheduler::multi_thread::worker::Launch&gt;::launch::{closure#0..</text></g><g><title>tokio::runtime::scheduler::multi_thread::worker::run (28,839 samples, 93.73%)</title><rect x="6.2665%" y="437" width="93.7335%" height="15" fill="rgb(233,0,4)" fg:x="1928" fg:w="28839"/><text x="6.5165%" y="447.50">tokio::runtime::scheduler::multi_thread::worker::run</text></g></svg></svg>
