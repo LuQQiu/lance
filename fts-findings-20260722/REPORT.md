@@ -30,20 +30,27 @@ columns, so every query materialized 100 `full_content` documents after top-k.
 (+75%) and CPU 76→90%. All prior absolute numbers were understated; relative A/Bs
 remain valid since both sides carried the same weight.
 
-### 2. Chunked partition pipeline kills over-scoring (commits `3d842c5`, `8e8aca2`)
+### 2. Chunked partition pipeline: ~40x cheaper comparisons (commits `3d842c5`, `8e8aca2`)
 
-Before: one tiny cpu-pool task per partition (353/query; ~80-120K dispatches/sec)
-and, at high concurrency, a query's partitions all start scoring in parallel with
-shared top-k threshold ≈ 0, so MAXSCORE prunes nothing: `index_comparisons` =
-1.31M scored docs per query for k=100 (13,100x over-scoring).
+Before: one tiny cpu-pool task per partition (353/query; ~80-120K dispatches/sec).
+Under load (c64: ~22K in-flight tiny tasks over 320 cores) the tasks interleave
+so heavily that cache locality is destroyed and every scoring comparison stalls
+on memory: ~800ns per comparison.
 
 After: partitions are searched in chunks of 16 (`LANCE_FTS_SEARCH_CHUNK`) — the
 chunk's postings/DocSets load concurrently, then ONE cpu task searches the 16
-partitions sequentially. The shared threshold ratchets between partitions on the
-same thread: partition #2 starts with #1's k-th score already published, and so
-on. Scoring CPU at ~225 qps dropped **~177 cores → ~6 cores**; c16 doubled to 428
-qps @ 37ms. (In-chunk loads must stay concurrent — the first sequential-load
-version regressed c128 181 vs 345 by serializing the contended load path.)
+partitions back-to-back on one thread. Same work, restored locality: ~20ns per
+comparison. Scoring CPU at ~225 qps dropped **~177 cores → ~6 cores**; c16
+doubled to 428 qps @ 37ms. (In-chunk loads must stay concurrent — a
+sequential-load version regressed c128 to 181 by serializing the contended load
+path.)
+
+Verified by ANALYZE (single warm query, same binary): `index_comparisons` is
+**1.31M with chunk=1 AND with chunk=16** — the comparison COUNT is unchanged;
+what chunking buys is per-comparison cost (elapsed 16.7ms -> 14.0ms even at c1;
+the ~40x gap appears under concurrent load). Consequently MAXSCORE's 13,100x
+over-scoring (1.31M scored docs for k=100) is still unaddressed — it remains an
+open optimization lever on top of the 1307 qps result.
 
 Note: chunking exposed rather than lifted the c64 wall — QPS stayed ~225 while
 CPU fell to 29%, i.e. 64 in-flight queries × 290ms with idle cores = a lock, not
@@ -83,6 +90,19 @@ reload). c64: **225 → 1307 qps**, and the c128+ collapse disappeared.
   `lu/fts_pipeline_experiments`) helps the cold path only. The chunk pipeline's
   value warm is task-rate + threshold propagation, not IO overlap.
 
+## Ablation matrix (each fix alone hits the other's wall)
+
+| variant (qps / latency / CPU) | c64 | c128 |
+|---|---|---|
+| baseline (neither) | 224 / 286ms / 78% | 345 / 371ms / 90% |
+| chunked pipeline only | 221 / 290ms / 29% | 181 / 710ms / 47% |
+| WeakSlot only (`LANCE_FTS_SEARCH_CHUNK=1`) | 225 / 285ms / 80% | 406 / 316ms / 90% |
+| both | **1307 / 49ms / 82%** | **1168 / 110ms / 84%** |
+
+WeakSlot alone removes the moka wall but the freed cores burn on slow
+(locality-thrashed) scoring; the pipeline alone makes scoring cheap but
+everything queues on moka bookkeeping. The fixes are multiplicative.
+
 ## Flamegraphs
 
 - `flame_c64_prechunk_maxscore.svg` — before chunking (160 qps era): 70.9%
@@ -101,8 +121,11 @@ reload). c64: **225 → 1307 qps**, and the c128+ collapse disappeared.
 ## Follow-ups
 
 - Productize the three commits as a PR once #7897 merges.
-- Recall/result-equivalence spot-check vs baseline (threshold sharing is exact
-  WAND semantics; expected identical modulo ties).
+- Recall/result-equivalence spot-check vs baseline (exact scoring throughout;
+  expected identical modulo ties).
+- Attack the remaining over-scoring: 1.31M comparisons/query for k=100 is
+  unchanged by chunking (ANALYZE-verified) — better MAXSCORE window pruning on
+  this workload is the next big QPS lever.
 - Proper fix for the moka wall at the cache layer: backend-level weak L1 in
   `MokaCacheBackend`, or evaluate a read-optimized backend (e.g. quick_cache)
   behind the existing `CacheBackend` trait; production PE (sophon-caching
