@@ -5391,7 +5391,7 @@ mod tests {
         use lance_table::format::Fragment;
         use lance_table::format::IndexMetadata;
         use lance_table::format::pb::fragment_reuse_index_details as pb_fri;
-        use lance_table::transaction::{FragmentReuseRewrite, RewriteGroup};
+        use lance_table::transaction::{FragReuseUpdate, FragmentReuseRewrite, RewriteGroup};
         use prost::Message;
 
         impl MockDatasetFixture {
@@ -5493,11 +5493,9 @@ mod tests {
                             new_fragments: destinations,
                         }],
                         rewritten_indices: vec![],
-                        frag_reuse_index: None,
-                        frag_reuse_rewrite: Some(FragmentReuseRewrite {
-                            transitions: vec![transition],
-                            base_entry_version: None,
-                        }),
+                        frag_reuse: Some(FragReuseUpdate::AppendTransitions(
+                            FragmentReuseRewrite::new(vec![transition]),
+                        )),
                     },
                     None,
                 ))
