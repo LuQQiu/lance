@@ -18,6 +18,7 @@ use lance_index::mem_wal::{CompactedSsTable, MEM_WAL_INDEX_NAME};
 use lance_select::{RowAddrTreeMap, RowSetOps};
 use lance_table::format::IndexMetadata;
 use lance_table::format::overlay::OverlayCoverage;
+use lance_table::transaction::FragReuseUpdate;
 use lance_table::{format::Fragment, io::deletion::write_deletion_file};
 use roaring::RoaringBitmap;
 use std::{
@@ -816,16 +817,14 @@ impl<'a> TransactionRebase<'a> {
                 // we indexed. If it did, we could retry.
                 // TODO: this will change with stable row ids.
                 Operation::Rewrite {
-                    groups,
-                    frag_reuse_index,
-                    ..
+                    groups, frag_reuse, ..
                 } => {
-                    // if frag_reuse_index is available, index remapping is deferred and
+                    // if a reuse update is present, index remapping is deferred and
                     // there is no conflict with concurrent CreateIndex of column indices.
                     // The only case that needs rebasing is when the frag_reuse_index cleanup
                     // triggers a CreateIndex, and it needs to add the new reuse
                     // version created by the rewrite
-                    if let Some(committed_fri) = frag_reuse_index {
+                    if let Some(FragReuseUpdate::ReplaceEntry(committed_fri)) = frag_reuse {
                         let ngram_coverage = new_indices
                             .iter()
                             .filter(|idx| {
@@ -937,10 +936,7 @@ impl<'a> TransactionRebase<'a> {
         other_version: u64,
     ) -> Result<()> {
         if let Operation::Rewrite {
-            groups,
-            frag_reuse_index,
-            frag_reuse_rewrite,
-            ..
+            groups, frag_reuse, ..
         } = &self.transaction.operation
         {
             match &other_transaction.operation {
@@ -990,7 +986,7 @@ impl<'a> TransactionRebase<'a> {
                 }
                 Operation::Rewrite {
                     groups,
-                    frag_reuse_index: committed_fri,
+                    frag_reuse: committed_frag_reuse,
                     ..
                 } => {
                     // Double consumption: the committed rewrite replaced
@@ -1006,8 +1002,8 @@ impl<'a> TransactionRebase<'a> {
                     // version or a tagged compaction's transition), and its
                     // manifest-diff check turns a concurrent stable-partition
                     // append into a retryable conflict.
-                    if let Some(frag_reuse_rewrite) = frag_reuse_rewrite {
-                        let touched: HashSet<u64> = frag_reuse_rewrite
+                    if let Some(FragReuseUpdate::AppendTransitions(rewrite)) = frag_reuse {
+                        let touched: HashSet<u64> = rewrite
                             .transitions
                             .iter()
                             .flat_map(|transition| {
@@ -1046,7 +1042,9 @@ impl<'a> TransactionRebase<'a> {
                         .any(|id| self.modified_fragment_ids.contains(&id))
                     {
                         Err(self.retryable_conflict_err(other_transaction, other_version))
-                    } else if committed_fri.is_some() && frag_reuse_index.is_some() {
+                    } else if matches!(committed_frag_reuse, Some(FragReuseUpdate::ReplaceEntry(_)))
+                        && matches!(frag_reuse, Some(FragReuseUpdate::ReplaceEntry(_)))
+                    {
                         // Do not commit concurrent rewrites that could produce conflicting frag_reuse_indexes.
                         // The other rewrite must retry.
                         // TODO: could potentially rebase to combine both frag_reuse_indexes,
@@ -1097,7 +1095,7 @@ impl<'a> TransactionRebase<'a> {
                     // provenance and the tagged entry records the row-level
                     // translation, so it takes the deferred-remap branches
                     // below.
-                    let defers_remap = frag_reuse_index.is_some() || frag_reuse_rewrite.is_some();
+                    let defers_remap = frag_reuse.is_some();
                     match (
                         new_indices
                             .iter()
@@ -1110,7 +1108,12 @@ impl<'a> TransactionRebase<'a> {
                         // the CURRENT manifest entry every attempt, so the
                         // trimmed entry is reloaded, our transition
                         // re-appended, and the result revalidated there.
-                        (Some(_), true) if frag_reuse_rewrite.is_some() => {
+                        (Some(_), true)
+                            if matches!(
+                                frag_reuse,
+                                Some(FragReuseUpdate::AppendTransitions(_))
+                            ) =>
+                        {
                             // Same mixture sanity as the v0 arm: an FRI
                             // replacement commits alone. A CreateIndex mixing
                             // it with user indices is a shape this resolver
@@ -2278,10 +2281,7 @@ impl<'a> TransactionRebase<'a> {
 
     async fn finish_rewrite(mut self, dataset: &Dataset) -> Result<Transaction> {
         if let Operation::Rewrite {
-            groups,
-            frag_reuse_index,
-            frag_reuse_rewrite,
-            ..
+            groups, frag_reuse, ..
         } = &mut self.transaction.operation
         {
             // A compaction that shaped itself for a v0 table can lose the
@@ -2301,10 +2301,8 @@ impl<'a> TransactionRebase<'a> {
             // this branch (the current entry is not tagged there), keeping
             // pure v0 behavior untouched; writers predating tagged support
             // are fenced off by the writer feature flag before this point.
-            if frag_reuse_rewrite.is_none()
-                && frag_reuse_index
-                    .as_ref()
-                    .is_some_and(|entry| entry.index_version == 0)
+            if let Some(FragReuseUpdate::ReplaceEntry(v0_entry)) = frag_reuse
+                && v0_entry.index_version == 0
             {
                 let current_is_tagged = crate::index::load_all_indices(dataset)
                     .await?
@@ -2312,7 +2310,6 @@ impl<'a> TransactionRebase<'a> {
                     .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
                     .is_some_and(lance_table::system_index::frag_reuse::metadata::is_tagged);
                 if current_is_tagged {
-                    let v0_entry = frag_reuse_index.as_ref().unwrap();
                     let details = load_frag_reuse_index_details(dataset, v0_entry).await?;
                     let appended = details.versions.last().ok_or_else(|| {
                         Error::internal(
@@ -2342,15 +2339,15 @@ impl<'a> TransactionRebase<'a> {
                             )),
                         })
                         .collect();
-                    *frag_reuse_rewrite = Some(crate::dataset::transaction::FragmentReuseRewrite {
-                        transitions,
-                        base_entry_version: None,
-                    });
-                    *frag_reuse_index = None;
+                    // In-place variant change: the same slot flips from a
+                    // v0 snapshot to append-only facts.
+                    *frag_reuse = Some(FragReuseUpdate::AppendTransitions(
+                        crate::dataset::transaction::FragmentReuseRewrite::new(transitions),
+                    ));
                 }
             }
 
-            if let Some(frag_reuse_rewrite) = frag_reuse_rewrite {
+            if let Some(FragReuseUpdate::AppendTransitions(rewrite)) = frag_reuse {
                 // Assembled (and re-assembled after a conflict) against the
                 // FRI entry committed at the version this attempt builds on,
                 // so a rebase appends onto the latest entry instead of a
@@ -2376,12 +2373,12 @@ impl<'a> TransactionRebase<'a> {
                 // longer in the manifest. What remains at this point is
                 // proven disjoint, and disjoint transitions merge.
                 let (entry, base_entry_version) =
-                    build_frag_reuse_rewrite_entry(dataset, frag_reuse_rewrite, groups).await?;
-                frag_reuse_rewrite.base_entry_version = base_entry_version;
-                *frag_reuse_index = Some(entry);
+                    build_frag_reuse_rewrite_entry(dataset, rewrite, groups).await?;
+                rewrite.base_entry_version = base_entry_version;
+                rewrite.assembled_entry = Some(entry);
                 return Ok(self.transaction);
             }
-            if let Some(new_fri) = frag_reuse_index {
+            if let Some(FragReuseUpdate::ReplaceEntry(new_fri)) = frag_reuse {
                 if self.conflicting_frag_reuse_indices.is_empty() {
                     return Ok(self.transaction);
                 }
@@ -2440,7 +2437,7 @@ impl<'a> TransactionRebase<'a> {
                 )
                 .await?;
 
-                *frag_reuse_index = Some(new_frag_reuse_index_meta);
+                *new_fri = new_frag_reuse_index_meta;
                 Ok(self.transaction)
             } else {
                 Ok(self.transaction)
@@ -2598,8 +2595,7 @@ mod tests {
             Operation::Rewrite {
                 groups: vec![],
                 rewritten_indices: vec![],
-                frag_reuse_index: Some(tagged.clone()),
-                frag_reuse_rewrite: None,
+                frag_reuse: Some(FragReuseUpdate::ReplaceEntry(tagged.clone())),
             }
         };
         let transaction = Transaction::new_from_version(dataset.manifest.version, operation);
@@ -3329,8 +3325,7 @@ mod tests {
                     new_fragments: vec![fragment1.clone()],
                 }],
                 rewritten_indices: vec![],
-                frag_reuse_index: None,
-                frag_reuse_rewrite: None,
+                frag_reuse: None,
             },
             Operation::ReserveFragments { num_fragments: 3 },
             Operation::Update {
@@ -3469,8 +3464,7 @@ mod tests {
                         new_fragments: vec![fragment0.clone()],
                     }],
                     rewritten_indices: Vec::new(),
-                    frag_reuse_index: None,
-                    frag_reuse_rewrite: None,
+                    frag_reuse: None,
                 },
                 [
                     Compatible,    // append
@@ -3492,8 +3486,7 @@ mod tests {
                         new_fragments: vec![fragment0.clone()],
                     }],
                     rewritten_indices: Vec::new(),
-                    frag_reuse_index: None,
-                    frag_reuse_rewrite: None,
+                    frag_reuse: None,
                 },
                 [
                     Compatible,    // append
@@ -3850,8 +3843,7 @@ mod tests {
                 new_fragments: vec![],
             }],
             rewritten_indices: vec![],
-            frag_reuse_index: None,
-            frag_reuse_rewrite: None,
+            frag_reuse: None,
         };
 
         let fragment0 = Fragment::new(0);
@@ -3996,8 +3988,7 @@ mod tests {
                 new_fragments: vec![],
             }],
             rewritten_indices: vec![],
-            frag_reuse_index: None,
-            frag_reuse_rewrite: None,
+            frag_reuse: None,
         };
 
         for (other, expect_conflict) in [(overlay_on(1), true), (overlay_on(0), false)] {
@@ -4802,8 +4793,7 @@ mod tests {
                     new_fragments: vec![Fragment::new(2)],
                 }],
                 rewritten_indices: vec![],
-                frag_reuse_index: Some(frag_reuse_index),
-                frag_reuse_rewrite: None,
+                frag_reuse: Some(FragReuseUpdate::ReplaceEntry(frag_reuse_index)),
             },
             None,
         );
@@ -5288,8 +5278,7 @@ mod tests {
                         new_fragments: vec![fragment1.clone()],
                     }],
                     rewritten_indices: vec![],
-                    frag_reuse_index: None,
-                    frag_reuse_rewrite: None,
+                    frag_reuse: None,
                 },
                 Retryable,
             ),
@@ -5304,8 +5293,7 @@ mod tests {
                         new_fragments: vec![fragment0],
                     }],
                     rewritten_indices: vec![],
-                    frag_reuse_index: None,
-                    frag_reuse_rewrite: None,
+                    frag_reuse: None,
                 },
                 Compatible,
             ),
@@ -5976,11 +5964,9 @@ mod tests {
                     new_fragments,
                 }],
                 rewritten_indices: vec![],
-                frag_reuse_index: None,
-                frag_reuse_rewrite: Some(FragmentReuseRewrite {
-                    transitions,
-                    base_entry_version: None,
-                }),
+                frag_reuse: Some(FragReuseUpdate::AppendTransitions(
+                    FragmentReuseRewrite::new(transitions),
+                )),
             }
         }
 
@@ -6103,8 +6089,7 @@ mod tests {
                                 new_fragments: fragments,
                             }],
                             rewritten_indices: vec![],
-                            frag_reuse_index: Some(entry),
-                            frag_reuse_rewrite: None,
+                            frag_reuse: Some(FragReuseUpdate::ReplaceEntry(entry)),
                         },
                         None,
                     ),
@@ -6326,8 +6311,7 @@ mod tests {
                                 new_fragments: fragments,
                             }],
                             rewritten_indices: vec![],
-                            frag_reuse_index: None,
-                            frag_reuse_rewrite: None,
+                            frag_reuse: None,
                         },
                         None,
                     ),
@@ -6397,8 +6381,7 @@ mod tests {
                         new_fragments: vec![Fragment::new(11)],
                     }],
                     rewritten_indices: vec![],
-                    frag_reuse_index: None,
-                    frag_reuse_rewrite: None,
+                    frag_reuse: None,
                 },
                 None,
             );
@@ -7011,7 +6994,11 @@ mod tests {
             .unwrap();
             let finished = rebase.finish(&dataset).await.unwrap();
             let Operation::Rewrite {
-                frag_reuse_index: Some(entry),
+                frag_reuse:
+                    Some(FragReuseUpdate::AppendTransitions(FragmentReuseRewrite {
+                        assembled_entry: Some(entry),
+                        ..
+                    })),
                 ..
             } = &finished.operation
             else {

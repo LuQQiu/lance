@@ -319,12 +319,12 @@ impl Transaction {
     /// must be entirely reordered or entirely order-preserving.
     pub(super) fn ordered_rewrite_groups(
         groups: &[RewriteGroup],
-        frag_reuse_rewrite: Option<&FragmentReuseRewrite>,
+        append_intent: Option<&FragmentReuseRewrite>,
     ) -> Result<Vec<RewriteGroup>> {
-        let Some(frag_reuse_rewrite) = frag_reuse_rewrite else {
+        let Some(append_intent) = append_intent else {
             return Ok(groups.to_vec());
         };
-        let sources = frag_reuse_rewrite.reordered_sources()?;
+        let sources = append_intent.reordered_sources()?;
         let mut ordered = Vec::new();
         for group in groups {
             let covered = group
@@ -508,23 +508,19 @@ mod tests {
             physical_rows: 4,
             num_deleted_rows: 0,
         };
-        let frag_reuse_rewrite = FragmentReuseRewrite {
-            transitions: vec![pb_fri::Transition {
-                sources: vec![digest(0), digest(1)],
-                destinations: vec![digest(10), digest(10)],
-                mapping: None,
-            }],
-            base_entry_version: None,
-        };
-        let ordered =
-            Transaction::ordered_rewrite_groups(&groups, Some(&frag_reuse_rewrite)).unwrap();
+        let append_intent = FragmentReuseRewrite::new(vec![pb_fri::Transition {
+            sources: vec![digest(0), digest(1)],
+            destinations: vec![digest(10), digest(10)],
+            mapping: None,
+        }]);
+        let ordered = Transaction::ordered_rewrite_groups(&groups, Some(&append_intent)).unwrap();
         assert_eq!(ordered.len(), 1);
         assert_eq!(ordered[0].old_fragments[0].id, 2);
 
         // A group straddling reordered and order-preserving sources is
         // rejected.
         let mixed = vec![group(&[1, 2], &[10])];
-        assert!(Transaction::ordered_rewrite_groups(&mixed, Some(&frag_reuse_rewrite)).is_err());
+        assert!(Transaction::ordered_rewrite_groups(&mixed, Some(&append_intent)).is_err());
     }
 
     #[test]

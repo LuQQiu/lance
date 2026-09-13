@@ -1067,15 +1067,18 @@ fn convert_to_java_operation_inner<'local>(
         Operation::Rewrite {
             groups,
             rewritten_indices,
-            frag_reuse_index,
-            // In-memory commit intent; never crosses the JNI boundary.
-            frag_reuse_rewrite: _,
+            frag_reuse,
         } => {
             let java_groups = export_vec(env, &groups)?;
             let java_indices = export_vec(env, &rewritten_indices)?;
-            let java_frag_reuse_index = match frag_reuse_index {
-                Some(index) => index.into_java(env)?,
-                None => JObject::null(),
+            // Only the v0 snapshot crosses the JNI boundary as the Java
+            // `fragReuseIndex`; append-transition intent is in-process
+            // commit state and never exported.
+            let java_frag_reuse_index = match frag_reuse {
+                Some(lance_table::transaction::FragReuseUpdate::ReplaceEntry(index)) => {
+                    index.into_java(env)?
+                }
+                _ => JObject::null(),
             };
 
             Ok(env.new_object(
@@ -1869,10 +1872,10 @@ fn convert_to_rust_operation(
             Operation::Rewrite {
                 groups,
                 rewritten_indices,
-                frag_reuse_index,
-                // Never carried through the bindings: the commit path
-                // assembles it in-process.
-                frag_reuse_rewrite: None,
+                // The Java `fragReuseIndex` is the v0 snapshot contract;
+                // append-transition intent never crosses the bindings.
+                frag_reuse: frag_reuse_index
+                    .map(lance_table::transaction::FragReuseUpdate::ReplaceEntry),
             }
         }
         "Update" => {

@@ -91,7 +91,8 @@ use super::fragment::FileFragment;
 use super::index::{DatasetIndexRemapperOptions, load_indices_for_remapping};
 use super::rowids::load_row_id_sequences;
 use super::transaction::{
-    FragmentReuseRewrite, Operation, RewriteGroup, RewrittenIndex, Transaction, TransactionBuilder,
+    FragReuseUpdate, FragmentReuseRewrite, Operation, RewriteGroup, RewrittenIndex, Transaction,
+    TransactionBuilder,
 };
 use super::utils::make_rowid_capture_stream;
 use super::versions;
@@ -3096,7 +3097,7 @@ pub async fn commit_compaction(
     // into tagged transitions when the current entry turns out tagged (see
     // `finish_rewrite`); the commit gate still rejects a v0 entry spliced by
     // a writer without that conversion.
-    let (frag_reuse_index, frag_reuse_rewrite) = if options.defer_index_remap && any_group_indexed {
+    let frag_reuse = if options.defer_index_remap && any_group_indexed {
         let tagged_at_commit = load_all_indices(dataset)
             .await?
             .iter()
@@ -3143,21 +3144,13 @@ pub async fn commit_compaction(
                     )),
                 })
                 .collect();
-            (
-                None,
-                Some(FragmentReuseRewrite {
-                    transitions,
-                    base_entry_version: None,
-                }),
-            )
+            Some(FragReuseUpdate::AppendTransitions(
+                FragmentReuseRewrite::new(transitions),
+            ))
         } else {
-            (
-                Some(
-                    build_new_frag_reuse_index(dataset, frag_reuse_groups, new_fragment_bitmap)
-                        .await?,
-                ),
-                None,
-            )
+            Some(FragReuseUpdate::ReplaceEntry(
+                build_new_frag_reuse_index(dataset, frag_reuse_groups, new_fragment_bitmap).await?,
+            ))
         }
     } else {
         if options.defer_index_remap {
@@ -3165,7 +3158,7 @@ pub async fn commit_compaction(
                 "skipping fragment reuse record: no rewritten fragments are covered by an index or the reuse lineage"
             );
         }
-        (None, None)
+        None
     };
 
     let transaction = TransactionBuilder::new(
@@ -3180,8 +3173,7 @@ pub async fn commit_compaction(
         Operation::Rewrite {
             groups: rewrite_groups,
             rewritten_indices,
-            frag_reuse_index,
-            frag_reuse_rewrite,
+            frag_reuse,
         },
     )
     .transaction_properties(options.transaction_properties.clone())

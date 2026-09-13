@@ -790,7 +790,7 @@ async fn validate_folded_deletions(
 /// ledger.
 pub(crate) async fn build_frag_reuse_rewrite_entry(
     dataset: &Dataset,
-    frag_reuse_rewrite: &FragmentReuseRewrite,
+    rewrite: &FragmentReuseRewrite,
     groups: &[RewriteGroup],
 ) -> lance_core::Result<(IndexMetadata, Option<u64>)> {
     // The spec excludes tagged histories on stable-row-id tables: the FRI is
@@ -805,7 +805,7 @@ pub(crate) async fn build_frag_reuse_rewrite_entry(
         ));
     }
 
-    let transitions = &frag_reuse_rewrite.transitions;
+    let transitions = &rewrite.transitions;
     if transitions.is_empty() {
         return Err(Error::invalid_input(
             "a fragment-reuse rewrite carries no transitions",
@@ -1207,7 +1207,7 @@ mod tests {
     use lance_table::system_index::frag_reuse::FragDigest;
     use lance_table::system_index::frag_reuse::ledger::{FragReuseLedger, Mapping};
     use lance_table::system_index::frag_reuse::metadata::is_tagged;
-    use lance_table::transaction::{Operation, Transaction};
+    use lance_table::transaction::{FragReuseUpdate, Operation, Transaction};
     use roaring::RoaringTreemap;
 
     async fn sorted_values(dataset: &Dataset) -> Vec<i32> {
@@ -1269,11 +1269,9 @@ mod tests {
                         new_fragments: destinations.clone(),
                     }],
                     rewritten_indices: vec![],
-                    frag_reuse_index: None,
-                    frag_reuse_rewrite: Some(FragmentReuseRewrite {
-                        transitions: vec![transition.clone()],
-                        base_entry_version: None,
-                    }),
+                    frag_reuse: Some(FragReuseUpdate::AppendTransitions(
+                        FragmentReuseRewrite::new(vec![transition.clone()]),
+                    )),
                 },
                 None,
             ))
@@ -1332,11 +1330,9 @@ mod tests {
                         new_fragments: destinations,
                     }],
                     rewritten_indices: vec![],
-                    frag_reuse_index: None,
-                    frag_reuse_rewrite: Some(FragmentReuseRewrite {
-                        transitions: vec![transition],
-                        base_entry_version: None,
-                    }),
+                    frag_reuse: Some(FragReuseUpdate::AppendTransitions(
+                        FragmentReuseRewrite::new(vec![transition]),
+                    )),
                 },
                 None,
             ))
@@ -1424,16 +1420,13 @@ mod tests {
 
         let old_fragments: Vec<Fragment> = dataset.fragments().iter().cloned().collect();
         let (transition, destinations) = reader_tests::prepare(&dataset).await;
-        let frag_reuse_rewrite = FragmentReuseRewrite {
-            transitions: vec![transition.clone()],
-            base_entry_version: None,
-        };
+        let rewrite_intent = FragmentReuseRewrite::new(vec![transition.clone()]);
         let groups = vec![RewriteGroup {
             old_fragments,
             new_fragments: destinations,
         }];
         let (entry, base_entry_version) =
-            build_frag_reuse_rewrite_entry(&dataset, &frag_reuse_rewrite, &groups)
+            build_frag_reuse_rewrite_entry(&dataset, &rewrite_intent, &groups)
                 .await
                 .unwrap();
         assert_eq!(base_entry_version, Some(v0_entry.dataset_version));
@@ -1461,10 +1454,7 @@ mod tests {
                 new_fragments: new,
             }]
         };
-        let sp = |transitions: Vec<Transition>| FragmentReuseRewrite {
-            transitions,
-            base_entry_version: None,
-        };
+        let sp = FragmentReuseRewrite::new;
 
         // A group straddling covered and uncovered sources.
         let mut with_extra = old_fragments.clone();
@@ -1525,10 +1515,7 @@ mod tests {
         destinations.truncate(1);
         let error = build_frag_reuse_rewrite_entry(
             &dataset,
-            &FragmentReuseRewrite {
-                transitions: vec![transition],
-                base_entry_version: None,
-            },
+            &FragmentReuseRewrite::new(vec![transition]),
             &[RewriteGroup {
                 old_fragments,
                 new_fragments: destinations,
@@ -1554,10 +1541,7 @@ mod tests {
         mapping.map_id = "not-a-uuid".to_string();
         let error = build_frag_reuse_rewrite_entry(
             &dataset,
-            &FragmentReuseRewrite {
-                transitions: vec![transition],
-                base_entry_version: None,
-            },
+            &FragmentReuseRewrite::new(vec![transition]),
             &[RewriteGroup {
                 old_fragments,
                 new_fragments: destinations,
@@ -1609,10 +1593,7 @@ mod tests {
 
         let (entry, base_entry_version) = build_frag_reuse_rewrite_entry(
             &dataset,
-            &FragmentReuseRewrite {
-                transitions,
-                base_entry_version: None,
-            },
+            &FragmentReuseRewrite::new(transitions),
             &groups,
         )
         .await
@@ -1653,11 +1634,9 @@ mod tests {
                         new_fragments: destinations,
                     }],
                     rewritten_indices: vec![],
-                    frag_reuse_index: None,
-                    frag_reuse_rewrite: Some(FragmentReuseRewrite {
-                        transitions: vec![transition],
-                        base_entry_version: None,
-                    }),
+                    frag_reuse: Some(FragReuseUpdate::AppendTransitions(
+                        FragmentReuseRewrite::new(vec![transition]),
+                    )),
                 },
                 None,
             ))
@@ -1735,12 +1714,12 @@ mod tests {
         values
     }
 
-    /// A pre-assembled tagged entry without `frag_reuse_rewrite` intent has
+    /// A pre-assembled tagged snapshot (`FragReuseUpdate::ReplaceEntry`) has
     /// bypassed assembly and validation; the commit chokepoint rejects it
     /// even though the empty-conflicts finish path passes it through
     /// unchanged. With intent, the same commit works (the atomic e2e above).
     #[tokio::test]
-    async fn tagged_entry_without_intent_rejected_at_commit() {
+    async fn tagged_snapshot_replace_rejected_at_commit() {
         let mut dataset = reader_tests::fixture().await;
         let entry = IndexMetadata {
             uuid: Uuid::new_v4(),
@@ -1765,8 +1744,7 @@ mod tests {
                     Operation::Rewrite {
                         groups: vec![],
                         rewritten_indices: vec![],
-                        frag_reuse_index: Some(entry),
-                        frag_reuse_rewrite: None,
+                        frag_reuse: Some(FragReuseUpdate::ReplaceEntry(entry)),
                     },
                     None,
                 ),
@@ -1804,11 +1782,9 @@ mod tests {
                 Operation::Rewrite {
                     groups: vec![],
                     rewritten_indices: vec![],
-                    frag_reuse_index: None,
-                    frag_reuse_rewrite: Some(FragmentReuseRewrite {
-                        transitions: vec![],
-                        base_entry_version: None,
-                    }),
+                    frag_reuse: Some(FragReuseUpdate::AppendTransitions(
+                        FragmentReuseRewrite::new(vec![]),
+                    )),
                 },
                 None,
             ))
@@ -1853,11 +1829,9 @@ mod tests {
                         new_fragments: new_destinations,
                     }],
                     rewritten_indices: vec![],
-                    frag_reuse_index: None,
-                    frag_reuse_rewrite: Some(FragmentReuseRewrite {
-                        transitions: vec![new_transition],
-                        base_entry_version: None,
-                    }),
+                    frag_reuse: Some(FragReuseUpdate::AppendTransitions(
+                        FragmentReuseRewrite::new(vec![new_transition]),
+                    )),
                 },
                 None,
             ))
@@ -1964,11 +1938,9 @@ mod tests {
                         new_fragments: destinations,
                     }],
                     rewritten_indices: vec![],
-                    frag_reuse_index: None,
-                    frag_reuse_rewrite: Some(FragmentReuseRewrite {
-                        transitions: vec![transition],
-                        base_entry_version: None,
-                    }),
+                    frag_reuse: Some(FragReuseUpdate::AppendTransitions(
+                        FragmentReuseRewrite::new(vec![transition]),
+                    )),
                 },
                 None,
             ))
@@ -2009,11 +1981,9 @@ mod tests {
                         new_fragments: destinations,
                     }],
                     rewritten_indices: vec![],
-                    frag_reuse_index: None,
-                    frag_reuse_rewrite: Some(FragmentReuseRewrite {
-                        transitions: vec![transition],
-                        base_entry_version: None,
-                    }),
+                    frag_reuse: Some(FragReuseUpdate::AppendTransitions(
+                        FragmentReuseRewrite::new(vec![transition]),
+                    )),
                 },
                 None,
             ))
@@ -2038,11 +2008,9 @@ mod tests {
                         new_fragments: new_destinations,
                     }],
                     rewritten_indices: vec![],
-                    frag_reuse_index: None,
-                    frag_reuse_rewrite: Some(FragmentReuseRewrite {
-                        transitions: vec![reused],
-                        base_entry_version: None,
-                    }),
+                    frag_reuse: Some(FragReuseUpdate::AppendTransitions(
+                        FragmentReuseRewrite::new(vec![reused]),
+                    )),
                 },
                 None,
             ))
@@ -2073,11 +2041,9 @@ mod tests {
                         new_fragments: destinations,
                     }],
                     rewritten_indices: vec![],
-                    frag_reuse_index: None,
-                    frag_reuse_rewrite: Some(FragmentReuseRewrite {
-                        transitions: vec![transition],
-                        base_entry_version: None,
-                    }),
+                    frag_reuse: Some(FragReuseUpdate::AppendTransitions(
+                        FragmentReuseRewrite::new(vec![transition]),
+                    )),
                 },
                 None,
             ))
@@ -2163,11 +2129,9 @@ mod tests {
                 Operation::Rewrite {
                     groups: vec![],
                     rewritten_indices: vec![],
-                    frag_reuse_index: None,
-                    frag_reuse_rewrite: Some(FragmentReuseRewrite {
-                        transitions: vec![],
-                        base_entry_version: None,
-                    }),
+                    frag_reuse: Some(FragReuseUpdate::AppendTransitions(
+                        FragmentReuseRewrite::new(vec![]),
+                    )),
                 },
                 None,
             ))
@@ -2199,8 +2163,7 @@ mod tests {
                 Operation::Rewrite {
                     groups: vec![],
                     rewritten_indices: vec![],
-                    frag_reuse_index: Some(entry),
-                    frag_reuse_rewrite: None,
+                    frag_reuse: Some(FragReuseUpdate::ReplaceEntry(entry)),
                 },
                 None,
             ))
@@ -2226,10 +2189,7 @@ mod tests {
         });
         let error = build_frag_reuse_rewrite_entry(
             &dataset,
-            &FragmentReuseRewrite {
-                transitions: vec![transition],
-                base_entry_version: None,
-            },
+            &FragmentReuseRewrite::new(vec![transition]),
             &[RewriteGroup {
                 old_fragments,
                 new_fragments: destinations,
@@ -2264,11 +2224,9 @@ mod tests {
                         new_fragments: destinations,
                     }],
                     rewritten_indices: vec![],
-                    frag_reuse_index: None,
-                    frag_reuse_rewrite: Some(FragmentReuseRewrite {
-                        transitions: vec![transition],
-                        base_entry_version: None,
-                    }),
+                    frag_reuse: Some(FragReuseUpdate::AppendTransitions(
+                        FragmentReuseRewrite::new(vec![transition]),
+                    )),
                 },
                 None,
             ))
@@ -2300,11 +2258,9 @@ mod tests {
                         new_fragments: destinations,
                     }],
                     rewritten_indices: vec![],
-                    frag_reuse_index: None,
-                    frag_reuse_rewrite: Some(FragmentReuseRewrite {
-                        transitions: vec![transition],
-                        base_entry_version: None,
-                    }),
+                    frag_reuse: Some(FragReuseUpdate::AppendTransitions(
+                        FragmentReuseRewrite::new(vec![transition]),
+                    )),
                 },
                 None,
             ))
@@ -2357,11 +2313,9 @@ mod tests {
                         new_fragments: destinations,
                     }],
                     rewritten_indices: vec![],
-                    frag_reuse_index: None,
-                    frag_reuse_rewrite: Some(FragmentReuseRewrite {
-                        transitions: vec![transition],
-                        base_entry_version: None,
-                    }),
+                    frag_reuse: Some(FragReuseUpdate::AppendTransitions(
+                        FragmentReuseRewrite::new(vec![transition]),
+                    )),
                 },
                 None,
             ))
@@ -2515,11 +2469,9 @@ mod tests {
                         new_fragments: destinations,
                     }],
                     rewritten_indices: vec![],
-                    frag_reuse_index: None,
-                    frag_reuse_rewrite: Some(FragmentReuseRewrite {
-                        transitions: vec![transition],
-                        base_entry_version: None,
-                    }),
+                    frag_reuse: Some(FragReuseUpdate::AppendTransitions(
+                        FragmentReuseRewrite::new(vec![transition]),
+                    )),
                 },
                 None,
             ))
@@ -2616,11 +2568,9 @@ mod tests {
                         new_fragments: sp_destinations,
                     }],
                     rewritten_indices: vec![],
-                    frag_reuse_index: None,
-                    frag_reuse_rewrite: Some(FragmentReuseRewrite {
-                        transitions: vec![transition],
-                        base_entry_version: None,
-                    }),
+                    frag_reuse: Some(FragReuseUpdate::AppendTransitions(
+                        FragmentReuseRewrite::new(vec![transition]),
+                    )),
                 },
                 None,
             ))
@@ -2753,11 +2703,9 @@ mod tests {
                         new_fragments: harness.destinations,
                     }],
                     rewritten_indices: vec![],
-                    frag_reuse_index: None,
-                    frag_reuse_rewrite: Some(FragmentReuseRewrite {
-                        transitions: vec![harness.transition],
-                        base_entry_version: None,
-                    }),
+                    frag_reuse: Some(FragReuseUpdate::AppendTransitions(
+                        FragmentReuseRewrite::new(vec![harness.transition]),
+                    )),
                 },
                 None,
             ))
@@ -2795,11 +2743,9 @@ mod tests {
                         new_fragments: destinations.clone(),
                     }],
                     rewritten_indices: vec![],
-                    frag_reuse_index: None,
-                    frag_reuse_rewrite: Some(FragmentReuseRewrite {
-                        transitions: vec![transition.clone()],
-                        base_entry_version: None,
-                    }),
+                    frag_reuse: Some(FragReuseUpdate::AppendTransitions(
+                        FragmentReuseRewrite::new(vec![transition.clone()]),
+                    )),
                 },
                 None,
             ))
@@ -3134,11 +3080,9 @@ mod tests {
                         new_fragments: vec![destination.clone()],
                     }],
                     rewritten_indices: vec![],
-                    frag_reuse_index: None,
-                    frag_reuse_rewrite: Some(FragmentReuseRewrite {
-                        transitions: vec![transition.clone()],
-                        base_entry_version: None,
-                    }),
+                    frag_reuse: Some(FragReuseUpdate::AppendTransitions(
+                        FragmentReuseRewrite::new(vec![transition.clone()]),
+                    )),
                 },
                 None,
             ))
@@ -3161,11 +3105,9 @@ mod tests {
                         new_fragments: vec![destination],
                     }],
                     rewritten_indices: vec![],
-                    frag_reuse_index: None,
-                    frag_reuse_rewrite: Some(FragmentReuseRewrite {
-                        transitions: vec![transition],
-                        base_entry_version: None,
-                    }),
+                    frag_reuse: Some(FragReuseUpdate::AppendTransitions(
+                        FragmentReuseRewrite::new(vec![transition]),
+                    )),
                 },
                 None,
             ))
@@ -3212,11 +3154,9 @@ mod tests {
                         new_fragments: vec![destination],
                     }],
                     rewritten_indices: vec![],
-                    frag_reuse_index: None,
-                    frag_reuse_rewrite: Some(FragmentReuseRewrite {
-                        transitions: vec![transition],
-                        base_entry_version: None,
-                    }),
+                    frag_reuse: Some(FragReuseUpdate::AppendTransitions(
+                        FragmentReuseRewrite::new(vec![transition]),
+                    )),
                 },
                 None,
             ))
@@ -3282,11 +3222,9 @@ mod tests {
                         new_fragments: vec![destination],
                     }],
                     rewritten_indices: vec![],
-                    frag_reuse_index: None,
-                    frag_reuse_rewrite: Some(FragmentReuseRewrite {
-                        transitions: vec![transition],
-                        base_entry_version: None,
-                    }),
+                    frag_reuse: Some(FragReuseUpdate::AppendTransitions(
+                        FragmentReuseRewrite::new(vec![transition]),
+                    )),
                 },
                 None,
             ))
@@ -3320,11 +3258,9 @@ mod tests {
                         new_fragments: vec![destination],
                     }],
                     rewritten_indices: vec![],
-                    frag_reuse_index: None,
-                    frag_reuse_rewrite: Some(FragmentReuseRewrite {
-                        transitions: vec![transition],
-                        base_entry_version: None,
-                    }),
+                    frag_reuse: Some(FragReuseUpdate::AppendTransitions(
+                        FragmentReuseRewrite::new(vec![transition]),
+                    )),
                 },
                 None,
             ))
@@ -3387,11 +3323,9 @@ mod tests {
                         },
                     ],
                     rewritten_indices: vec![],
-                    frag_reuse_index: None,
-                    frag_reuse_rewrite: Some(FragmentReuseRewrite {
-                        transitions: vec![sp_transition, oc_transition],
-                        base_entry_version: None,
-                    }),
+                    frag_reuse: Some(FragReuseUpdate::AppendTransitions(
+                        FragmentReuseRewrite::new(vec![sp_transition, oc_transition]),
+                    )),
                 },
                 None,
             ))
