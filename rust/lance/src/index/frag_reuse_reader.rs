@@ -45,7 +45,12 @@ pub(super) async fn load_indices(
         if !super::index_is_usable(index) {
             continue;
         }
-        if index.name == lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME {
+        // System indices are table-level metadata, not per-fragment query
+        // segments: they carry no fragment coverage (MemWAL stores
+        // `fragment_bitmap: None`) and have no remap plugin, so the coverage
+        // filtering below would silently drop them. Pass them through
+        // untouched.
+        if lance_table::system_index::is_system_index(index) {
             result[position] = Some(index.clone());
         } else {
             groups
@@ -1013,8 +1018,16 @@ pub mod tests {
                     .find(|i| i.name == FRAG_REUSE_INDEX_NAME)
                     .unwrap();
                 assert_eq!(fri.index_version, 0);
-                assert_eq!(dataset.manifest.reader_feature_flags & 512, 0);
-                assert_eq!(dataset.manifest.writer_feature_flags & 512, 0);
+                assert_eq!(
+                    dataset.manifest.reader_feature_flags
+                        & lance_table::feature_flags::FLAG_FRAGMENT_REUSE_INDEX,
+                    0
+                );
+                assert_eq!(
+                    dataset.manifest.writer_feature_flags
+                        & lance_table::feature_flags::FLAG_FRAGMENT_REUSE_INDEX,
+                    0
+                );
                 assert_eq!(dataset.count_rows(Some("i = 2".into())).await.unwrap(), 1);
                 assert!(
                     dataset
@@ -1267,8 +1280,16 @@ pub mod tests {
                         .find(|i| i.name == FRAG_REUSE_INDEX_NAME)
                         .unwrap();
                     assert_eq!(fri.index_version, 0);
-                    assert_eq!(snapshot.manifest.reader_feature_flags & 512, 0);
-                    assert_eq!(snapshot.manifest.writer_feature_flags & 512, 0);
+                    assert_eq!(
+                        snapshot.manifest.reader_feature_flags
+                            & lance_table::feature_flags::FLAG_FRAGMENT_REUSE_INDEX,
+                        0
+                    );
+                    assert_eq!(
+                        snapshot.manifest.writer_feature_flags
+                            & lance_table::feature_flags::FLAG_FRAGMENT_REUSE_INDEX,
+                        0
+                    );
                     assert!(
                         snapshot
                             .open_frag_reuse_index(&metrics)
