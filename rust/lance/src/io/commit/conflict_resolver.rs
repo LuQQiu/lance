@@ -2,7 +2,8 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use crate::dataset::index::frag_reuse::{
-    TaggedTrimOutcome, derive_tagged_trim, is_tagged_trim_operation,
+    TaggedTrimOutcome, derive_superseded_segments, derive_tagged_trim,
+    is_superseded_prune_transaction, is_tagged_trim_operation,
 };
 use crate::index::DatasetIndexExt;
 use crate::index::frag_reuse::{
@@ -2201,6 +2202,8 @@ impl<'a> TransactionRebase<'a> {
     }
 
     async fn finish_create_index(mut self, dataset: &Dataset) -> Result<Transaction> {
+        // Computed before the operation is borrowed mutably below.
+        let self_is_superseded_prune = is_superseded_prune_transaction(&self.transaction);
         if let Operation::CreateIndex {
             new_indices,
             removed_indices,
@@ -2239,6 +2242,32 @@ impl<'a> TransactionRebase<'a> {
                         *removed_indices = vec![current_entry];
                     }
                 }
+                return Ok(self.transaction);
+            }
+
+            // A superseded-segment prune's removal of a segment is justified
+            // by the coverage of kept same-name siblings, and a concurrent
+            // commit can withdraw exactly that justification without touching
+            // any segment in the removal set (e.g. a remap swap replacing a
+            // kept sibling with a narrower-coverage one), so no conflict
+            // predicate fires. Re-committing the original removal set after
+            // such a rebase would silently drop index coverage. Mirror the
+            // tagged trim: whenever this attempt builds on a version newer
+            // than the one it read, re-derive the removal set wholesale
+            // against the current manifest, and when nothing is superseded
+            // anymore abort with a marker conflict instead of writing an
+            // empty no-op version; `prune_superseded_segments` treats exactly
+            // that conflict as success.
+            if self_is_superseded_prune && dataset.manifest.version != self.transaction.read_version
+            {
+                let rederived = derive_superseded_segments(dataset).await?;
+                if rederived.is_empty() {
+                    return Err(Error::retryable_commit_conflict_source(
+                        dataset.manifest.version,
+                        crate::dataset::index::frag_reuse::SUPERSEDED_PRUNE_REBASED_TO_NOOP.into(),
+                    ));
+                }
+                *removed_indices = rederived;
                 return Ok(self.transaction);
             }
 

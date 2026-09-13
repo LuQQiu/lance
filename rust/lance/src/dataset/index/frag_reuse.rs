@@ -5,7 +5,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use crate::Dataset;
-use crate::dataset::transaction::{Operation, Transaction};
+use crate::dataset::transaction::{Operation, Transaction, TransactionBuilder};
 use crate::index::DatasetIndexInternalExt;
 use crate::index::frag_reuse::{
     build_frag_reuse_index_metadata, build_tagged_frag_reuse_entry,
@@ -270,6 +270,47 @@ fn is_index_remap_caught_up(
 pub(crate) const TAGGED_TRIM_REBASED_TO_NOOP: &str =
     "the tagged trim rebased to nothing to trim; a concurrent commit already satisfied it";
 
+/// Conflict-source marker for a superseded-segment prune whose rebase derived
+/// nothing left to remove: a concurrent commit changed the coverage the
+/// original removal set relied on (or already removed the segments), so
+/// instead of writing an empty no-op manifest version the commit attempt
+/// aborts with a retryable conflict carrying this message, and
+/// [`prune_superseded_segments`] treats exactly that conflict as success.
+pub(crate) const SUPERSEDED_PRUNE_REBASED_TO_NOOP: &str = "the superseded-segment prune rebased to nothing to remove; \
+     a concurrent commit changed the coverage it relied on";
+
+/// Transaction property marking a removal-only `CreateIndex` as a
+/// superseded-segment prune.
+///
+/// The shape alone (removals, no creations) is ambiguous: `drop_index`
+/// commits exactly the same operation, and re-deriving a user's drop as a
+/// prune would resurrect indexes they asked to remove. The explicit property
+/// travels with the transaction through the commit loop, so the conflict
+/// resolver's `finish_create_index` can recognize the prune and re-derive its
+/// removal set against the current manifest whenever the attempt builds on a
+/// version newer than the one it read. Without that, a rebase over a
+/// non-conflicting concurrent commit (e.g. a remap swap narrowing a sibling's
+/// coverage) would re-commit the stale removal set and silently drop index
+/// coverage.
+pub(crate) const SUPERSEDED_PRUNE_PROPERTY: &str = "__lance.frag_reuse.superseded_prune";
+
+/// Whether a transaction is a superseded-segment prune: marked with
+/// [`SUPERSEDED_PRUNE_PROPERTY`] and shaped as a pure removal.
+pub(crate) fn is_superseded_prune_transaction(transaction: &Transaction) -> bool {
+    let has_marker = transaction
+        .transaction_properties
+        .as_ref()
+        .is_some_and(|props| props.contains_key(SUPERSEDED_PRUNE_PROPERTY));
+    has_marker
+        && matches!(
+            &transaction.operation,
+            Operation::CreateIndex {
+                new_indices,
+                removed_indices,
+            } if new_indices.is_empty() && !removed_indices.is_empty()
+        )
+}
+
 /// The outcome of deriving a tagged trim against the current manifest.
 #[derive(Debug)]
 pub(crate) enum TaggedTrimOutcome {
@@ -408,19 +449,36 @@ async fn prune_superseded_segments(dataset: &mut Dataset) -> lance_core::Result<
         if removals.is_empty() {
             return Ok(());
         }
-        let transaction = Transaction::new(
+        let transaction = TransactionBuilder::new(
             dataset.manifest.version,
             Operation::CreateIndex {
                 new_indices: vec![],
                 removed_indices: removals,
             },
-            None,
-        );
+        )
+        // The marker lets `finish_create_index` recognize this shape (which
+        // is otherwise indistinguishable from `drop_index`) and re-derive
+        // the removal set whenever the commit rebases over a concurrent
+        // commit; see `SUPERSEDED_PRUNE_PROPERTY`.
+        .transaction_properties(Some(Arc::new(HashMap::from([(
+            SUPERSEDED_PRUNE_PROPERTY.to_string(),
+            "true".to_string(),
+        )]))))
+        .build();
         match dataset
             .apply_commit(transaction, &Default::default(), &Default::default())
             .await
         {
             Ok(()) => return Ok(()),
+            Err(error @ Error::RetryableCommitConflict { .. })
+                if error.to_string().contains(SUPERSEDED_PRUNE_REBASED_TO_NOOP) =>
+            {
+                // The rebase found nothing left to remove: a concurrent
+                // commit changed the coverage the removal relied on, so this
+                // maintenance run succeeds without writing a version.
+                dataset.checkout_latest().await?;
+                return Ok(());
+            }
             Err(error @ Error::RetryableCommitConflict { .. }) => {
                 dataset.checkout_latest().await?;
                 last_conflict = Some(error);
@@ -1754,6 +1812,115 @@ mod tests {
             assert_eq!(
                 dataset.count_rows(Some("i >= 4".into())).await.unwrap(),
                 before_filtered
+            );
+        }
+
+        /// Union of the coverage the reader attributes to the usable
+        /// segments of `name`, restricted to live fragments.
+        async fn covered_fragments(dataset: &Dataset, name: &str) -> roaring::RoaringBitmap {
+            let live = dataset.fragment_bitmap.as_ref();
+            let mut covered = roaring::RoaringBitmap::new();
+            for index in dataset.load_indices().await.unwrap().iter() {
+                if index.name == name
+                    && let Some(bitmap) = index.fragment_bitmap.as_ref()
+                {
+                    covered |= bitmap & live;
+                }
+            }
+            covered
+        }
+
+        /// Replace the segment `uuid` of `name` with an identical one whose
+        /// stored coverage narrows to `covered` -- the shape a tagged remap
+        /// swap commits when the reader attributes less coverage to the
+        /// segment than its stored bitmap claimed.
+        async fn narrow_segment_bitmap(
+            dataset: &mut Dataset,
+            name: &str,
+            uuid: Uuid,
+            covered: &[u32],
+        ) {
+            let original = stored_segments(dataset, name)
+                .await
+                .into_iter()
+                .find(|segment| segment.uuid == uuid)
+                .unwrap();
+            let mut narrowed = original.clone();
+            narrowed.fragment_bitmap = Some(covered.iter().copied().collect());
+            dataset
+                .apply_commit(
+                    Transaction::new(
+                        dataset.manifest.version,
+                        Operation::CreateIndex {
+                            new_indices: vec![narrowed],
+                            removed_indices: vec![original],
+                        },
+                        None,
+                    ),
+                    &Default::default(),
+                    &Default::default(),
+                )
+                .await
+                .unwrap();
+        }
+
+        /// Residual race: the prune removes the old segment because the kept
+        /// delta's coverage justifies it, and a concurrent commit replaces
+        /// the delta with a narrower-coverage segment (the shape a tagged
+        /// remap swap commits). Neither side removes the other's UUID, so no
+        /// conflict predicate fires and the prune's commit rebases over the
+        /// replacement; re-committing the stale removal would drop the old
+        /// segment while its justification was withdrawn, silently losing
+        /// all index coverage of destination 11. The rebase must re-derive:
+        /// nothing is prunable against the narrowed delta, so the old
+        /// segment survives and the prune writes no version.
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn prune_rederives_over_concurrent_coverage_narrowing() {
+            let mut dataset = reader_tests::fixture().await;
+            reserve_fragments(&mut dataset, 20).await;
+            let source_ids: Vec<u64> = dataset.fragments().iter().map(|f| f.id).collect();
+            let mut dataset = commit_stable_partition(dataset, &source_ids, 10).await;
+            let old_segment = stored_segments(&dataset, "i_idx").await[0].clone();
+            let delta = commit_delta_segment(&mut dataset, None).await;
+
+            // The prune's read: the old segment is superseded by the delta.
+            assert_eq!(
+                derive_superseded_segments(&dataset)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .map(|segment| segment.uuid)
+                    .collect::<Vec<_>>(),
+                vec![old_segment.uuid]
+            );
+            let covered_before = covered_fragments(&dataset, "i_idx").await;
+
+            let mut stale = dataset.clone();
+            // Concurrent replacement: the delta's coverage narrows to
+            // destination 10, withdrawing the justification for pruning the
+            // old segment (which alone still reaches destination 11 through
+            // the transition chain).
+            narrow_segment_bitmap(&mut dataset, "i_idx", delta, &[10]).await;
+            let expected_version = dataset.manifest.version;
+
+            prune_superseded_segments(&mut stale).await.unwrap();
+
+            stale.checkout_latest().await.unwrap();
+            assert_eq!(
+                stale.manifest.version, expected_version,
+                "the rebased no-op prune must not write a version"
+            );
+            let segments = stored_segments(&stale, "i_idx").await;
+            assert!(
+                segments.iter().any(|s| s.uuid == old_segment.uuid),
+                "the rebased prune must keep the segment whose justifying coverage was withdrawn"
+            );
+            let covered_after = covered_fragments(&stale, "i_idx").await;
+            assert!(
+                covered_before.is_subset(&covered_after),
+                "every fragment covered before the race must stay covered: \
+                 before {covered_before:?}, after {covered_after:?}"
             );
         }
 
