@@ -3255,6 +3255,31 @@ impl Dataset {
         Ok(())
     }
 
+    /// Shared clone-target preflight for `shallow_clone` and `deep_clone`:
+    /// permit the clone only when the target definitively holds no dataset.
+    /// Only the codebase-wide "dataset absent" pair passes: the built-in
+    /// resolver reports an empty `_versions/` listing as `NotFound`, while
+    /// handlers with an external source of truth use `DatasetNotFound` (the
+    /// same discrimination the write path's destination probe applies). Any
+    /// other resolver failure (storage, auth, corrupt manifest listing)
+    /// propagates instead of letting the clone write into a target it failed
+    /// to inspect.
+    async fn ensure_clone_target_absent(
+        commit_handler: &dyn CommitHandler,
+        target_base: &Path,
+        target_store: &ObjectStore,
+        target_path: &str,
+    ) -> Result<()> {
+        match commit_handler
+            .resolve_latest_location(target_base, target_store)
+            .await
+        {
+            Ok(_) => Err(Error::dataset_already_exists(target_path.to_string())),
+            Err(Error::NotFound { .. } | Error::DatasetNotFound { .. }) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Shallow clone the target version into a new dataset at target_path.
     /// 'target_path': the uri string to clone the dataset into.
     /// 'version': the version cloned from, could be a version number or tag.
@@ -3271,27 +3296,16 @@ impl Dataset {
         // ahead of the manifest commit, which must not pollute a live
         // dataset. The check goes through the same store and commit handler
         // the commit below writes through. Only a definitive "no dataset
-        // here" permits the clone: any other resolver failure (storage,
-        // auth, corrupt manifest listing) propagates instead of letting the
-        // clone write into a target it failed to inspect.
+        // here" permits the clone; see `ensure_clone_target_absent`.
         let target_base =
             ObjectStore::extract_path_from_uri(self.session.store_registry(), target_path)?;
-        match self
-            .commit_handler
-            .resolve_latest_location(&target_base, &self.object_store)
-            .await
-        {
-            Ok(_) => {
-                return Err(Error::dataset_already_exists(target_path.to_string()));
-            }
-            // The codebase-wide "dataset absent" pair: the built-in resolver
-            // reports an empty `_versions/` listing as `NotFound`, while
-            // handlers with an external source of truth use
-            // `DatasetNotFound` (the same discrimination the write path's
-            // destination probe applies).
-            Err(Error::NotFound { .. } | Error::DatasetNotFound { .. }) => {}
-            Err(error) => return Err(error),
-        }
+        Self::ensure_clone_target_absent(
+            self.commit_handler.as_ref(),
+            &target_base,
+            &self.object_store,
+            target_path,
+        )
+        .await?;
 
         let (ref_name, version_number) = self.resolve_reference(version.into()).await?;
         let source_location = self.branch_location().find_branch(ref_name.as_deref())?;
@@ -3360,15 +3374,16 @@ impl Dataset {
         )
         .await?;
 
-        // Prevent cloning into an existing target dataset
-        if self
-            .commit_handler
-            .resolve_latest_location(&target_base, &target_store)
-            .await
-            .is_ok()
-        {
-            return Err(Error::dataset_already_exists(target_path.to_string()));
-        }
+        // Prevent cloning into an existing target dataset. Only a definitive
+        // "no dataset here" permits the clone; see
+        // `ensure_clone_target_absent`.
+        Self::ensure_clone_target_absent(
+            self.commit_handler.as_ref(),
+            &target_base,
+            &target_store,
+            target_path,
+        )
+        .await?;
 
         let build_absolute_path = |relative_path: &str, base: &Path| -> Path {
             let mut path = base.clone();

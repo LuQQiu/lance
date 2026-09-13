@@ -2947,6 +2947,10 @@ mod tests {
     mod shallow_clone {
         use super::*;
         use futures::TryStreamExt;
+        use lance_table::io::commit::{
+            CommitError, CommitHandler, ManifestLocation, ManifestNamingScheme, ManifestWriter,
+            RenameCommitHandler,
+        };
 
         /// An on-disk two-fragment dataset with a committed scalar index.
         pub(super) async fn disk_fixture(uri: &str) -> Dataset {
@@ -3101,6 +3105,55 @@ mod tests {
             load_raw_frag_reuse_content(dataset, &stored_fri(&stored))
                 .await
                 .unwrap()
+        }
+
+        /// Delegates everything except latest-location resolution, which
+        /// fails with a non-NotFound error for base paths ending in
+        /// `fail_suffix`. Shared by the shallow- and deep-clone preflight
+        /// tests.
+        #[derive(Debug)]
+        pub(super) struct FailingResolver {
+            pub(super) inner: RenameCommitHandler,
+            pub(super) fail_suffix: &'static str,
+        }
+
+        #[async_trait::async_trait]
+        impl CommitHandler for FailingResolver {
+            async fn resolve_latest_location(
+                &self,
+                base_path: &Path,
+                object_store: &ObjectStore,
+            ) -> lance_core::Result<ManifestLocation> {
+                if base_path.as_ref().ends_with(self.fail_suffix) {
+                    return Err(Error::io("injected resolver outage"));
+                }
+                self.inner
+                    .resolve_latest_location(base_path, object_store)
+                    .await
+            }
+
+            async fn commit(
+                &self,
+                manifest: &mut Manifest,
+                indices: Option<Vec<IndexMetadata>>,
+                base_path: &Path,
+                object_store: &ObjectStore,
+                manifest_writer: ManifestWriter,
+                naming_scheme: ManifestNamingScheme,
+                transaction: Option<lance_table::format::Transaction>,
+            ) -> std::result::Result<ManifestLocation, CommitError> {
+                self.inner
+                    .commit(
+                        manifest,
+                        indices,
+                        base_path,
+                        object_store,
+                        manifest_writer,
+                        naming_scheme,
+                        transaction,
+                    )
+                    .await
+            }
         }
 
         /// Test 1: cloning a tagged table relocates the row-map references
@@ -3736,58 +3789,6 @@ mod tests {
         #[tokio::test]
         #[serial_test::serial(frag_reuse_maintenance)]
         async fn clone_preflight_propagates_resolver_errors() {
-            use lance_table::io::commit::{
-                CommitError, CommitHandler, ManifestLocation, ManifestNamingScheme, ManifestWriter,
-                RenameCommitHandler,
-            };
-
-            /// Delegates everything except latest-location resolution, which
-            /// fails with a non-NotFound error for the poisoned target path.
-            #[derive(Debug)]
-            struct FailingResolver {
-                inner: RenameCommitHandler,
-                fail_suffix: &'static str,
-            }
-
-            #[async_trait::async_trait]
-            impl CommitHandler for FailingResolver {
-                async fn resolve_latest_location(
-                    &self,
-                    base_path: &Path,
-                    object_store: &ObjectStore,
-                ) -> lance_core::Result<ManifestLocation> {
-                    if base_path.as_ref().ends_with(self.fail_suffix) {
-                        return Err(Error::io("injected resolver outage"));
-                    }
-                    self.inner
-                        .resolve_latest_location(base_path, object_store)
-                        .await
-                }
-
-                async fn commit(
-                    &self,
-                    manifest: &mut Manifest,
-                    indices: Option<Vec<IndexMetadata>>,
-                    base_path: &Path,
-                    object_store: &ObjectStore,
-                    manifest_writer: ManifestWriter,
-                    naming_scheme: ManifestNamingScheme,
-                    transaction: Option<lance_table::format::Transaction>,
-                ) -> std::result::Result<ManifestLocation, CommitError> {
-                    self.inner
-                        .commit(
-                            manifest,
-                            indices,
-                            base_path,
-                            object_store,
-                            manifest_writer,
-                            naming_scheme,
-                            transaction,
-                        )
-                        .await
-                }
-            }
-
             let source_dir = lance_core::utils::tempfile::TempStrDir::default();
             let clone_dir = lance_core::utils::tempfile::TempStrDir::default();
             let clone_uri = format!("{}/flaky-target", clone_dir.as_str());
@@ -3887,8 +3888,8 @@ mod tests {
 
     mod deep_clone {
         use super::shallow_clone::{
-            commit_big_v0_entry, commit_stable_partition, disk_fixture, list_fri_map_dirs,
-            stable_partition_bases,
+            FailingResolver, commit_big_v0_entry, commit_stable_partition, disk_fixture,
+            list_fri_map_dirs, stable_partition_bases,
         };
         use super::*;
 
@@ -4123,6 +4124,91 @@ mod tests {
             );
             assert!(list_fri_map_dirs(&clone).await.is_empty());
             assert_eq!(sorted_values(&clone).await, before);
+        }
+
+        /// Test 5: deep-cloning onto an occupied target is rejected before
+        /// anything is copied there, and the occupied dataset is untouched.
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn deep_clone_onto_existing_dataset_rejected() {
+            let source_dir = lance_core::utils::tempfile::TempStrDir::default();
+            let target_dir = lance_core::utils::tempfile::TempStrDir::default();
+            let target_uri = format!("{}/occupied", target_dir.as_str());
+            let mut dataset = disk_fixture(source_dir.as_str()).await;
+            reserve_fragments(&mut dataset, 20).await;
+            let source_ids: Vec<u64> = dataset.fragments().iter().map(|f| f.id).collect();
+            let mut dataset = commit_stable_partition(dataset, &source_ids, 10).await;
+
+            let occupied = lance_datagen::gen_batch()
+                .col("j", lance_datagen::array::step::<Int32Type>())
+                .into_dataset(
+                    target_uri.as_str(),
+                    crate::utils::test::FragmentCount::from(1),
+                    crate::utils::test::FragmentRowCount::from(4),
+                )
+                .await
+                .unwrap();
+            let occupied_version = occupied.manifest.version;
+
+            let version = dataset.manifest.version;
+            let error = dataset
+                .deep_clone(target_uri.as_str(), version, None)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, Error::DatasetAlreadyExists { .. }),
+                "{error}"
+            );
+            // The occupied dataset is untouched.
+            let reopened = Dataset::open(target_uri.as_str()).await.unwrap();
+            assert_eq!(reopened.manifest.version, occupied_version);
+        }
+
+        /// Test 6 (mirror of the shallow-clone test): the target preflight
+        /// only lets a definitive "no dataset here" resolution permit the
+        /// clone: any other resolver failure (storage, auth, corrupt
+        /// listing) aborts before anything is copied, instead of treating an
+        /// uninspectable target as absent.
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn deep_clone_preflight_propagates_resolver_errors() {
+            use lance_table::io::commit::RenameCommitHandler;
+
+            let source_dir = lance_core::utils::tempfile::TempStrDir::default();
+            let clone_dir = lance_core::utils::tempfile::TempStrDir::default();
+            let clone_uri = format!("{}/flaky-target", clone_dir.as_str());
+            // Build the tagged source normally, then reopen it with the
+            // failing resolver installed as its commit handler.
+            let mut dataset = disk_fixture(source_dir.as_str()).await;
+            reserve_fragments(&mut dataset, 20).await;
+            let source_ids: Vec<u64> = dataset.fragments().iter().map(|f| f.id).collect();
+            let dataset = commit_stable_partition(dataset, &source_ids, 10).await;
+            let version = dataset.manifest.version;
+            drop(dataset);
+            let mut dataset =
+                crate::dataset::builder::DatasetBuilder::from_uri(source_dir.as_str())
+                    .with_read_params(crate::dataset::ReadParams {
+                        commit_handler: Some(Arc::new(FailingResolver {
+                            inner: RenameCommitHandler,
+                            fail_suffix: "flaky-target",
+                        })),
+                        ..Default::default()
+                    })
+                    .load()
+                    .await
+                    .unwrap();
+
+            let error = dataset
+                .deep_clone(clone_uri.as_str(), version, None)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, Error::IO { .. }), "{error}");
+            assert!(
+                error.to_string().contains("injected resolver outage"),
+                "{error}"
+            );
+            // The clone did not proceed: nothing was written to the target.
+            assert!(!std::path::Path::new(clone_uri.as_str()).exists());
         }
     }
 
