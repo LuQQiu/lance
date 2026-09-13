@@ -3348,12 +3348,8 @@ impl Dataset {
         // Resolve source dataset and its manifest using checkout_version
         let src_ds = self.checkout_version(version).await?;
         ensure_can_write_manifest(&src_ds.manifest)?;
-        lance_table::system_index::frag_reuse::metadata::ensure_deep_clone_supported(
-            &src_ds.object_store,
-            &src_ds.manifest_location,
-            &src_ds.manifest,
-        )
-        .await?;
+        // Rejects a tagged FRI history this writer cannot fully interpret
+        // before anything is copied or written to the target.
         let src_paths = src_ds.collect_paths().await?;
 
         // Prepare target object store and base path
@@ -3525,6 +3521,16 @@ impl Dataset {
         .await?;
 
         for index in &indices {
+            if lance_table::system_index::frag_reuse::metadata::is_tagged(index) {
+                // The clone commit rewrites a tagged FRI entry under a fresh
+                // uuid with local references (its details spill included), so
+                // the entry's own `_indices/<uuid>/` directory is not copied;
+                // the row maps it references are, into the clone's `_fri/`.
+                file_paths.extend(
+                    crate::index::frag_reuse::collect_tagged_row_map_paths(self, index).await?,
+                );
+                continue;
+            }
             let base_root = if let Some(base_id) = index.base_id {
                 let base_path = self
                     .manifest

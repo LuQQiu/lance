@@ -1439,17 +1439,26 @@ fn patch_stable_partition_base(
     Ok(output)
 }
 
-/// Relocate a tagged FRI entry for a shallow clone.
+/// How a clone restamps the stable-partition `base_id`s it relocates.
+pub(crate) enum CloneBaseRemap {
+    /// Shallow clone: row-map files stay where they are.
+    /// `Manifest::shallow_clone` carries the source's `base_paths` ids over
+    /// verbatim and adds `new_base_id` for the source's own base, so `None`
+    /// becomes `Some(new_base_id)` and `Some(id)` stays `id`.
+    Shallow { new_base_id: u32 },
+    /// Deep clone: every referenced row map is copied into the clone's own
+    /// `_fri/` (see [`collect_tagged_row_map_paths`]), so every reference
+    /// becomes local: any stamp clears to unset.
+    Deep,
+}
+
+/// Relocate a tagged FRI entry for a clone.
 ///
 /// The source entry's content is resolved base-aware (a chained clone's entry
 /// or details file may live in one of the source's own bases), its
 /// stable-partition references are restamped through the clone's base mapping
-/// (`Manifest::shallow_clone` carries the source's `base_paths` ids over
-/// verbatim and adds `new_base_id` for the source's own base, so `None`
-/// becomes `Some(new_base_id)` and `Some(id)` stays `id`), and the relocated
-/// content is written into the CLONE under a fresh uuid with `base_id: None`.
-/// Row-map files are NOT copied: the relocated references keep resolving them
-/// from the bases they live in.
+/// (per [`CloneBaseRemap`]), and the relocated content is written into the
+/// CLONE under a fresh uuid with `base_id: None`.
 ///
 /// A history this writer cannot fully interpret (unsupported transitions or
 /// unknown records) is refused with `NotSupported` before anything is
@@ -1459,13 +1468,13 @@ fn patch_stable_partition_base(
 /// file in the target, that file's path so a failed clone commit can delete
 /// it again.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn relocate_tagged_entry_for_shallow_clone(
+pub(crate) async fn relocate_tagged_entry_for_clone(
     source_store: &ObjectStore,
     source_base: &Path,
     source_manifest: &Manifest,
     store_registry: Arc<ObjectStoreRegistry>,
     entry: &IndexMetadata,
-    new_base_id: u32,
+    base_remap: CloneBaseRemap,
     target_store: &ObjectStore,
     target_base: &Path,
 ) -> lance_core::Result<(IndexMetadata, Option<Path>)> {
@@ -1539,22 +1548,27 @@ pub(crate) async fn relocate_tagged_entry_for_shallow_clone(
         ));
     }
 
-    let relocated = relocate_stable_partition_bases(&content, |base_id| match base_id {
-        // The source's own base gets the id the clone assigned to it.
-        None => Ok(Some(new_base_id)),
-        // The clone carries the source's `base_paths` entries over under the
-        // same ids, so a foreign-base reference keeps its id; it must exist.
-        Some(id) => {
-            if source_manifest.base_paths.contains_key(&id) {
-                Ok(Some(id))
-            } else {
-                Err(Error::corrupt_file_named(
-                    "FRI details",
-                    format!("stable partition mapping references missing base {id}"),
-                ))
+    let relocated =
+        relocate_stable_partition_bases(&content, |base_id| match (&base_remap, base_id) {
+            // Deep clone materializes every referenced map into the clone's
+            // own `_fri/`, so every stamp clears to unset.
+            (CloneBaseRemap::Deep, _) => Ok(None),
+            // The source's own base gets the id the clone assigned to it.
+            (CloneBaseRemap::Shallow { new_base_id }, None) => Ok(Some(*new_base_id)),
+            // The clone carries the source's `base_paths` entries over under
+            // the same ids, so a foreign-base reference keeps its id; it
+            // must exist.
+            (CloneBaseRemap::Shallow { .. }, Some(id)) => {
+                if source_manifest.base_paths.contains_key(&id) {
+                    Ok(Some(id))
+                } else {
+                    Err(Error::corrupt_file_named(
+                        "FRI details",
+                        format!("stable partition mapping references missing base {id}"),
+                    ))
+                }
             }
-        }
-    })?;
+        })?;
     // The relocated history must still decode as a well-formed ledger.
     decode_frag_reuse_ledger_from_content(entry.index_version, &relocated).await?;
 
@@ -1589,6 +1603,101 @@ pub(crate) async fn relocate_tagged_entry_for_shallow_clone(
         },
         spilled,
     ))
+}
+
+/// The copy work a deep clone owes a tagged FRI entry: every file of every
+/// `_fri/<map_id>/` row map the history references, resolved through the
+/// manifest's `base_paths` (a chained shallow-then-deep clone finds maps
+/// living in ancestor bases), as `(relative_path, base_root)` pairs for
+/// `deep_clone`'s copy loop. Map ids are UUIDs minted at rewrite time, so
+/// the copies land in the target's fresh `_fri/` namespace collision-free.
+///
+/// A history this writer cannot fully interpret (an unknown mapping kind or
+/// an unknown envelope record) is refused with `NotSupported` before
+/// anything is copied: an unknown record may reference row maps this writer
+/// cannot enumerate, and copying an incomplete set would fabricate a
+/// silently broken "independent" table. This is the same obligation the
+/// shallow-clone relocation honors, with the same error.
+pub(crate) async fn collect_tagged_row_map_paths(
+    dataset: &Dataset,
+    entry: &IndexMetadata,
+) -> lance_core::Result<Vec<(String, Path)>> {
+    use futures::TryStreamExt;
+    use lance_table::system_index::frag_reuse::ledger::Mapping;
+
+    let ledger = decode_frag_reuse_ledger(dataset, entry).await?;
+    if ledger.has_unsupported_transitions() {
+        return Err(Error::not_supported(
+            "the fragment reuse history contains mappings this writer cannot relocate; \
+             upgrade to a newer version of Lance before cloning this table",
+        ));
+    }
+
+    let mut seen: HashSet<(Option<u32>, &str)> = HashSet::new();
+    let mut paths = Vec::new();
+    for transition in ledger.transitions() {
+        let Mapping::StablePartition(reference) = transition.mapping() else {
+            continue;
+        };
+        if !seen.insert((reference.base_id, reference.map_id.as_str())) {
+            continue;
+        }
+        // The same base-aware resolution the reader opens the map with.
+        let base_root = match reference.base_id {
+            None => dataset.base.clone(),
+            Some(id) => dataset
+                .manifest
+                .base_paths
+                .get(&id)
+                .ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "mapping {} references missing base {id}",
+                        reference.map_id
+                    ))
+                })?
+                .extract_path(dataset.session.store_registry())?,
+        };
+        let map_dir = base_root
+            .clone()
+            .join("_fri")
+            .join(reference.map_id.as_str());
+        let mut found = false;
+        let mut stream = dataset.object_store.read_dir_all(&map_dir, None);
+        loop {
+            match stream.try_next().await {
+                Ok(Some(meta)) => {
+                    let relative = meta
+                        .location
+                        .as_ref()
+                        .strip_prefix(map_dir.as_ref())
+                        .ok_or_else(|| {
+                            Error::internal(format!(
+                                "listing {} returned {} outside it",
+                                map_dir, meta.location
+                            ))
+                        })?
+                        .trim_start_matches('/');
+                    paths.push((
+                        format!("_fri/{}/{relative}", reference.map_id),
+                        base_root.clone(),
+                    ));
+                    found = true;
+                }
+                Ok(None) => break,
+                Err(Error::NotFound { .. }) => break,
+                Err(error) => return Err(error),
+            }
+        }
+        // A referenced map with no files cannot produce a working clone;
+        // refuse rather than commit a history that cannot translate.
+        if !found {
+            return Err(Error::corrupt_file_named(
+                "FRI details",
+                format!("row map {} has no files under its base", reference.map_id),
+            ));
+        }
+    }
+    Ok(paths)
 }
 
 #[cfg(test)]
@@ -2840,7 +2949,7 @@ mod tests {
         use futures::TryStreamExt;
 
         /// An on-disk two-fragment dataset with a committed scalar index.
-        async fn disk_fixture(uri: &str) -> Dataset {
+        pub(super) async fn disk_fixture(uri: &str) -> Dataset {
             let mut dataset = lance_datagen::gen_batch()
                 .col("i", lance_datagen::array::step::<Int32Type>())
                 .into_dataset(
@@ -2865,7 +2974,7 @@ mod tests {
 
         /// Commit one stable-partition rewrite over `source_ids`, writing its
         /// row map into the dataset's own `_fri/`.
-        async fn commit_stable_partition(
+        pub(super) async fn commit_stable_partition(
             dataset: Dataset,
             source_ids: &[u64],
             dest_base_id: u64,
@@ -2904,7 +3013,7 @@ mod tests {
         }
 
         /// The `_fri/<map_id>/` directories under the dataset's own base.
-        async fn list_fri_map_dirs(dataset: &Dataset) -> Vec<String> {
+        pub(super) async fn list_fri_map_dirs(dataset: &Dataset) -> Vec<String> {
             let prefix = dataset.base.clone().join("_fri");
             let mut ids = HashSet::new();
             let mut stream = dataset.object_store.read_dir_all(&prefix, None);
@@ -2931,7 +3040,7 @@ mod tests {
 
         /// The stable-partition `base_id`s of the entry's transitions, in
         /// lineage order.
-        fn stable_partition_bases(ledger: &FragReuseLedger) -> Vec<Option<u32>> {
+        pub(super) fn stable_partition_bases(ledger: &FragReuseLedger) -> Vec<Option<u32>> {
             ledger
                 .transitions()
                 .iter()
@@ -2944,7 +3053,7 @@ mod tests {
 
         /// Commit a v0 entry big enough (>200KB) that its lifted tagged form
         /// spills details to an external file. Returns the v0 content bytes.
-        async fn commit_big_v0_entry(dataset: &mut Dataset) -> Vec<u8> {
+        pub(super) async fn commit_big_v0_entry(dataset: &mut Dataset) -> Vec<u8> {
             let digest = |id: u64| FragDigest {
                 id,
                 physical_rows: 4,
@@ -3001,6 +3110,7 @@ mod tests {
         #[case::inline(false)]
         #[case::external(true)]
         #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
         async fn clone_relocates_row_map_references(#[case] external: bool) {
             let source_dir = lance_core::utils::tempfile::TempStrDir::default();
             let clone_dir = lance_core::utils::tempfile::TempStrDir::default();
@@ -3076,6 +3186,7 @@ mod tests {
         /// the relocated entry, mixing a source-base mapping with a
         /// clone-base one; both translation hops resolve correctly.
         #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
         async fn stable_partition_on_clone_mixes_bases() {
             let source_dir = lance_core::utils::tempfile::TempStrDir::default();
             let clone_dir = lance_core::utils::tempfile::TempStrDir::default();
@@ -3128,6 +3239,7 @@ mod tests {
         /// carried-over base id, the second hop's own-base mapping gets the
         /// freshly assigned one.
         #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
         async fn chained_clone_remaps_both_hops() {
             let source_dir = lance_core::utils::tempfile::TempStrDir::default();
             let clone_dir = lance_core::utils::tempfile::TempStrDir::default();
@@ -3343,6 +3455,7 @@ mod tests {
         #[case::unknown_transition_field(false)]
         #[case::unknown_envelope_record(true)]
         #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
         async fn clone_rejects_uninterpretable_history(#[case] envelope: bool) {
             let source_dir = lance_core::utils::tempfile::TempStrDir::default();
             let clone_dir = lance_core::utils::tempfile::TempStrDir::default();
@@ -3506,6 +3619,7 @@ mod tests {
         /// stable-partition submessage or a fragment digest (exactly the
         /// shape `base_id` itself was added in) survive byte-identically.
         #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
         async fn clone_preserves_unknown_nested_wire_fields() {
             let source_dir = lance_core::utils::tempfile::TempStrDir::default();
             let clone_dir = lance_core::utils::tempfile::TempStrDir::default();
@@ -3575,6 +3689,7 @@ mod tests {
         /// a tagged clone cannot pollute a live dataset's `_indices/` with
         /// staged details.
         #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
         async fn clone_onto_existing_dataset_rejected() {
             let source_dir = lance_core::utils::tempfile::TempStrDir::default();
             let target_dir = lance_core::utils::tempfile::TempStrDir::default();
@@ -3619,6 +3734,7 @@ mod tests {
         /// auth, corrupt listing) aborts before anything is written, instead
         /// of treating an uninspectable target as absent.
         #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
         async fn clone_preflight_propagates_resolver_errors() {
             use lance_table::io::commit::{
                 CommitError, CommitHandler, ManifestLocation, ManifestNamingScheme, ManifestWriter,
@@ -3715,6 +3831,7 @@ mod tests {
         /// `shallow_clone` rejects an occupied target before staging, so the
         /// racing case is simulated by committing the same clone twice.
         #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
         async fn failed_clone_commit_cleans_staged_details() {
             let source_dir = lance_core::utils::tempfile::TempStrDir::default();
             let clone_dir = lance_core::utils::tempfile::TempStrDir::default();
@@ -3767,6 +3884,248 @@ mod tests {
             assert_eq!(list_index_dirs(&clone).await, staged);
         }
     }
+
+    mod deep_clone {
+        use super::shallow_clone::{
+            commit_big_v0_entry, commit_stable_partition, disk_fixture, list_fri_map_dirs,
+            stable_partition_bases,
+        };
+        use super::*;
+
+        /// Test 1: deep-cloning a tagged table copies its row maps into the
+        /// clone's own `_fri/` and rewrites the entry with local references,
+        /// so the clone is truly independent of the source.
+        #[rstest::rstest]
+        #[case::inline(false)]
+        #[case::external(true)]
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn deep_clone_copies_row_maps_and_is_independent(#[case] external: bool) {
+            let source_dir = lance_core::utils::tempfile::TempStrDir::default();
+            let clone_dir = lance_core::utils::tempfile::TempStrDir::default();
+            let clone_uri = format!("{}/deep", clone_dir.as_str());
+            let mut dataset = disk_fixture(source_dir.as_str()).await;
+            let v0_content = if external {
+                commit_big_v0_entry(&mut dataset).await
+            } else {
+                Vec::new()
+            };
+            reserve_fragments(&mut dataset, 20).await;
+            let before = sorted_values(&dataset).await;
+            let source_ids: Vec<u64> = dataset.fragments().iter().map(|f| f.id).collect();
+            let mut dataset = commit_stable_partition(dataset, &source_ids, 10).await;
+            let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+            let source_entry = stored_fri(&stored);
+            assert_eq!(source_entry.index_version, 1);
+            let source_content = load_raw_frag_reuse_content(&dataset, &source_entry)
+                .await
+                .unwrap();
+            assert_eq!(source_content.len() > 204800, external);
+            let source_map_dirs = list_fri_map_dirs(&dataset).await;
+            assert_eq!(source_map_dirs.len(), 1);
+
+            let version = dataset.manifest.version;
+            let clone = dataset
+                .deep_clone(clone_uri.as_str(), version, None)
+                .await
+                .unwrap();
+
+            // The entry lives in the clone under a fresh uuid with no base
+            // stamp; the history's references were already unset (they
+            // pointed at the source's own base), so its bytes carry over
+            // unchanged.
+            let stored = crate::index::load_all_indices(&clone).await.unwrap();
+            let entry = stored_fri(&stored);
+            assert!(is_tagged(&entry));
+            assert_eq!(entry.index_version, 1);
+            assert_ne!(entry.uuid, source_entry.uuid);
+            assert_eq!(entry.base_id, None);
+            assert!(clone.manifest.base_paths.is_empty());
+            let proto = FragmentReuseIndexDetails::decode(
+                entry.index_details.as_ref().unwrap().value.as_slice(),
+            )
+            .unwrap();
+            if external {
+                // Spilled to the CLONE's own `_indices/<new uuid>/`.
+                assert!(matches!(proto.content, Some(Content::External(_))));
+            } else {
+                assert!(matches!(proto.content, Some(Content::Inline(_))));
+            }
+            let clone_content = load_raw_frag_reuse_content(&clone, &entry).await.unwrap();
+            assert!(clone_content.starts_with(&v0_content));
+            assert_eq!(clone_content, source_content);
+
+            // The row map was copied into the clone's own `_fri/` under the
+            // same map id, and every reference resolves locally.
+            assert_eq!(list_fri_map_dirs(&clone).await, source_map_dirs);
+            let ledger = decode_entry(&clone, &entry).await;
+            assert_eq!(stable_partition_bases(&ledger), vec![None]);
+
+            // Queries translate through the copied mapping, and the clone is
+            // independent: with the source deleted it still answers.
+            assert_eq!(sorted_values(&clone).await, before);
+            assert_eq!(filtered_values(&clone, "i = 3").await, vec![3]);
+            drop(dataset);
+            drop(clone);
+            std::fs::remove_dir_all(source_dir.as_str()).unwrap();
+            let clone = Dataset::open(clone_uri.as_str()).await.unwrap();
+            assert_eq!(sorted_values(&clone).await, before);
+            assert_eq!(filtered_values(&clone, "i = 3").await, vec![3]);
+            assert_eq!(filtered_values(&clone, "i >= 4").await, vec![4, 5, 6, 7]);
+        }
+
+        /// Test 2: deep clone of a shallow clone materializes the row maps
+        /// living in ancestor bases into the deep clone's own tree and
+        /// unsets every stable-partition base reference.
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn deep_clone_of_shallow_clone_materializes_parent_row_maps() {
+            let source_dir = lance_core::utils::tempfile::TempStrDir::default();
+            let clone_dir = lance_core::utils::tempfile::TempStrDir::default();
+            let shallow_uri = format!("{}/shallow", clone_dir.as_str());
+            let deep_uri = format!("{}/deep", clone_dir.as_str());
+            let mut dataset = disk_fixture(source_dir.as_str()).await;
+            reserve_fragments(&mut dataset, 40).await;
+            let before = sorted_values(&dataset).await;
+            let source_ids: Vec<u64> = dataset.fragments().iter().map(|f| f.id).collect();
+            let mut dataset = commit_stable_partition(dataset, &source_ids, 10).await;
+            let source_map_dirs = list_fri_map_dirs(&dataset).await;
+            assert_eq!(source_map_dirs.len(), 1);
+
+            let version = dataset.manifest.version;
+            let mut shallow = dataset
+                .shallow_clone(shallow_uri.as_str(), version, None)
+                .await
+                .unwrap();
+            reserve_fragments(&mut shallow, 40).await;
+            let mut shallow = commit_stable_partition(shallow, &[10, 11], 20).await;
+            let shallow_map_dirs = list_fri_map_dirs(&shallow).await;
+            assert_eq!(shallow_map_dirs.len(), 1);
+
+            let version = shallow.manifest.version;
+            let deep = shallow
+                .deep_clone(deep_uri.as_str(), version, None)
+                .await
+                .unwrap();
+
+            // Both hops' maps now live in the deep clone's own `_fri/`, and
+            // nothing references a base anymore.
+            let mut expected: Vec<String> = source_map_dirs
+                .iter()
+                .chain(shallow_map_dirs.iter())
+                .cloned()
+                .collect();
+            expected.sort();
+            assert_eq!(list_fri_map_dirs(&deep).await, expected);
+            assert!(deep.manifest.base_paths.is_empty());
+            let stored = crate::index::load_all_indices(&deep).await.unwrap();
+            let entry = stored_fri(&stored);
+            assert_eq!(entry.base_id, None);
+            let ledger = decode_entry(&deep, &entry).await;
+            assert_eq!(stable_partition_bases(&ledger), vec![None, None]);
+
+            // Fully independent of both ancestors.
+            drop(dataset);
+            drop(shallow);
+            drop(deep);
+            std::fs::remove_dir_all(source_dir.as_str()).unwrap();
+            std::fs::remove_dir_all(shallow_uri.as_str()).unwrap();
+            let deep = Dataset::open(deep_uri.as_str()).await.unwrap();
+            assert_eq!(sorted_values(&deep).await, before);
+            assert_eq!(filtered_values(&deep, "i = 3").await, vec![3]);
+            assert_eq!(filtered_values(&deep, "i >= 4").await, vec![4, 5, 6, 7]);
+        }
+
+        /// Test 3: a history this writer cannot fully interpret is refused
+        /// before anything is copied: an unknown record may reference row
+        /// maps this writer cannot enumerate, and copying an incomplete set
+        /// would fabricate a silently broken "independent" table. Same
+        /// rejection as shallow clone's, whether the opacity sits inside a
+        /// transition or beside the known records.
+        #[rstest::rstest]
+        #[case::unknown_transition_field(false)]
+        #[case::unknown_envelope_record(true)]
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn deep_clone_rejects_uninterpretable_history(#[case] envelope: bool) {
+            let source_dir = lance_core::utils::tempfile::TempStrDir::default();
+            let clone_dir = lance_core::utils::tempfile::TempStrDir::default();
+            let clone_uri = format!("{}/deep", clone_dir.as_str());
+            let mut dataset = disk_fixture(source_dir.as_str()).await;
+            let (transition, destinations) = reader_tests::prepare(&dataset).await;
+            let content = if envelope {
+                let mut content = reader_tests::field(2, &transition.encode_to_vec());
+                content.extend(reader_tests::field(3, b"future record"));
+                content
+            } else {
+                let mut raw = transition.encode_to_vec();
+                raw.extend(reader_tests::field(9, b"future mapping payload"));
+                reader_tests::field(2, &raw)
+            };
+            reader_tests::install(&mut dataset, content, destinations, false).await;
+            let indices = crate::index::load_all_indices(&dataset)
+                .await
+                .unwrap()
+                .as_ref()
+                .clone();
+            reader_tests::persist_fixture(&mut dataset, indices).await;
+
+            let version = dataset.manifest.version;
+            let error = dataset
+                .deep_clone(clone_uri.as_str(), version, None)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+            assert!(
+                error.to_string().to_lowercase().contains("upgrade"),
+                "{error}"
+            );
+            // Nothing was written at the target.
+            assert!(!std::path::Path::new(clone_uri.as_str()).exists());
+            assert_eq!(dataset.manifest.version, version);
+        }
+
+        /// Test 4: a v0 history is untouched by deep clone: the entry (uuid
+        /// included) and its details bytes carry over verbatim, and no
+        /// `_fri/` directory appears in the clone.
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn deep_clone_keeps_v0_entry_byte_identical() {
+            let source_dir = lance_core::utils::tempfile::TempStrDir::default();
+            let clone_dir = lance_core::utils::tempfile::TempStrDir::default();
+            let clone_uri = format!("{}/deep", clone_dir.as_str());
+            let mut dataset = disk_fixture(source_dir.as_str()).await;
+            let v0_content = commit_big_v0_entry(&mut dataset).await;
+            let before = sorted_values(&dataset).await;
+            // The persisted form (the manifest round-trip truncates
+            // `created_at`), which is what byte-identical carry-over yields.
+            let stored = lance_table::io::manifest::read_manifest_indexes(
+                &dataset.object_store,
+                &dataset.manifest_location,
+                &dataset.manifest,
+            )
+            .await
+            .unwrap();
+            let source_entry = stored_fri(&stored);
+            assert_eq!(source_entry.index_version, 0);
+
+            let version = dataset.manifest.version;
+            let clone = dataset
+                .deep_clone(clone_uri.as_str(), version, None)
+                .await
+                .unwrap();
+            let stored = crate::index::load_all_indices(&clone).await.unwrap();
+            let entry = stored_fri(&stored);
+            assert_eq!(entry, source_entry);
+            assert_eq!(
+                load_raw_frag_reuse_content(&clone, &entry).await.unwrap(),
+                v0_content
+            );
+            assert!(list_fri_map_dirs(&clone).await.is_empty());
+            assert_eq!(sorted_values(&clone).await, before);
+        }
+    }
+
     /// Round 8 (a): a stable-partition rewrite over a source carrying data
     /// overlay files is refused. Materialization would bake the overlaid
     /// values into the destination while indices keep translated coverage

@@ -402,16 +402,6 @@ async fn do_commit_new_dataset(
         )
         .await?;
         ensure_can_write_manifest(&source_manifest)?;
-        if !*is_shallow {
-            // Deep clone copies files without relocating row-map references;
-            // shallow clone relocates tagged FRI entries below instead.
-            lance_table::system_index::frag_reuse::metadata::ensure_deep_clone_supported(
-                source_store,
-                &source_manifest_location,
-                &source_manifest,
-            )
-            .await?;
-        }
 
         // Prepare the cloned index metadata now: an uncloneable tagged FRI
         // history must be rejected before anything is written to the target.
@@ -433,48 +423,46 @@ async fn do_commit_new_dataset(
             .max()
             .map(|id| *id + 1)
             .unwrap_or(0);
-        let updated_indices = if *is_shallow {
-            let mut updated = Vec::with_capacity(indices.len());
-            for mut index in indices {
-                if lance_table::system_index::frag_reuse::metadata::is_tagged(&index) {
-                    // Restamp the entry's row-map references through the
-                    // clone's base mapping and move the entry itself into the
-                    // clone; the row-map files stay where they are.
-                    let (relocated, spilled) =
-                        crate::index::frag_reuse::relocate_tagged_entry_for_shallow_clone(
-                            source_store,
-                            &source_base_path,
-                            &source_manifest,
-                            store_registry.clone(),
-                            &index,
-                            new_base_id,
-                            object_store,
-                            base_path,
-                        )
-                        .await?;
-                    index = relocated;
-                    spilled_clone_files.extend(spilled);
-                } else if index.base_id.is_none() {
-                    // Same rule as the data files in `Manifest::shallow_clone`:
-                    // only the source's own entries get the new base; entries
-                    // already stamped keep their ids, which carry over into
-                    // the clone's `base_paths` verbatim (a chained clone must
-                    // not restamp an origin-based index onto the middle hop).
-                    index.base_id = Some(new_base_id);
-                }
-                updated.push(index);
+        let mut updated_indices = Vec::with_capacity(indices.len());
+        for mut index in indices {
+            if lance_table::system_index::frag_reuse::metadata::is_tagged(&index) {
+                // Restamp the entry's row-map references through the clone's
+                // base mapping and move the entry itself into the clone. A
+                // shallow clone leaves the row-map files where they are; a
+                // deep clone copies them into its own `_fri/` (the copy loop
+                // in `deep_clone`), so every reference becomes local.
+                let base_remap = if *is_shallow {
+                    crate::index::frag_reuse::CloneBaseRemap::Shallow { new_base_id }
+                } else {
+                    crate::index::frag_reuse::CloneBaseRemap::Deep
+                };
+                let (relocated, spilled) =
+                    crate::index::frag_reuse::relocate_tagged_entry_for_clone(
+                        source_store,
+                        &source_base_path,
+                        &source_manifest,
+                        store_registry.clone(),
+                        &index,
+                        base_remap,
+                        object_store,
+                        base_path,
+                    )
+                    .await?;
+                index = relocated;
+                spilled_clone_files.extend(spilled);
+            } else if !*is_shallow {
+                // Deep clone: keep metadata but normalize base to local.
+                index.base_id = None;
+            } else if index.base_id.is_none() {
+                // Same rule as the data files in `Manifest::shallow_clone`:
+                // only the source's own entries get the new base; entries
+                // already stamped keep their ids, which carry over into
+                // the clone's `base_paths` verbatim (a chained clone must
+                // not restamp an origin-based index onto the middle hop).
+                index.base_id = Some(new_base_id);
             }
-            updated
-        } else {
-            // Deep clone: keep metadata but normalize base to local.
-            indices
-                .into_iter()
-                .map(|mut index| {
-                    index.base_id = None;
-                    index
-                })
-                .collect()
-        };
+            updated_indices.push(index);
+        }
         Some((source_manifest, new_base_id, updated_indices))
     } else {
         None

@@ -4,13 +4,10 @@
 //! Metadata guards for tagged fragment reuse histories.
 
 use lance_core::{Error, Result};
-use lance_io::object_store::ObjectStore;
 
 use super::FRAG_REUSE_INDEX_NAME;
 use crate::feature_flags::FLAG_FRAGMENT_REUSE_INDEX;
 use crate::format::{IndexMetadata, Manifest};
-use crate::io::commit::ManifestLocation;
-use crate::io::manifest::read_manifest_indexes;
 
 /// Whether an index entry requires the tagged FRI format contract.
 pub fn is_tagged(index: &IndexMetadata) -> bool {
@@ -44,29 +41,6 @@ pub fn validate_flags(manifest: &Manifest, indices: &[IndexMetadata]) -> Result<
         return Err(Error::corrupt_file_named(
             "manifest",
             "tagged FRI metadata requires both reader and writer feature flags",
-        ));
-    }
-    Ok(())
-}
-
-/// Deep-cloning a tagged history would need every referenced row-map file
-/// copied and its stable-partition references relocated, which no writer
-/// implements. Shallow clone does not consult this: it relocates the
-/// references in the `lance` crate instead (the decode machinery lives
-/// there), rejecting on its own any content it cannot fully interpret.
-/// A sticky flag alone need not mean that a mapping still exists.
-pub async fn ensure_deep_clone_supported(
-    store: &ObjectStore,
-    location: &ManifestLocation,
-    manifest: &Manifest,
-) -> Result<()> {
-    if manifest.reader_feature_flags & FLAG_FRAGMENT_REUSE_INDEX == 0 {
-        return Ok(());
-    }
-    let indices = read_manifest_indexes(store, location, manifest).await?;
-    if indices.iter().any(is_tagged) {
-        return Err(Error::not_supported(
-            "Deep-cloning tagged FRI requires copying row maps and relocating their references. Please upgrade to a version supporting FRI deep clone",
         ));
     }
     Ok(())

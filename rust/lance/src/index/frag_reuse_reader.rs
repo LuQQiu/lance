@@ -717,12 +717,12 @@ pub mod tests {
     // longer in this list either: tagged trim is implemented (see
     // `crate::dataset::index::frag_reuse::tests::tagged_trim`), and on this
     // fixture it is a retaining no-op. Shallow clone is no longer in this
-    // list: it relocates the entry's row-map references (see the clone tests
-    // in `crate::index::frag_reuse`).
+    // list: it relocates the entry's row-map references, and deep clone is
+    // not either: it copies the row maps and localizes their references (see
+    // the clone tests in `crate::index::frag_reuse`).
     #[rstest::rstest]
     #[case::eager_compaction("eager")]
     #[case::statistics("statistics")]
-    #[case::deep_clone("deep")]
     #[tokio::test]
     async fn unsupported_maintenance_preserves_snapshot(#[case] operation: &str) {
         let mut dataset = fixture().await;
@@ -753,10 +753,6 @@ pub mod tests {
             .unwrap_err(),
             "statistics" => dataset
                 .index_statistics(FRAG_REUSE_INDEX_NAME)
-                .await
-                .unwrap_err(),
-            "deep" => dataset
-                .deep_clone("memory://fri-deep", version, None)
                 .await
                 .unwrap_err(),
             _ => unreachable!(),
@@ -897,20 +893,6 @@ pub mod tests {
                 .contains("tagged FRI metadata requires both"),
             "{error}"
         );
-    }
-
-    #[tokio::test]
-    async fn clone_without_fri_flag_does_not_read_index_metadata() {
-        let dataset = fixture().await;
-        let mut location = dataset.manifest_location.clone();
-        location.path = dataset.base.clone().join("missing.manifest");
-        lance_table::system_index::frag_reuse::metadata::ensure_deep_clone_supported(
-            &dataset.object_store,
-            &location,
-            &dataset.manifest,
-        )
-        .await
-        .unwrap();
     }
 
     #[tokio::test]
@@ -1709,12 +1691,14 @@ pub mod tests {
             .unwrap_err();
         assert!(matches!(error, Error::NotSupported { .. }));
         assert!(error.to_string().contains("index_version 2"), "{error}");
+        // Deep clone would have to enumerate row maps referenced by content
+        // it cannot interpret; the same version gate rejects it too.
         let error = dataset
             .deep_clone("memory://fri-deep", version, None)
             .await
             .unwrap_err();
         assert!(matches!(error, Error::NotSupported { .. }));
-        assert!(error.to_string().contains("Deep-cloning"), "{error}");
+        assert!(error.to_string().contains("index_version 2"), "{error}");
         let error = crate::dataset::index::frag_reuse::cleanup_frag_reuse_index(&mut dataset)
             .await
             .unwrap_err();
