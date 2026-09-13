@@ -110,20 +110,31 @@ pub(crate) fn maybe_timeout<T>(
     }
 }
 
-/// Read the transaction data from a transaction file.
-pub(crate) async fn read_transaction_file(
+/// Read the raw protobuf transaction from a transaction file.
+async fn read_transaction_file_pb(
     object_store: &ObjectStore,
     base_path: &Path,
     transaction_file: &str,
-) -> Result<Transaction> {
+) -> Result<pb::Transaction> {
     let path = base_path
         .clone()
         .join(TRANSACTIONS_DIR)
         .join(transaction_file);
     let result = object_store.inner.get(&path).await?;
     let data = result.bytes().await?;
-    let transaction = pb::Transaction::decode(data)?;
-    transaction.try_into()
+    Ok(pb::Transaction::decode(data)?)
+}
+
+/// Read the transaction data from a transaction file.
+#[cfg(test)]
+pub(crate) async fn read_transaction_file(
+    object_store: &ObjectStore,
+    base_path: &Path,
+    transaction_file: &str,
+) -> Result<Transaction> {
+    read_transaction_file_pb(object_store, base_path, transaction_file)
+        .await?
+        .try_into()
 }
 
 /// Best-effort delete of a transaction file that is no longer needed.
@@ -209,6 +220,12 @@ const COMMIT_VERIFICATION_ATTEMPTS: u32 = 3;
 /// the complete transaction recorded in the manifest at `version` with this
 /// attempt's transaction.
 ///
+/// The comparison is done between durable (protobuf) forms: the in-memory
+/// [`Transaction`] can carry state that is intentionally not serialized
+/// (e.g. the frag reuse payload attached to a rewrite), so comparing the
+/// read-back transaction against the in-memory one would misclassify our own
+/// landed commit as foreign.
+///
 /// Never returns an error. Read failures and non-definitive not-found results
 /// are retried briefly, then collapse to [`CommitOutcome::Unknown`].
 async fn verify_commit_outcome(
@@ -223,6 +240,10 @@ async fn verify_commit_outcome(
         Read(Error),
     }
 
+    // Durable form of this attempt's transaction, matching what the commit
+    // path serialized.
+    let transaction_pb = pb::Transaction::from(transaction);
+
     let mut backoff = Backoff::default();
     let failure = loop {
         let failure = match try_read_manifest_at(object_store, commit_handler, base_path, version)
@@ -232,7 +253,7 @@ async fn verify_commit_outcome(
                 match read_manifest_transaction(object_store, base_path, &manifest, &location).await
                 {
                     Ok(Some(committed_transaction)) => {
-                        return if committed_transaction == *transaction {
+                        return if committed_transaction == transaction_pb {
                             CommitOutcome::Ours {
                                 manifest: Box::new(manifest),
                                 location,
@@ -287,7 +308,7 @@ async fn read_manifest_transaction(
     base_path: &Path,
     manifest: &Manifest,
     location: &ManifestLocation,
-) -> Result<Option<Transaction>> {
+) -> Result<Option<pb::Transaction>> {
     if let Some(position) = manifest.transaction_section {
         let reader = if let Some(size) = location.size {
             object_store
@@ -298,9 +319,9 @@ async fn read_manifest_transaction(
         };
         let transaction: pb::Transaction =
             lance_io::utils::read_message(reader.as_ref(), position).await?;
-        Transaction::try_from(transaction).map(Some)
+        Ok(Some(transaction))
     } else if let Some(transaction_file) = manifest.transaction_file.as_deref() {
-        read_transaction_file(object_store, base_path, transaction_file)
+        read_transaction_file_pb(object_store, base_path, transaction_file)
             .await
             .map(Some)
     } else {
@@ -3385,5 +3406,43 @@ mod tests {
             index_segment("idx_a", Some(RoaringBitmap::from_iter(5..10))),
         ];
         assert!(detect_overlapping_fragments(&disjoint).is_ok());
+    }
+
+    /// Commit-outcome verification must compare durable (protobuf) forms.
+    ///
+    /// A rewrite's frag reuse payload is intentionally dropped by
+    /// serialization and restored as `None` on read, so the in-memory
+    /// transaction never equals its own read-back form. Comparing durable
+    /// forms classifies the landed commit as ours anyway.
+    #[test]
+    fn test_frag_reuse_rewrite_own_commit_comparison_uses_durable_form() {
+        use lance_table::transaction::{FragReuseUpdate, FragmentReuseRewrite, Operation};
+
+        let transaction = Transaction::new(
+            42,
+            Operation::Rewrite {
+                groups: vec![],
+                rewritten_indices: vec![],
+                frag_reuse: Some(FragReuseUpdate::AppendTransitions(
+                    FragmentReuseRewrite::new(vec![]),
+                )),
+            },
+            None,
+        );
+        // What the commit wrote, and what verification reads back.
+        let durable = pb::Transaction::from(&transaction);
+        let read_back = pb::Transaction::decode(durable.encode_to_vec().as_slice()).unwrap();
+        // The old comparison (read-back deserialized into memory, compared
+        // with `Transaction::eq`) misclassifies our own landed commit: the
+        // round trip loses the payload.
+        assert_ne!(
+            Transaction::try_from(read_back.clone()).unwrap(),
+            transaction,
+            "the round-tripped transaction must differ in memory (frag_reuse is not serialized); \
+             if this starts holding, the durable-form comparison is merely redundant"
+        );
+        // The comparison `verify_commit_outcome` performs: read-back durable
+        // form against the regenerated durable form of this attempt.
+        assert_eq!(read_back, pb::Transaction::from(&transaction));
     }
 }
