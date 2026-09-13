@@ -3098,22 +3098,22 @@ pub async fn commit_compaction(
     // `finish_rewrite`); the commit gate still rejects a v0 entry spliced by
     // a writer without that conversion.
     let frag_reuse = if options.defer_index_remap && any_group_indexed {
-        // Once a table is v1, it stays v1. An existing entry decides by its
-        // own index_version; with NO entry -- for example a fully drained
-        // history whose entry a trim deleted -- the sticky
-        // FLAG_FRAGMENT_REUSE_INDEX decides, so a tagged table never
-        // restarts its history in the v0 format. A table that never was
-        // tagged has neither, and keeps creating the v0 entry byte
+        // Once a table is v1, it stays v1: the sticky
+        // FLAG_FRAGMENT_REUSE_INDEX is the final authority
+        // (`uses_tagged_fri`), never the entry's own index_version. With NO
+        // entry -- for example a fully drained history whose entry a trim
+        // deleted -- the flag alone decides, so a tagged table never
+        // restarts its history in the v0 format; with a v0 entry UNDER the
+        // flag (a legacy entry a concurrent upgrade left pending) the
+        // tagged assembly lifts that entry byte-verbatim instead of
+        // extending it in place. A table that never was tagged has neither
+        // flag nor tagged entry, and keeps creating the v0 entry byte
         // identically.
         let stored = load_all_indices(dataset).await?;
-        let tagged_at_commit = match stored.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME) {
-            Some(entry) => lance_table::system_index::frag_reuse::metadata::is_tagged(entry),
-            None => {
-                dataset.manifest.reader_feature_flags
-                    & lance_table::feature_flags::FLAG_FRAGMENT_REUSE_INDEX
-                    != 0
-            }
-        };
+        let tagged_at_commit = lance_table::system_index::frag_reuse::metadata::uses_tagged_fri(
+            &dataset.manifest,
+            stored.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME),
+        );
         if tagged_at_commit {
             // Materializing a data overlay breaks the reuse premise that a
             // rewrite moves addresses, never values; on a tagged table the

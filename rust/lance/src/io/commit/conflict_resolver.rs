@@ -2297,19 +2297,26 @@ impl<'a> TransactionRebase<'a> {
             // onto the CURRENT entry with full revalidation and a refreshed
             // base version. The stale versions the v0 intent entry carried
             // are dropped: the current entry is the authoritative history,
-            // concurrent trims included. A genuine v0 table never enters
-            // this branch (the current entry is not tagged there), keeping
-            // pure v0 behavior untouched; writers predating tagged support
-            // are fenced off by the writer feature flag before this point.
+            // concurrent trims included. The conversion keys on
+            // `uses_tagged_fri` -- the sticky FLAG_FRAGMENT_REUSE_INDEX or a
+            // tagged current entry -- so it still fires when a concurrent
+            // trim deleted a fully drained tagged entry: the flag survives
+            // the trim and remains the final authority, and the assembly
+            // then restarts the history tagged. A genuine v0 table never
+            // enters this branch (neither flag nor tagged entry exists
+            // there), keeping pure v0 behavior untouched; writers predating
+            // tagged support are fenced off by the writer feature flag
+            // before this point.
             if let Some(FragReuseUpdate::ReplaceEntry(v0_entry)) = frag_reuse
                 && v0_entry.index_version == 0
             {
-                let current_is_tagged = crate::index::load_all_indices(dataset)
-                    .await?
-                    .iter()
-                    .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
-                    .is_some_and(lance_table::system_index::frag_reuse::metadata::is_tagged);
-                if current_is_tagged {
+                let stored = crate::index::load_all_indices(dataset).await?;
+                let current_uses_tagged =
+                    lance_table::system_index::frag_reuse::metadata::uses_tagged_fri(
+                        &dataset.manifest,
+                        stored.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME),
+                    );
+                if current_uses_tagged {
                     let details = load_frag_reuse_index_details(dataset, v0_entry).await?;
                     let appended = details.versions.last().ok_or_else(|| {
                         Error::internal(
