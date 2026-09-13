@@ -314,6 +314,26 @@ pub(crate) async fn derive_superseded_segments(
         &dataset.manifest,
     )
     .await?;
+    // The coverage derivation below flows through `load_indices`, the lenient
+    // reader path: a segment whose coverage crosses an unsupported transition
+    // (or an unknown envelope record) gets an empty translated bitmap, so its
+    // valid coverage shrinks and the subset check could prune a segment a
+    // newer client still serves. Validate the ledger strictly first, exactly
+    // as `derive_tagged_trim` does. Living here (not in the caller's retry
+    // loop) makes the refusal hold on every rebased re-derivation too.
+    if let Some(entry) = stored
+        .iter()
+        .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME && idx.index_version != 0)
+    {
+        let content = load_raw_frag_reuse_content(dataset, entry).await?;
+        let ledger = decode_frag_reuse_ledger_from_content(entry.index_version, &content).await?;
+        if ledger.has_unsupported_transitions() {
+            return Err(Error::not_supported(
+                "the tagged FRI history carries transitions this client cannot interpret; \
+                 upgrade to a newer version of Lance before pruning superseded index segments",
+            ));
+        }
+    }
     // The reader's own coverage derivation (translated through the ledger,
     // direct-coverage-wins applied); not reimplemented here.
     use crate::index::DatasetIndexExt;
@@ -1853,6 +1873,70 @@ mod tests {
                 "the ledger must report envelope-level unknowns so every \
                  maintenance path (and _fri GC) refuses consistently"
             );
+        }
+
+        /// Superseded-segment pruning derives its removal set through the
+        /// lenient reader path, where coverage crossing an unknown record
+        /// translates to nothing -- so a history this build cannot fully
+        /// interpret must refuse the prune BEFORE any removal commit, not
+        /// prune a segment a newer client still serves.
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn unknown_envelope_record_refuses_pruning() {
+            let mut dataset = reader_tests::fixture().await;
+            reserve_fragments(&mut dataset, 20).await;
+            let source_ids: Vec<u64> = dataset.fragments().iter().map(|f| f.id).collect();
+            let mut dataset = commit_stable_partition(dataset, &source_ids, 10).await;
+            let old_segment = stored_segments(&dataset, "i_idx").await[0].clone();
+            // A delta fully covering the destinations: without the unknown
+            // record the old segment would be pruned (see
+            // `superseded_segment_pruned_then_transition_released`).
+            let delta = commit_delta_segment(&mut dataset, None).await;
+
+            // Splice an unknown envelope-level record into the committed
+            // entry, standing in for a record written by a newer Lance.
+            let entry = fri_entry(&dataset).await.unwrap();
+            let mut content = load_raw_frag_reuse_content(&dataset, &entry).await.unwrap();
+            content.extend(reader_tests::field(9, b"future envelope record"));
+            let unknown_entry = IndexMetadata {
+                index_details: Some(Arc::new(prost_types::Any {
+                    type_url: "/lance.table.FragmentReuseIndexDetails".into(),
+                    value: reader_tests::field(1, &content),
+                })),
+                ..entry.clone()
+            };
+            let indices = read_manifest_indexes(
+                &dataset.object_store,
+                &dataset.manifest_location,
+                &dataset.manifest,
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|idx| {
+                if idx.uuid == entry.uuid {
+                    unknown_entry.clone()
+                } else {
+                    idx
+                }
+            })
+            .collect();
+            reader_tests::persist_fixture(&mut dataset, indices).await;
+
+            let version = dataset.manifest.version;
+            let error = cleanup_frag_reuse_index(&mut dataset).await.unwrap_err();
+            assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+            assert!(error.to_string().contains("upgrade"), "{error}");
+            // The refusal fired before the removal-only commit: no new
+            // version was written and the otherwise-superseded segment is
+            // still present.
+            assert_eq!(dataset.manifest.version, version);
+            let segments = stored_segments(&dataset, "i_idx").await;
+            let mut uuids: Vec<_> = segments.iter().map(|s| s.uuid).collect();
+            uuids.sort();
+            let mut expected = vec![old_segment.uuid, delta];
+            expected.sort();
+            assert_eq!(uuids, expected);
         }
 
         fn unusable_details() -> Option<Arc<prost_types::Any>> {
