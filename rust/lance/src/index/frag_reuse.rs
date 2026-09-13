@@ -765,10 +765,27 @@ async fn validate_folded_deletions(
         let bitmap: RoaringBitmap = match &frag.deletion_file {
             None => RoaringBitmap::new(),
             Some(deletion) => {
-                crate::io::deletion::read_dataset_deletion_file(dataset, frag.id, deletion)
-                    .await?
-                    .iter()
-                    .collect()
+                let bitmap: RoaringBitmap =
+                    crate::io::deletion::read_dataset_deletion_file(dataset, frag.id, deletion)
+                        .await?
+                        .iter()
+                        .collect();
+                // The metadata count is consumed downstream (e.g. row
+                // counting) without re-reading the file, so a lying count
+                // must be rejected here even though the positions themselves
+                // are validated from the file below.
+                if let Some(num_deleted_rows) = deletion.num_deleted_rows
+                    && num_deleted_rows as u64 != bitmap.len()
+                {
+                    return Err(Error::invalid_input(format!(
+                        "destination fragment {} records {num_deleted_rows} deleted rows \
+                         in its deletion file metadata but the deletion file holds {} \
+                         positions",
+                        frag.id,
+                        bitmap.len()
+                    )));
+                }
+                bitmap
             }
         };
         supplied_total += bitmap.len();
@@ -1390,6 +1407,94 @@ mod tests {
             dataset.count_rows(Some("i = 3".to_string())).await.unwrap(),
             1
         );
+    }
+
+    /// A frag-reuse-bearing rewrite whose commit lands but reports a conflict
+    /// must be recognized as our own commit. The frag reuse payload is
+    /// intentionally not serialized, so commit-outcome verification has to
+    /// compare durable forms; comparing the in-memory transaction would
+    /// misclassify the landed commit as foreign, retry against ourselves, and
+    /// delete the landed commit's transaction file as "stale".
+    #[tokio::test]
+    async fn tagged_rewrite_recognizes_ambiguous_commit_as_own() {
+        use crate::utils::test::{AmbiguousCommitHandler, AmbiguousFailure};
+        use lance_datagen::{BatchCount, RowCount};
+
+        let handler = Arc::new(AmbiguousCommitHandler::default());
+        let data = lance_datagen::gen_batch()
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(8), BatchCount::from(1));
+        let mut dataset = Dataset::write(
+            data,
+            "memory://frag-reuse-ambiguous-own-commit",
+            Some(WriteParams {
+                max_rows_per_file: 4,
+                commit_handler: Some(handler.clone()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["i"],
+                lance_index::IndexType::BTree,
+                Some("i_idx".into()),
+                &lance_index::scalar::ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+        let before = sorted_values(&dataset).await;
+        assert_eq!(before, (0..8).collect::<Vec<_>>());
+
+        reserve_fragments(&mut dataset, 20).await;
+        let old_fragments: Vec<Fragment> = dataset.fragments().iter().cloned().collect();
+        let (transition, destinations) = reader_tests::prepare(&dataset).await;
+        let read_version = dataset.manifest.version;
+
+        // The commit lands, but the store reports a conflict.
+        handler.fail_next_rewrite(AmbiguousFailure::LandAndConflict);
+        let dataset = crate::dataset::write::CommitBuilder::new(Arc::new(dataset))
+            .execute(Transaction::new(
+                read_version,
+                Operation::Rewrite {
+                    groups: vec![RewriteGroup {
+                        old_fragments,
+                        new_fragments: destinations,
+                    }],
+                    rewritten_indices: vec![],
+                    frag_reuse: Some(FragReuseUpdate::AppendTransitions(
+                        FragmentReuseRewrite::new(vec![transition]),
+                    )),
+                },
+                None,
+            ))
+            .await
+            .expect("verification must recognize the landed rewrite as our own commit");
+
+        // Exactly the landed version: no spurious retry commit.
+        assert_eq!(dataset.manifest.version, read_version + 1);
+        let flag = FLAG_FRAGMENT_REUSE_INDEX;
+        assert_eq!(dataset.manifest.reader_feature_flags & flag, flag);
+        let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+        let entry = stored_fri(&stored);
+        assert!(is_tagged(&entry));
+        assert_eq!(sorted_values(&dataset).await, before);
+
+        // The landed manifest references its transaction file; it must not
+        // have been deleted by the (spurious) conflict cleanup.
+        let transaction_file = dataset
+            .manifest
+            .transaction_file
+            .as_deref()
+            .expect("the landed manifest records its transaction file");
+        let path = dataset
+            .base
+            .clone()
+            .join(crate::dataset::TRANSACTIONS_DIR)
+            .join(transaction_file);
+        assert!(dataset.object_store.exists(&path).await.unwrap());
     }
 
     /// A 0 -> 1 lift reinterprets the committed v0 bytes without re-encoding
@@ -2870,6 +2975,29 @@ mod tests {
         assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
         assert!(
             error.to_string().contains("translated positions"),
+            "{error}"
+        );
+    }
+
+    /// A destination deletion file whose metadata count lies about the
+    /// file's cardinality is rejected even when the folded positions
+    /// themselves are correct: the count is consumed downstream without
+    /// re-reading the file.
+    #[tokio::test]
+    async fn folded_lying_destination_count_rejected() {
+        let mut harness = folding_harness(Some("i = 1 OR i = 2")).await;
+        fold_destination(&mut harness, 1, &[0]).await;
+        fold_destination(&mut harness, 0, &[1]).await;
+        // The positions are exactly right; only the recorded count lies.
+        harness.destinations[0]
+            .deletion_file
+            .as_mut()
+            .unwrap()
+            .num_deleted_rows = Some(5);
+        let error = commit_fold(harness).await.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(
+            error.to_string().contains("records 5 deleted rows"),
             "{error}"
         );
     }

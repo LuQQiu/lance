@@ -3697,6 +3697,80 @@ mod tests {
         assert_eq!(scanned.num_rows(), num_rows);
     }
 
+    /// A deferred (v0 ReplaceEntry) compaction whose commit lands but reports
+    /// a conflict must be recognized as our own commit. The frag reuse
+    /// payload is intentionally not serialized, so commit-outcome
+    /// verification has to compare durable forms; comparing the in-memory
+    /// transaction would misclassify the landed commit as foreign, retry
+    /// against ourselves, and delete the landed commit's transaction file.
+    #[tokio::test]
+    async fn test_deferred_compaction_recognizes_ambiguous_commit_as_own() {
+        use crate::utils::test::{AmbiguousCommitHandler, AmbiguousFailure};
+
+        let handler = Arc::new(AmbiguousCommitHandler::default());
+        let mut data_gen =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("i".to_owned())));
+        let mut dataset = Dataset::write(
+            data_gen.batch(600),
+            "memory://test/deferred_ambiguous",
+            Some(WriteParams {
+                max_rows_per_file: 100, // 6 small files -> compaction has work
+                commit_handler: Some(handler.clone()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        // Indexed data, so the deferred compaction carries a frag reuse
+        // (ReplaceEntry) payload on its Rewrite transaction.
+        create_scalar_index(&mut dataset, "i", false).await;
+        let fragments_before = dataset.get_fragments().len();
+
+        let options = CompactionOptions {
+            target_rows_per_fragment: 100_000,
+            defer_index_remap: true,
+            ..Default::default()
+        };
+        let completed = execute_compaction_plan(&dataset, &options).await;
+
+        // The commit lands, but the store reports a conflict.
+        handler.fail_next_rewrite(AmbiguousFailure::LandAndConflict);
+        commit_compaction(
+            &mut dataset,
+            completed,
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &options,
+        )
+        .await
+        .expect("verification must recognize the landed compaction as our own commit");
+
+        assert!(
+            dataset.get_fragments().len() < fragments_before,
+            "the landed compaction must be visible"
+        );
+        let fri = dataset
+            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap()
+            .expect("the deferred compaction installs the frag reuse entry");
+        assert_eq!(fri.index_version, 0);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 600);
+
+        // The landed manifest references its transaction file; it must not
+        // have been deleted by the (spurious) conflict cleanup.
+        let transaction_file = dataset
+            .manifest
+            .transaction_file
+            .as_deref()
+            .expect("the landed manifest records its transaction file");
+        let path = dataset
+            .base
+            .clone()
+            .join(crate::dataset::TRANSACTIONS_DIR)
+            .join(transaction_file);
+        assert!(dataset.object_store.exists(&path).await.unwrap());
+    }
+
     /// A failed ReserveFragments commit cannot reference the rewritten files,
     /// so both stable-row-id reservation paths must still clean them up.
     #[tokio::test]
