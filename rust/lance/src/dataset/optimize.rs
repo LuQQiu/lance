@@ -91,7 +91,8 @@ use super::fragment::FileFragment;
 use super::index::{DatasetIndexRemapperOptions, load_indices_for_remapping};
 use super::rowids::load_row_id_sequences;
 use super::transaction::{
-    FragmentReuseRewrite, Operation, RewriteGroup, RewrittenIndex, Transaction, TransactionBuilder,
+    FragReuseUpdate, FragmentReuseRewrite, Operation, RewriteGroup, RewrittenIndex, Transaction,
+    TransactionBuilder,
 };
 use super::utils::make_rowid_capture_stream;
 use super::versions;
@@ -3096,11 +3097,23 @@ pub async fn commit_compaction(
     // into tagged transitions when the current entry turns out tagged (see
     // `finish_rewrite`); the commit gate still rejects a v0 entry spliced by
     // a writer without that conversion.
-    let (frag_reuse_index, frag_reuse_rewrite) = if options.defer_index_remap && any_group_indexed {
-        let tagged_at_commit = load_all_indices(dataset)
-            .await?
-            .iter()
-            .any(lance_table::system_index::frag_reuse::metadata::is_tagged);
+    let frag_reuse = if options.defer_index_remap && any_group_indexed {
+        // Once a table is v1, it stays v1: the sticky
+        // FLAG_FRAGMENT_REUSE_INDEX is the final authority
+        // (`uses_tagged_fri`), never the entry's own index_version. With NO
+        // entry -- for example a fully drained history whose entry a trim
+        // deleted -- the flag alone decides, so a tagged table never
+        // restarts its history in the v0 format; with a v0 entry UNDER the
+        // flag (a legacy entry a concurrent upgrade left pending) the
+        // tagged assembly lifts that entry byte-verbatim instead of
+        // extending it in place. A table that never was tagged has neither
+        // flag nor tagged entry, and keeps creating the v0 entry byte
+        // identically.
+        let stored = load_all_indices(dataset).await?;
+        let tagged_at_commit = lance_table::system_index::frag_reuse::metadata::uses_tagged_fri(
+            &dataset.manifest,
+            stored.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME),
+        );
         if tagged_at_commit {
             // Materializing a data overlay breaks the reuse premise that a
             // rewrite moves addresses, never values; on a tagged table the
@@ -3143,21 +3156,13 @@ pub async fn commit_compaction(
                     )),
                 })
                 .collect();
-            (
-                None,
-                Some(FragmentReuseRewrite {
-                    transitions,
-                    base_entry_version: None,
-                }),
-            )
+            Some(FragReuseUpdate::AppendTransitions(
+                FragmentReuseRewrite::new(transitions),
+            ))
         } else {
-            (
-                Some(
-                    build_new_frag_reuse_index(dataset, frag_reuse_groups, new_fragment_bitmap)
-                        .await?,
-                ),
-                None,
-            )
+            Some(FragReuseUpdate::ReplaceEntry(
+                build_new_frag_reuse_index(dataset, frag_reuse_groups, new_fragment_bitmap).await?,
+            ))
         }
     } else {
         if options.defer_index_remap {
@@ -3165,7 +3170,7 @@ pub async fn commit_compaction(
                 "skipping fragment reuse record: no rewritten fragments are covered by an index or the reuse lineage"
             );
         }
-        (None, None)
+        None
     };
 
     let transaction = TransactionBuilder::new(
@@ -3180,8 +3185,7 @@ pub async fn commit_compaction(
         Operation::Rewrite {
             groups: rewrite_groups,
             rewritten_indices,
-            frag_reuse_index,
-            frag_reuse_rewrite,
+            frag_reuse,
         },
     )
     .transaction_properties(options.transaction_properties.clone())

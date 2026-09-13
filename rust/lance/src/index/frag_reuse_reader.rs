@@ -1690,8 +1690,7 @@ pub mod tests {
                     Operation::Rewrite {
                         groups: vec![],
                         rewritten_indices: vec![],
-                        frag_reuse_index: None,
-                        frag_reuse_rewrite: None,
+                        frag_reuse: None,
                     },
                     None,
                 ),

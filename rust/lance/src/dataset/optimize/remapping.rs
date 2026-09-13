@@ -959,7 +959,7 @@ mod tests {
         use arrow_array::types::Int32Type;
         use lance_index::IndexType;
         use lance_index::scalar::ScalarIndexParams;
-        use lance_table::transaction::{FragmentReuseRewrite, RewriteGroup};
+        use lance_table::transaction::{FragReuseUpdate, FragmentReuseRewrite, RewriteGroup};
 
         async fn reserve_fragments(dataset: &mut Dataset, num_fragments: u32) {
             dataset
@@ -1004,11 +1004,9 @@ mod tests {
                             new_fragments: destinations,
                         }],
                         rewritten_indices: vec![],
-                        frag_reuse_index: None,
-                        frag_reuse_rewrite: Some(FragmentReuseRewrite {
-                            transitions: vec![transition],
-                            base_entry_version: None,
-                        }),
+                        frag_reuse: Some(FragReuseUpdate::AppendTransitions(
+                            FragmentReuseRewrite::new(vec![transition]),
+                        )),
                     },
                     None,
                 ))

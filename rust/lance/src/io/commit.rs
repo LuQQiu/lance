@@ -1183,15 +1183,13 @@ pub(crate) async fn do_commit_detached_transaction(
     // A detached manifest is also outside the main version chain, where an
     // appended fragment-reuse history has no meaning. Reject both shapes
     // outright.
-    if let Operation::Rewrite {
-        frag_reuse_index,
-        frag_reuse_rewrite,
-        ..
-    } = &transaction.operation
-        && (frag_reuse_rewrite.is_some()
-            || frag_reuse_index
-                .as_ref()
-                .is_some_and(lance_table::system_index::frag_reuse::metadata::is_tagged))
+    if let Operation::Rewrite { frag_reuse, .. } = &transaction.operation
+        && frag_reuse.as_ref().is_some_and(|update| match update {
+            lance_table::transaction::FragReuseUpdate::AppendTransitions(_) => true,
+            lance_table::transaction::FragReuseUpdate::ReplaceEntry(entry) => {
+                lance_table::system_index::frag_reuse::metadata::is_tagged(entry)
+            }
+        })
     {
         return Err(Error::not_supported(
             "Detached commits cannot carry fragment reuse transition intent or a tagged \

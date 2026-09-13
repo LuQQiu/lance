@@ -1231,7 +1231,7 @@ mod tests {
         use lance_index::scalar::ScalarIndexParams;
         use lance_table::format::Fragment;
         use lance_table::system_index::frag_reuse::ledger::Mapping;
-        use lance_table::transaction::{FragmentReuseRewrite, RewriteGroup};
+        use lance_table::transaction::{FragReuseUpdate, FragmentReuseRewrite, RewriteGroup};
         use uuid::Uuid;
 
         fn digest(id: u64) -> pb_fri::FragmentDigest {
@@ -1416,11 +1416,9 @@ mod tests {
                             new_fragments: destinations,
                         }],
                         rewritten_indices: vec![],
-                        frag_reuse_index: None,
-                        frag_reuse_rewrite: Some(FragmentReuseRewrite {
-                            transitions: vec![transition],
-                            base_entry_version: None,
-                        }),
+                        frag_reuse: Some(FragReuseUpdate::AppendTransitions(
+                            FragmentReuseRewrite::new(vec![transition]),
+                        )),
                     },
                     None,
                 ))
