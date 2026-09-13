@@ -26,7 +26,7 @@ use crate::io::{
 };
 use crate::rowids::version::build_version_meta;
 use crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
-use crate::system_index::frag_reuse::metadata::{is_tagged, validate_flags};
+use crate::system_index::frag_reuse::metadata::{is_tagged, uses_tagged_fri, validate_flags};
 use crate::system_index::is_system_index;
 use crate::system_index::mem_wal::{
     CompactedSsTable, IndexCatchupProgress, MEM_WAL_INDEX_NAME, load_mem_wal_index_details,
@@ -578,6 +578,38 @@ impl Transaction {
         {
             return Err(Error::not_supported(
                 "Tagged FRI history maintenance is not implemented for this operation; upgrade to a writer supporting tagged histories",
+            ));
+        }
+
+        // The sticky flag is the final authority on the record form
+        // (`uses_tagged_fri`): once a manifest carries
+        // FLAG_FRAGMENT_REUSE_INDEX, every fragment reuse write is tagged,
+        // even when a trim removed a fully drained entry -- the flag never
+        // clears. A v0 snapshot publishing here would silently downgrade
+        // the table back to whole-history replacement, so it is rejected
+        // regardless of whether an entry currently exists; the commit path
+        // converts a stale v0 intent into transitions before this point
+        // (see `finish_rewrite`), so only a writer that skipped that
+        // conversion can arrive here.
+        if matches!(
+            &self.operation,
+            Operation::Rewrite {
+                frag_reuse: Some(FragReuseUpdate::ReplaceEntry(_)),
+                ..
+            }
+        ) && current_manifest.is_some_and(|manifest| {
+            uses_tagged_fri(
+                manifest,
+                current_indices
+                    .iter()
+                    .find(|index| index.name == FRAG_REUSE_INDEX_NAME),
+            )
+        }) {
+            return Err(Error::invalid_input(
+                "a v0 fragment reuse snapshot cannot be published onto a table using \
+                 the tagged fragment reuse format: the sticky feature flag makes the \
+                 tagged format permanent, even after a drained entry is trimmed away, \
+                 so the rewrite must append transitions instead",
             ));
         }
 
@@ -1926,6 +1958,35 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
         assert!(error.to_string().contains("must be assembled"), "{error}");
+    }
+
+    #[test]
+    fn v0_snapshot_replace_rejected_on_flag_carrying_manifest_without_entry() {
+        // The sticky flag alone forbids a v0 snapshot: a trim may have
+        // deleted the fully drained tagged entry, but the flag survives and
+        // remains the final authority on the record form. Publishing the
+        // snapshot would silently downgrade the table to v0.
+        let mut manifest = sample_manifest();
+        manifest.reader_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
+        manifest.writer_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
+        let mut entry =
+            sample_index_metadata(crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME);
+        entry.fields.clear();
+        entry.index_version = 0;
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::Rewrite {
+                groups: vec![],
+                rewritten_indices: vec![],
+                frag_reuse: Some(FragReuseUpdate::ReplaceEntry(entry)),
+            },
+            None,
+        );
+        let error = transaction
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(error.to_string().contains("sticky feature flag"), "{error}");
     }
 
     #[test]

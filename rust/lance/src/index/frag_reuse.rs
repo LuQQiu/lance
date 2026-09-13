@@ -3499,6 +3499,305 @@ mod tests {
         assert_eq!(filtered_values(&dataset, "i = 3").await, vec![3]);
     }
 
+    /// Sticky v1, entry-present arm: with the flag set and a legacy v0
+    /// entry still in the manifest, the flag -- not the entry's own
+    /// index_version -- decides the record form, so a deferred compaction
+    /// must upgrade: the resulting entry is tagged, carries the legacy
+    /// content lifted byte-verbatim, and records the compaction as an
+    /// ordered-compaction transition appended after it.
+    #[tokio::test]
+    async fn flag_with_existing_v0_entry_compaction_upgrades() {
+        let mut dataset = indexed_three_fragment_dataset().await;
+
+        // A committed v0 entry with one legacy compaction (100 -> 110),
+        // fictional fragments so the live indexed ones stay compaction
+        // candidates.
+        let mut addrs = RoaringTreemap::new();
+        for offset in 0..4u64 {
+            addrs.insert((100 << 32) + offset);
+        }
+        let mut changed_row_addrs = Vec::new();
+        addrs.serialize_into(&mut changed_row_addrs).unwrap();
+        let digest = |id: u64| FragDigest {
+            id,
+            physical_rows: 4,
+            num_deleted_rows: 0,
+        };
+        let details = FragReuseIndexDetails {
+            versions: vec![FragReuseVersion {
+                dataset_version: 1,
+                groups: vec![FragReuseGroup {
+                    changed_row_addrs,
+                    old_frags: vec![digest(100)],
+                    new_frags: vec![digest(110)],
+                }],
+            }],
+        };
+        let v0_entry = build_frag_reuse_index_metadata(
+            &dataset,
+            None,
+            details,
+            RoaringBitmap::from_iter([110u32]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(v0_entry.index_version, 0);
+        dataset
+            .apply_commit(
+                Transaction::new(
+                    dataset.manifest.version,
+                    Operation::CreateIndex {
+                        new_indices: vec![v0_entry],
+                        removed_indices: vec![],
+                    },
+                    None,
+                ),
+                &Default::default(),
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+
+        // Stamp the sticky flag next to the v0 entry: the concurrency
+        // remnant under test, where an upgrade elsewhere tagged the table
+        // while this legacy entry survived.
+        let indices: Vec<IndexMetadata> = crate::index::load_all_indices(&dataset)
+            .await
+            .unwrap()
+            .as_ref()
+            .clone();
+        {
+            let manifest = Arc::make_mut(&mut dataset.manifest);
+            manifest.reader_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
+            manifest.writer_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
+        }
+        reader_tests::persist_fixture(&mut dataset, indices).await;
+        let flag = FLAG_FRAGMENT_REUSE_INDEX;
+        assert_eq!(dataset.manifest.reader_feature_flags & flag, flag);
+        let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+        let v0_entry = stored_fri(&stored);
+        assert_eq!(v0_entry.index_version, 0);
+        let v0_content = load_raw_frag_reuse_content(&dataset, &v0_entry)
+            .await
+            .unwrap();
+
+        let before = sorted_values(&dataset).await;
+        crate::dataset::optimize::compact_files(
+            &mut dataset,
+            crate::dataset::optimize::CompactionOptions {
+                target_rows_per_fragment: 100,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+        let entry = stored_fri(&stored);
+        assert_eq!(entry.index_version, 1);
+        assert!(is_tagged(&entry));
+        // The legacy content is lifted byte-verbatim ...
+        let lifted = load_raw_frag_reuse_content(&dataset, &entry).await.unwrap();
+        assert!(lifted.starts_with(&v0_content));
+        // ... and the compaction rides after it: the lifted legacy group
+        // plus the new ordered-compaction transition.
+        let ledger = decode_entry(&dataset, &entry).await;
+        assert_eq!(ledger.transitions().len(), 2);
+        assert!(matches!(
+            ledger.transitions()[0].mapping(),
+            Mapping::OrderedCompaction(_)
+        ));
+        assert!(matches!(
+            ledger.transitions()[1].mapping(),
+            Mapping::OrderedCompaction(_)
+        ));
+        assert_eq!(
+            ledger.transitions()[1]
+                .sources()
+                .iter()
+                .map(|digest| digest.id)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(sorted_values(&dataset).await, before);
+    }
+
+    /// P1 regression: a v0 rewrite intent prepared against a v0 table must
+    /// land as tagged transitions when it retries after the table was
+    /// upgraded to the tagged format AND the drained entry was trimmed
+    /// away. The entry is gone at retry time, but the sticky flag remains
+    /// the final authority, so the retry converts the intent instead of
+    /// silently downgrading the table back to v0 snapshot replacement.
+    #[tokio::test]
+    async fn stale_v0_writer_lands_v1_after_upgrade_and_trim() {
+        let mut dataset = indexed_three_fragment_dataset().await;
+        reserve_fragments(&mut dataset, 40).await;
+        let before = sorted_values(&dataset).await;
+        assert_eq!(before, (0..12).collect::<Vec<_>>());
+
+        // Writer A prepares a v0 compaction of fragments 1 and 2 at this
+        // version: real destination files, a v0 ReplaceEntry intent.
+        let read_version = dataset.manifest.version;
+        let old_fragments: Vec<Fragment> = dataset
+            .fragments()
+            .iter()
+            .filter(|frag| frag.id == 1 || frag.id == 2)
+            .cloned()
+            .collect();
+        let compacted = {
+            let mut scan = dataset.scan();
+            scan.with_fragments(old_fragments.clone());
+            scan.try_into_batch().await.unwrap()
+        };
+        let append = InsertBuilder::new(Arc::new(dataset.clone()))
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            })
+            .execute_uncommitted(vec![compacted])
+            .await
+            .unwrap();
+        let Operation::Append { fragments } = append.operation else {
+            unreachable!()
+        };
+        let mut destinations = fragments;
+        assert_eq!(destinations.len(), 1);
+        destinations[0].id = 30;
+        let mut addrs = RoaringTreemap::new();
+        for frag_id in [1u64, 2] {
+            for offset in 0..4u64 {
+                addrs.insert((frag_id << 32) + offset);
+            }
+        }
+        let mut changed_row_addrs = Vec::new();
+        addrs.serialize_into(&mut changed_row_addrs).unwrap();
+        let digest = |id: u64, physical_rows: usize| FragDigest {
+            id,
+            physical_rows,
+            num_deleted_rows: 0,
+        };
+        let details = FragReuseIndexDetails {
+            versions: vec![FragReuseVersion {
+                dataset_version: read_version,
+                groups: vec![FragReuseGroup {
+                    changed_row_addrs,
+                    old_frags: vec![digest(1, 4), digest(2, 4)],
+                    new_frags: vec![digest(30, 8)],
+                }],
+            }],
+        };
+        let v0_entry = build_frag_reuse_index_metadata(
+            &dataset,
+            None,
+            details,
+            RoaringBitmap::from_iter([30u32]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(v0_entry.index_version, 0);
+        let stale_transaction = Transaction::new(
+            read_version,
+            Operation::Rewrite {
+                groups: vec![RewriteGroup {
+                    old_fragments,
+                    new_fragments: destinations,
+                }],
+                rewritten_indices: vec![],
+                frag_reuse: Some(FragReuseUpdate::ReplaceEntry(v0_entry)),
+            },
+            None,
+        );
+
+        // Concurrently the table is upgraded to the tagged format by a
+        // stable-partition rewrite of fragment 0 ...
+        let mut dataset = tag_fragment_zero(dataset).await;
+        let flag = FLAG_FRAGMENT_REUSE_INDEX;
+        assert_eq!(dataset.manifest.reader_feature_flags & flag, flag);
+
+        // ... and the drained entry is trimmed away (simulated -- trim is
+        // future work): the entry is gone, the sticky flag stays. The
+        // fixture writes no transaction file, so the stand-in for the
+        // trim's transaction is supplied through the session cache for the
+        // retry's transaction walk.
+        let indices: Vec<IndexMetadata> = crate::index::load_all_indices(&dataset)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|idx| idx.name != FRAG_REUSE_INDEX_NAME)
+            .cloned()
+            .collect();
+        reader_tests::persist_fixture(&mut dataset, indices).await;
+        assert_eq!(dataset.manifest.reader_feature_flags & flag, flag);
+        assert!(
+            crate::index::load_all_indices(&dataset)
+                .await
+                .unwrap()
+                .iter()
+                .all(|idx| idx.name != FRAG_REUSE_INDEX_NAME)
+        );
+        let trim_version = dataset.manifest.version;
+        dataset
+            .metadata_cache
+            .insert_with_key(
+                &crate::session::caches::TransactionKey {
+                    version: trim_version,
+                },
+                Arc::new(Transaction::new(
+                    trim_version - 1,
+                    Operation::ReserveFragments { num_fragments: 0 },
+                    None,
+                )),
+            )
+            .await;
+
+        // Fresh coverage over the surviving fragments, as after a real
+        // (fully drained) trim.
+        dataset
+            .create_index(
+                &["i"],
+                lance_index::IndexType::Scalar,
+                Some("i_idx".into()),
+                &lance_index::scalar::ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Writer A retries: the intent still says ReplaceEntry(v0), the
+        // current entry is None, only the flag says tagged. The commit
+        // must land tagged transitions, never a v0 entry.
+        dataset
+            .apply_commit(stale_transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+
+        let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+        let entry = stored_fri(&stored);
+        assert_eq!(entry.index_version, 1);
+        assert!(is_tagged(&entry));
+        let ledger = decode_entry(&dataset, &entry).await;
+        assert_eq!(ledger.transitions().len(), 1);
+        assert!(matches!(
+            ledger.transitions()[0].mapping(),
+            Mapping::OrderedCompaction(_)
+        ));
+        assert_eq!(
+            ledger.transitions()[0]
+                .sources()
+                .iter()
+                .map(|digest| digest.id)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(ledger.transitions()[0].destinations()[0].id, 30);
+        // Reads stay row-identical through the upgrade, the trim and the
+        // converted commit.
+        assert_eq!(sorted_values(&dataset).await, before);
+        assert_eq!(filtered_values(&dataset, "i = 7").await, vec![7]);
+    }
+
     /// Guard: a table that never was tagged (no flag, no entry) keeps
     /// creating the v0 legacy entry byte-identically.
     #[tokio::test]
