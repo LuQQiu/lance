@@ -3098,10 +3098,22 @@ pub async fn commit_compaction(
     // `finish_rewrite`); the commit gate still rejects a v0 entry spliced by
     // a writer without that conversion.
     let frag_reuse = if options.defer_index_remap && any_group_indexed {
-        let tagged_at_commit = load_all_indices(dataset)
-            .await?
-            .iter()
-            .any(lance_table::system_index::frag_reuse::metadata::is_tagged);
+        // Once a table is v1, it stays v1. An existing entry decides by its
+        // own index_version; with NO entry -- for example a fully drained
+        // history whose entry a trim deleted -- the sticky
+        // FLAG_FRAGMENT_REUSE_INDEX decides, so a tagged table never
+        // restarts its history in the v0 format. A table that never was
+        // tagged has neither, and keeps creating the v0 entry byte
+        // identically.
+        let stored = load_all_indices(dataset).await?;
+        let tagged_at_commit = match stored.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME) {
+            Some(entry) => lance_table::system_index::frag_reuse::metadata::is_tagged(entry),
+            None => {
+                dataset.manifest.reader_feature_flags
+                    & lance_table::feature_flags::FLAG_FRAGMENT_REUSE_INDEX
+                    != 0
+            }
+        };
         if tagged_at_commit {
             // Materializing a data overlay breaks the reuse premise that a
             // rewrite moves addresses, never values; on a tagged table the
