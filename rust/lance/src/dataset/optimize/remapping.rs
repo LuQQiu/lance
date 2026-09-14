@@ -1618,6 +1618,237 @@ mod tests {
             }
         }
 
+        /// A14: a segment covering ALL sources of a stable partition takes
+        /// the free case -- a full remap with the bitmap restamped onto the
+        /// destinations it now wholly owns (the iron-law assertion runs in
+        /// this build), and queries stay correct.
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn fully_covered_stable_partition_remaps_and_restamps() {
+            let dataset = reader_tests::fixture().await;
+            let mut dataset = append_two_fragments(dataset).await; // {2,3} uncovered
+            reserve_fragments(&mut dataset, 40).await;
+            let mut dataset = commit_stable_partition(dataset, &[0, 1], 10).await;
+
+            let before = stored_index(&dataset, "i_idx").await;
+            let all_values: Vec<i32> = (0..16).collect();
+            assert_eq!(sorted_values(&dataset, None).await, all_values);
+            remap_column_index(&mut dataset, &["i"], Some("i_idx".into()))
+                .await
+                .unwrap();
+            let after = stored_index(&dataset, "i_idx").await;
+            assert_ne!(after.uuid, before.uuid);
+            assert!(after.dataset_version > before.dataset_version);
+            assert_eq!(
+                after.fragment_bitmap.as_ref().unwrap(),
+                &RoaringBitmap::from_iter([10u32, 11]),
+                "the swapped bitmap must claim exactly the SP destinations"
+            );
+            assert_eq!(sorted_values(&dataset, None).await, all_values);
+            assert_eq!(sorted_values(&dataset, Some("i = 5")).await, vec![5]);
+            assert_eq!(
+                sorted_values(&dataset, Some("i < 4")).await,
+                (0..4).collect::<Vec<_>>()
+            );
+        }
+
+        /// A15: a mixed chain -- compaction, then a straddled stable
+        /// partition, then another compaction -- goes address-only through
+        /// ALL hops: the bitmap stays as stored while the addresses are
+        /// rewritten to the chain's end.
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn address_only_remap_through_mixed_chain() {
+            use crate::utils::test::DatagenExt;
+
+            // Four indexed fragments {0,1,2,3}; appends {4,5} uncovered.
+            let mut dataset = lance_datagen::gen_batch()
+                .col("i", lance_datagen::array::step::<Int32Type>())
+                .into_ram_dataset(
+                    crate::utils::test::FragmentCount::from(4),
+                    crate::utils::test::FragmentRowCount::from(4),
+                )
+                .await
+                .unwrap();
+            dataset
+                .create_index(
+                    &["i"],
+                    IndexType::Scalar,
+                    Some("i_idx".into()),
+                    &ScalarIndexParams::default(),
+                    false,
+                )
+                .await
+                .unwrap();
+            let batch = lance_datagen::gen_batch()
+                .col("i", lance_datagen::array::step_custom::<Int32Type>(16, 1))
+                .into_batch_rows(lance_datagen::RowCount::from(8))
+                .unwrap();
+            let dataset = InsertBuilder::new(Arc::new(dataset))
+                .with_params(&WriteParams {
+                    mode: WriteMode::Append,
+                    max_rows_per_file: 4,
+                    ..Default::default()
+                })
+                .execute(vec![batch])
+                .await
+                .unwrap();
+            let mut dataset = dataset;
+            reserve_fragments(&mut dataset, 60).await;
+
+            // First deferred compaction: {0,1} -> A, {2,3} -> B, {4,5} -> C.
+            compact_files(
+                &mut dataset,
+                CompactionOptions {
+                    target_rows_per_fragment: 8,
+                    defer_index_remap: true,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+            let entry = stored_index(&dataset, FRAG_REUSE_INDEX_NAME).await;
+            let ledger = decode_frag_reuse_ledger(&dataset, &entry).await.unwrap();
+            let b = ledger.transitions()[ledger.consumer(2).unwrap()].destinations()[0].id;
+            let c = ledger.transitions()[ledger.consumer(4).unwrap()].destinations()[0].id;
+            // The stable partition consumes {B, C}: the index descends into
+            // B's rows but none of C's -- a straddle.
+            let mut dataset = commit_stable_partition(dataset, &[b, c], 30).await;
+            // Second deferred compaction folds the SP destinations onward.
+            compact_files(
+                &mut dataset,
+                CompactionOptions {
+                    target_rows_per_fragment: 16,
+                    defer_index_remap: true,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+
+            let predicates = [
+                None,
+                Some("i < 8"),
+                Some("i >= 8 AND i < 16"),
+                Some("i = 11"),
+                Some("i >= 16"),
+            ];
+            let mut expected = Vec::new();
+            for predicate in predicates {
+                expected.push(sorted_values(&dataset, predicate).await);
+            }
+            assert_eq!(expected[0], (0..24).collect::<Vec<_>>());
+
+            let before = stored_index(&dataset, "i_idx").await;
+            remap_column_index(&mut dataset, &["i"], Some("i_idx".into()))
+                .await
+                .unwrap();
+            let after = stored_index(&dataset, "i_idx").await;
+            assert_ne!(
+                after.uuid, before.uuid,
+                "the chain must be applied address-only"
+            );
+            assert!(after.dataset_version > before.dataset_version);
+            assert_eq!(
+                after.fragment_bitmap, before.fragment_bitmap,
+                "no restamp through a straddled chain"
+            );
+            for (predicate, expected) in predicates.iter().zip(&expected) {
+                assert_eq!(
+                    &sorted_values(&dataset, *predicate).await,
+                    expected,
+                    "results changed for {predicate:?}"
+                );
+            }
+        }
+
+        /// A12: after an address-only remap, queries neither open nor read
+        /// the stable partition's row map: the rewritten addresses are live
+        /// and the reader's per-address dispatch short-circuits before any
+        /// mapping IO -- even though the ledger record is still present.
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn address_only_remap_queries_do_zero_row_map_io() {
+            use arrow_array::RecordBatchIterator;
+            use lance_core::utils::tempfile::TempStrDir;
+
+            let dir = TempStrDir::default();
+            let uri = format!("{}/table", dir.as_str());
+            let batch = lance_datagen::gen_batch()
+                .col("i", lance_datagen::array::step::<Int32Type>())
+                .into_batch_rows(lance_datagen::RowCount::from(8))
+                .unwrap();
+            let schema = batch.schema();
+            let mut dataset = Dataset::write(
+                RecordBatchIterator::new(vec![Ok(batch)], schema),
+                &uri,
+                Some(WriteParams {
+                    max_rows_per_file: 4,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+            dataset
+                .create_index(
+                    &["i"],
+                    IndexType::Scalar,
+                    Some("i_idx".into()),
+                    &ScalarIndexParams::default(),
+                    false,
+                )
+                .await
+                .unwrap();
+            let mut dataset = append_two_fragments(dataset).await;
+            reserve_fragments(&mut dataset, 40).await;
+            let mut dataset = commit_stable_partition(dataset, &[1, 2], 10).await;
+
+            // Sanity for the tracker itself: the remap's materializer must
+            // sweep the row map, so "_fri" reads are visible when they
+            // happen at all.
+            dataset.object_store.as_ref().io_stats_incremental(); // reset
+            remap_column_index(&mut dataset, &["i"], Some("i_idx".into()))
+                .await
+                .unwrap();
+            let remap_stats = dataset.object_store.as_ref().io_stats_incremental();
+            assert!(
+                remap_stats
+                    .requests
+                    .iter()
+                    .any(|request| request.path.as_ref().contains("_fri")),
+                "the materializer must read the row map (tracker sanity)"
+            );
+
+            // A fresh dataset (fresh session, empty caches) proves the
+            // queries themselves need no row-map IO, not merely a warm
+            // cache.
+            let dataset = Dataset::open(&uri).await.unwrap();
+            dataset.object_store.as_ref().io_stats_incremental(); // reset
+            assert_eq!(sorted_values(&dataset, Some("i = 2")).await, vec![2]);
+            assert_eq!(sorted_values(&dataset, Some("i = 5")).await, vec![5]);
+            assert_eq!(
+                sorted_values(&dataset, None).await,
+                (0..16).collect::<Vec<_>>()
+            );
+            let query_stats = dataset.object_store.as_ref().io_stats_incremental();
+            assert!(
+                query_stats.read_iops > 0,
+                "the queries must actually have read something"
+            );
+            let row_map_reads: Vec<_> = query_stats
+                .requests
+                .iter()
+                .filter(|request| request.path.as_ref().contains("_fri"))
+                .collect();
+            assert!(
+                row_map_reads.is_empty(),
+                "queries after an address-only remap must not touch the row map: \
+                 {row_map_reads:?}"
+            );
+        }
+
         /// A13: the address-only remap is idempotent at the planner level.
         /// A second maintenance run finds the segment stamped at or past
         /// the FRI entry's version, plans a no-op, and commits nothing.
