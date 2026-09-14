@@ -474,9 +474,7 @@ fn plan_tagged_remap(ledger: &FragReuseLedger, provenance: &RoaringBitmap) -> Ta
                     .map(|digest| digest.id as u32),
             );
             all_hops.push(match transition.mapping() {
-                Mapping::OrderedCompaction(remap) => {
-                    PlannedHop::Compaction(remap.as_ref().clone())
-                }
+                Mapping::OrderedCompaction(remap) => PlannedHop::Compaction(remap.as_ref().clone()),
                 Mapping::StablePartition(_) => PlannedHop::StablePartition(position),
             });
         }
@@ -493,9 +491,7 @@ fn plan_tagged_remap(ledger: &FragReuseLedger, provenance: &RoaringBitmap) -> Ta
                     .map(|digest| digest.id as u32),
             );
             hops.push(match transition.mapping() {
-                Mapping::OrderedCompaction(remap) => {
-                    PlannedHop::Compaction(remap.as_ref().clone())
-                }
+                Mapping::OrderedCompaction(remap) => PlannedHop::Compaction(remap.as_ref().clone()),
                 Mapping::StablePartition(_) => PlannedHop::StablePartition(position),
             });
             applied[position] = true;
@@ -672,8 +668,14 @@ async fn remap_index_tagged(dataset: &mut Dataset, index_id: &Uuid) -> Result<()
         TaggedRemapPlan::Identity => return Ok(()),
         TaggedRemapPlan::AddressOnly { hops } => {
             let entry_version = entry.dataset_version;
-            return remap_index_address_only(dataset, &ledger, entry_version, curr_index_meta, hops)
-                .await;
+            return remap_index_address_only(
+                dataset,
+                &ledger,
+                entry_version,
+                curr_index_meta,
+                hops,
+            )
+            .await;
         }
         TaggedRemapPlan::Remap { hops, coverage } => {
             (materialize_hops(dataset, &ledger, hops).await?, coverage)
@@ -1186,8 +1188,7 @@ mod tests {
                 ordered(&[8, 12], &[13]),
             ])
             .await;
-            let TaggedRemapPlan::AddressOnly { hops } =
-                plan_tagged_remap(&ledger, &coverage(&[1]))
+            let TaggedRemapPlan::AddressOnly { hops } = plan_tagged_remap(&ledger, &coverage(&[1]))
             else {
                 panic!("expected an address-only plan");
             };
