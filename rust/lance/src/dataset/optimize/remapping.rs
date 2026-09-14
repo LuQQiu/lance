@@ -399,8 +399,19 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
 #[derive(Debug)]
 enum PlannedHop {
     Compaction(RowAddrRemap),
-    /// Index into `ledger.transitions()`.
-    StablePartition(usize),
+    /// A stable-partition hop. `position` indexes `ledger.transitions()`;
+    /// `enter_fragments` is the subset of that transition's SOURCE fragments
+    /// the segment's addresses actually occupy when they reach this hop
+    /// (its provenance pushed forward through the preceding hops, intersected
+    /// with the transition's sources). Materializing the row map over only
+    /// these fragments -- rather than every source of the transition -- keeps
+    /// the map O(segment rows), not O(table rows): a segment covering a
+    /// quarter of a full-table partition builds a quarter-size map, and the
+    /// reader only ever looks up the addresses this segment stores anyway.
+    StablePartition {
+        position: usize,
+        enter_fragments: RoaringBitmap,
+    },
 }
 
 /// The outcome of walking a segment's stored provenance forward through a
@@ -465,7 +476,8 @@ fn plan_tagged_remap(ledger: &FragReuseLedger, provenance: &RoaringBitmap) -> Ta
             .iter()
             .map(|digest| digest.id as u32)
             .collect();
-        if !(&sources & &translated).is_empty() {
+        let translated_overlap = &sources & &translated;
+        if !translated_overlap.is_empty() {
             translated -= &sources;
             translated.extend(
                 transition
@@ -475,7 +487,10 @@ fn plan_tagged_remap(ledger: &FragReuseLedger, provenance: &RoaringBitmap) -> Ta
             );
             all_hops.push(match transition.mapping() {
                 Mapping::OrderedCompaction(remap) => PlannedHop::Compaction(remap.as_ref().clone()),
-                Mapping::StablePartition(_) => PlannedHop::StablePartition(position),
+                Mapping::StablePartition(_) => PlannedHop::StablePartition {
+                    position,
+                    enter_fragments: translated_overlap,
+                },
             });
         }
         let overlap = &sources & &coverage;
@@ -492,7 +507,13 @@ fn plan_tagged_remap(ledger: &FragReuseLedger, provenance: &RoaringBitmap) -> Ta
             );
             hops.push(match transition.mapping() {
                 Mapping::OrderedCompaction(remap) => PlannedHop::Compaction(remap.as_ref().clone()),
-                Mapping::StablePartition(_) => PlannedHop::StablePartition(position),
+                // Fully covered: the segment owns every source of this
+                // transition, so its entering fragment set is exactly the
+                // sources (the free / restamp case).
+                Mapping::StablePartition(_) => PlannedHop::StablePartition {
+                    position,
+                    enter_fragments: overlap.clone(),
+                },
             });
             applied[position] = true;
         } else {
@@ -548,20 +569,40 @@ async fn materialize_hops(
     for hop in hops {
         remaps.push(match hop {
             PlannedHop::Compaction(remap) => remap,
-            PlannedHop::StablePartition(position) => {
-                materialize_stable_partition(dataset, &ledger.transitions()[position]).await?
+            PlannedHop::StablePartition {
+                position,
+                enter_fragments,
+            } => {
+                materialize_stable_partition(
+                    dataset,
+                    &ledger.transitions()[position],
+                    &enter_fragments,
+                )
+                .await?
             }
         });
     }
     Ok(RowAddrRemap::chained(remaps))
 }
 
-/// Materialize one stable-partition transition as a fully materialized
-/// source-address → destination-address map by sweeping every source address
-/// (fragment id + `0..physical_rows`) through the transition's row map.
+/// Materialize one stable-partition transition as a materialized
+/// source-address → destination-address map by sweeping the source addresses
+/// (fragment id + `0..physical_rows`) the remapped segment actually stores
+/// through the transition's row map.
+///
+/// `enter_fragments` bounds the enumeration to the SOURCE fragments the
+/// segment's addresses occupy when they reach this hop, so the resulting map
+/// is O(segment rows), not O(table rows). This is exactly the set the reader
+/// would ever look up: `index::remap_index` streams only the segment's own
+/// stored addresses through the returned map, and any address outside these
+/// fragments is not one the segment stores. (A fragment listed in
+/// `enter_fragments` that is not a source of this transition contributes
+/// nothing: its addresses would remain unaffected by the map, matching the
+/// tri-state `None` a full-table map returns for them.)
 async fn materialize_stable_partition(
     dataset: &Dataset,
     transition: &lance_table::system_index::frag_reuse::ledger::Transition,
+    enter_fragments: &RoaringBitmap,
 ) -> Result<RowAddrRemap> {
     use lance_core::utils::fragment_reuse::MappingReader;
     use lance_index::frag_reuse::stable_partition::{MAPPING_FILE, StablePartitionMapping};
@@ -605,6 +646,7 @@ async fn materialize_stable_partition(
     let addrs: Vec<u64> = transition
         .sources()
         .iter()
+        .filter(|digest| enter_fragments.contains(digest.id as u32))
         .flat_map(|digest| {
             let fragment = digest.id as u32;
             (0..digest.physical_rows as u32)
@@ -1078,7 +1120,7 @@ mod tests {
         fn compose(hops: Vec<PlannedHop>) -> RowAddrRemap {
             RowAddrRemap::chained(hops.into_iter().map(|hop| match hop {
                 PlannedHop::Compaction(remap) => remap,
-                PlannedHop::StablePartition(position) => {
+                PlannedHop::StablePartition { position, .. } => {
                     panic!("hop {position} needs row-map IO; not composable in a plan test")
                 }
             }))
@@ -1136,7 +1178,10 @@ mod tests {
                 panic!("expected a remap plan");
             };
             assert_eq!(coverage, RoaringBitmap::from_iter([2u32]));
-            assert!(matches!(hops.as_slice(), [PlannedHop::StablePartition(0)]));
+            assert!(matches!(
+                hops.as_slice(),
+                [PlannedHop::StablePartition { position: 0, .. }]
+            ));
         }
 
         /// A5 (revised): the free case composes downstream of a compaction
@@ -1152,7 +1197,10 @@ mod tests {
             assert_eq!(coverage, RoaringBitmap::from_iter([3u32]));
             assert!(matches!(
                 hops.as_slice(),
-                [PlannedHop::Compaction(_), PlannedHop::StablePartition(1)]
+                [
+                    PlannedHop::Compaction(_),
+                    PlannedHop::StablePartition { position: 1, .. }
+                ]
             ));
         }
 
@@ -1168,10 +1216,20 @@ mod tests {
             else {
                 panic!("expected an address-only plan");
             };
-            assert!(matches!(
-                hops.as_slice(),
-                [PlannedHop::Compaction(_), PlannedHop::StablePartition(1)]
-            ));
+            let [
+                PlannedHop::Compaction(_),
+                PlannedHop::StablePartition {
+                    position: 1,
+                    enter_fragments,
+                },
+            ] = hops.as_slice()
+            else {
+                panic!("expected a compaction then a straddled stable partition");
+            };
+            // The segment covers only source {5} of the partition {5,7}->{6};
+            // the materialized map must enumerate that fragment alone, never
+            // the sibling-owned {7}.
+            assert_eq!(enter_fragments, &RoaringBitmap::from_iter([5u32]));
         }
 
         /// An address-only plan keeps following the chain past the straddled
@@ -1196,7 +1254,7 @@ mod tests {
                 hops.as_slice(),
                 [
                     PlannedHop::Compaction(_),
-                    PlannedHop::StablePartition(1),
+                    PlannedHop::StablePartition { position: 1, .. },
                     PlannedHop::Compaction(_),
                     PlannedHop::Compaction(_)
                 ]
