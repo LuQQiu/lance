@@ -671,7 +671,9 @@ async fn remap_index_tagged(dataset: &mut Dataset, index_id: &Uuid) -> Result<()
     let (remap, mut coverage) = match plan_tagged_remap(&ledger, &provenance) {
         TaggedRemapPlan::Identity => return Ok(()),
         TaggedRemapPlan::AddressOnly { hops } => {
-            return remap_index_address_only(dataset, &ledger, curr_index_meta, hops).await;
+            let entry_version = entry.dataset_version;
+            return remap_index_address_only(dataset, &ledger, entry_version, curr_index_meta, hops)
+                .await;
         }
         TaggedRemapPlan::Remap { hops, coverage } => {
             (materialize_hops(dataset, &ledger, hops).await?, coverage)
@@ -790,9 +792,32 @@ async fn remap_index_tagged(dataset: &mut Dataset, index_id: &Uuid) -> Result<()
 async fn remap_index_address_only(
     dataset: &mut Dataset,
     ledger: &FragReuseLedger,
+    entry_version: u64,
     curr_index_meta: IndexMetadata,
     hops: Vec<PlannedHop>,
 ) -> Result<()> {
+    // Idempotence gate. The unchanged bitmap re-derives the same
+    // AddressOnly plan on every maintenance run, so the plan alone cannot
+    // tell a translated segment from an untranslated one. The version
+    // stamps can: on a tagged table only a remap swap or an index (re)build
+    // advances a user segment's dataset_version (both stamp the manifest
+    // version they were built against), and every ledger append rewrites
+    // the FRI entry with the version IT was built against. A segment at or
+    // past the entry's version has therefore already been address-remapped
+    // (or rebuilt) past everything the ledger currently holds; re-running
+    // the rewrite would be a per-row no-op by idempotence, so plan a no-op
+    // with no commit at all.
+    if curr_index_meta.dataset_version >= entry_version {
+        log::info!(
+            "Index {} ({}) is already address-remapped past the reuse ledger \
+             (segment version {}, ledger entry version {}); nothing to do",
+            curr_index_meta.name,
+            curr_index_meta.uuid,
+            curr_index_meta.dataset_version,
+            entry_version,
+        );
+        return Ok(());
+    }
     // The query listing derives this segment's servable coverage, and a
     // segment whose ENTIRE coverage straddles the stable partition derives
     // none at all, so it is not listed -- and `index::remap_index` resolves
@@ -1591,6 +1616,68 @@ mod tests {
                     "results changed for {predicate:?}"
                 );
             }
+        }
+
+        /// A13: the address-only remap is idempotent at the planner level.
+        /// A second maintenance run finds the segment stamped at or past
+        /// the FRI entry's version, plans a no-op, and commits nothing.
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn address_only_remap_second_run_is_noop() {
+            let dataset = reader_tests::fixture().await;
+            let mut dataset = append_two_fragments(dataset).await;
+            reserve_fragments(&mut dataset, 40).await;
+            let mut dataset = commit_stable_partition(dataset, &[1, 2], 10).await;
+
+            let before = stored_index(&dataset, "i_idx").await;
+            remap_column_index(&mut dataset, &["i"], Some("i_idx".into()))
+                .await
+                .unwrap();
+            let after_first = stored_index(&dataset, "i_idx").await;
+            assert_ne!(after_first.uuid, before.uuid, "the first run must rewrite");
+            let version_after_first = dataset.manifest.version;
+
+            // The ledger record is still present, so the plan derives
+            // AddressOnly again -- only the version gate stops the rewrite.
+            let entry = stored_index(&dataset, FRAG_REUSE_INDEX_NAME).await;
+            assert!(
+                after_first.dataset_version >= entry.dataset_version,
+                "gate precondition: the swap stamps at or past the entry"
+            );
+            remap_column_index(&mut dataset, &["i"], Some("i_idx".into()))
+                .await
+                .unwrap();
+            assert_eq!(
+                dataset.manifest.version, version_after_first,
+                "the second run must commit nothing"
+            );
+            let after_second = stored_index(&dataset, "i_idx").await;
+            assert_eq!(after_second.uuid, after_first.uuid);
+            assert_eq!(after_second.fragment_bitmap, after_first.fragment_bitmap);
+        }
+
+        /// A18: a stable-partition rewrite commit on a tagged table
+        /// (deferred remap, no index work) leaves the covering user index's
+        /// dataset_version AND fragment_bitmap untouched. This pins the
+        /// invariant the idempotence gate relies on: nothing advances a
+        /// user segment's version stamp except a remap swap or a rebuild,
+        /// while every ledger append rewrites the FRI entry's stamp.
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn stable_partition_commit_leaves_user_index_stamp_alone() {
+            let dataset = reader_tests::fixture().await;
+            let mut dataset = append_two_fragments(dataset).await;
+            reserve_fragments(&mut dataset, 40).await;
+            let before = stored_index(&dataset, "i_idx").await;
+            let dataset = commit_stable_partition(dataset, &[1, 2], 10).await;
+            let after = stored_index(&dataset, "i_idx").await;
+            assert_eq!(after.uuid, before.uuid);
+            assert_eq!(after.dataset_version, before.dataset_version);
+            assert_eq!(after.fragment_bitmap, before.fragment_bitmap);
+            // And the append stamped the FRI entry past the segment, which
+            // is what arms (and later closes) the address-only gate.
+            let entry = stored_index(&dataset, FRAG_REUSE_INDEX_NAME).await;
+            assert!(entry.dataset_version > after.dataset_version);
         }
 
         /// A8/A9 integration: a segment covering only part of a compaction
