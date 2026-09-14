@@ -1503,9 +1503,10 @@ mod tests {
             );
             prost::encoding::encode_varint(6, &mut content);
             content.extend_from_slice(b"future");
-            let ledger = crate::index::frag_reuse::decode_frag_reuse_ledger_from_content(1, &content)
-                .await
-                .unwrap();
+            let ledger =
+                crate::index::frag_reuse::decode_frag_reuse_ledger_from_content(1, &content)
+                    .await
+                    .unwrap();
             assert!(ledger.has_unsupported_transitions());
             let entry = named_index(FRAG_REUSE_INDEX_NAME, 10, &[2]);
             assert!(!frag_reuse_version_needs_no_translation(
@@ -1513,7 +1514,11 @@ mod tests {
                 &entry,
                 &[entry.clone(), named_index("a_idx", 10, &[1, 2])],
             ));
-            assert!(!frag_reuse_version_needs_no_translation(&ledger, &entry, &[]));
+            assert!(!frag_reuse_version_needs_no_translation(
+                &ledger,
+                &entry,
+                &[]
+            ));
         }
 
         /// The per-transition retention rule (B1-B5, B7-B9): retain iff some
