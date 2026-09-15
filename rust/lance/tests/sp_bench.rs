@@ -187,6 +187,29 @@ struct Config {
     ivf_partitions: usize,
     topk: usize,
     nprobes: usize,
+    /// SPBENCH_INDEX_TYPE: "ivf_rq_1bit" (default), "ivf_rq_8bit", "ivf_pq".
+    /// Controls both the built index and the from-scratch rebuild baseline so
+    /// remap-vs-rebuild is measured for the same index kind.
+    index_type: String,
+}
+
+/// Vector index params for the configured index type. Both the segmented build
+/// and the rebuild baseline call this so they stay identical.
+fn index_params(cfg: &Config) -> VectorIndexParams {
+    match cfg.index_type.as_str() {
+        "ivf_rq_1bit" => VectorIndexParams::ivf_rq(cfg.ivf_partitions, 1, DistanceType::L2),
+        "ivf_rq_8bit" => VectorIndexParams::ivf_rq(cfg.ivf_partitions, 8, DistanceType::L2),
+        "ivf_pq" => VectorIndexParams::ivf_pq(
+            cfg.ivf_partitions,
+            8,
+            (cfg.dim / 8).max(1),
+            DistanceType::L2,
+            50,
+        ),
+        other => panic!(
+            "unknown SPBENCH_INDEX_TYPE {other:?}; use ivf_rq_1bit | ivf_rq_8bit | ivf_pq"
+        ),
+    }
 }
 
 /// INGEST + INDEX interleaved the natural OSS way: ingest one slice of whole
@@ -241,7 +264,7 @@ async fn ingest_and_index(uri: &str, cfg: &Config, prefix: &str) -> (Dataset, u6
         let ds = dataset.as_mut().unwrap();
         let t = Instant::now();
         if seg == 0 {
-            let params = VectorIndexParams::ivf_rq(cfg.ivf_partitions, 1, DistanceType::L2);
+            let params = index_params(cfg);
             ds.create_index(
                 &["vec"],
                 IndexType::Vector,
@@ -537,6 +560,7 @@ async fn run_fixture(
     dataset_dir: &str,
     cfg: &Config,
     prefix: &str,
+    cloud: bool,
 ) -> (u64, u64, u64, Dataset) {
     assert_eq!(
         cfg.rows % cfg.src_frags,
@@ -611,15 +635,20 @@ async fn run_fixture(
     println!("SPBENCH {prefix}gate=ok");
 
     // A12-style IO check on fresh sessions: queries at S2 need the row map,
-    // queries at S3 must not touch it.
-    let fri_s2 = fri_reads_for_query(uri, s2, query, cfg).await;
-    let fri_s3 = fri_reads_for_query(uri, s3, query, cfg).await;
-    println!("SPBENCH {prefix}fri_reads_query_s2={fri_s2}");
-    println!("SPBENCH {prefix}fri_reads_query_s3={fri_s3}");
-    assert_eq!(
-        fri_s3, 0,
-        "queries after the remap must not read the row map"
-    );
+    // queries at S3 must not touch it. Skipped in cloud mode (the check keys on
+    // local-fs path walking); correctness is still covered by the gate above.
+    if cloud {
+        println!("SPBENCH {prefix}fri_reads_query_skipped_cloud");
+    } else {
+        let fri_s2 = fri_reads_for_query(uri, s2, query, cfg).await;
+        let fri_s3 = fri_reads_for_query(uri, s3, query, cfg).await;
+        println!("SPBENCH {prefix}fri_reads_query_s2={fri_s2}");
+        println!("SPBENCH {prefix}fri_reads_query_s3={fri_s3}");
+        assert_eq!(
+            fri_s3, 0,
+            "queries after the remap must not read the row map"
+        );
+    }
 
     (s1, s2, s3, dataset)
 }
@@ -637,7 +666,13 @@ async fn sp_bench() {
         ivf_partitions: env_usize("SPBENCH_IVF_PARTITIONS", (rows / 1000).clamp(16, 4096)),
         topk: env_usize("SPBENCH_TOPK", 10),
         nprobes: env_usize("SPBENCH_NPROBES", 32),
+        index_type: std::env::var("SPBENCH_INDEX_TYPE")
+            .unwrap_or_else(|_| "ivf_rq_1bit".to_string()),
     };
+    // SPBENCH_CLOUD=1 allows an object-store URI (e.g. az://...). The SP driver
+    // already writes the row map through the dataset object store, so cloud
+    // backing works; the local-fs `_fri` read-count check is skipped in this mode.
+    let cloud = std::env::var("SPBENCH_CLOUD").as_deref() == Ok("1");
     let tmp = tempfile::tempdir().unwrap();
     let dataset_dir = std::env::var("SPBENCH_URI").unwrap_or_else(|_| {
         tmp.path()
@@ -647,9 +682,9 @@ async fn sp_bench() {
             .to_string()
     });
     assert!(
-        !dataset_dir.contains("://") || dataset_dir.starts_with("file://"),
-        "SPBENCH_URI must be a local path; the harness writes the row map and \
-         walks _fri via the local filesystem"
+        cloud || !dataset_dir.contains("://") || dataset_dir.starts_with("file://"),
+        "SPBENCH_URI must be a local path unless SPBENCH_CLOUD=1; the harness \
+         writes the row map and walks _fri via the local filesystem"
     );
     let dataset_dir = dataset_dir
         .strip_prefix("file://")
@@ -662,7 +697,7 @@ async fn sp_bench() {
     );
 
     let (s1, s2, s3, mut dataset) =
-        Box::pin(run_fixture(&dataset_dir, &dataset_dir, &cfg, "")).await;
+        Box::pin(run_fixture(&dataset_dir, &dataset_dir, &cfg, "", cloud)).await;
 
     // Stage 5 (optional): free-case leg on a second dataset with SEGMENTS=1;
     // its post-remap version is S4.
@@ -678,6 +713,7 @@ async fn sp_bench() {
             &freecase_dir,
             &freecase_cfg,
             "freecase_",
+            cloud,
         ))
         .await;
         Some(freecase_s3)
@@ -688,7 +724,7 @@ async fn sp_bench() {
     // Stage 6: REBUILD BASELINE, last so S1-S3 stay undisturbed (this commits
     // a new version past S3).
     let t = Instant::now();
-    let params = VectorIndexParams::ivf_rq(cfg.ivf_partitions, 1, DistanceType::L2);
+    let params = index_params(&cfg);
     dataset
         .create_index(
             &["vec"],
