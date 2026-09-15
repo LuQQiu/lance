@@ -308,7 +308,7 @@ async fn ingest_and_index(uri: &str, cfg: &Config, prefix: &str) -> (Dataset, u6
     );
     println!("SPBENCH {prefix}ingest_secs={ingest_secs:.3}");
     println!("SPBENCH {prefix}index_secs={index_secs:.3}");
-    println!("SPBENCH {prefix}index_variant=IVF_RQ_1bit");
+    println!("SPBENCH {prefix}index_variant={}", cfg.index_type);
     let s1 = dataset.version().version;
     (dataset, s1)
 }
