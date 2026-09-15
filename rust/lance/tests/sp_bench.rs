@@ -207,9 +207,17 @@ fn index_params(cfg: &Config) -> VectorIndexParams {
             DistanceType::L2,
             50,
         ),
-        other => {
-            panic!("unknown SPBENCH_INDEX_TYPE {other:?}; use ivf_rq_1bit | ivf_rq_8bit | ivf_pq")
-        }
+        // IVF_HNSW_SQ: graph-building index, the most expensive to rebuild —
+        // the case where remap is most likely to beat rebuild.
+        "ivf_hnsw_sq" => VectorIndexParams::with_ivf_hnsw_sq_params(
+            DistanceType::L2,
+            lance_index::vector::ivf::IvfBuildParams::new(cfg.ivf_partitions),
+            lance_index::vector::hnsw::builder::HnswBuildParams::default(),
+            lance_index::vector::sq::builder::SQBuildParams::default(),
+        ),
+        other => panic!(
+            "unknown SPBENCH_INDEX_TYPE {other:?}; use ivf_rq_1bit | ivf_rq_8bit | ivf_pq | ivf_hnsw_sq"
+        ),
     }
 }
 
