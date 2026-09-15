@@ -7,7 +7,8 @@
 //! States produced (versions printed as `SPBENCH S1=.. S2=.. S3=..`):
 //!   S1 = segmented IVF_RQ(1-bit) index over the source fragments
 //!   S2 = after a synthetic stable partition ALL src -> dest fragments
-//!   S3 = after the tagged remap job (address-only path when SEGMENTS > 1)
+//!   S3 = after the tagged remap job (free-case restamp for fully-covered
+//!        segments; partially-covered segments are skipped)
 //!   S4 = (optional, `SPBENCH_FREECASE=1`) restamp path on a second dataset
 //!        with SEGMENTS=1, at `<uri>_freecase`
 //!
@@ -206,9 +207,9 @@ fn index_params(cfg: &Config) -> VectorIndexParams {
             DistanceType::L2,
             50,
         ),
-        other => panic!(
-            "unknown SPBENCH_INDEX_TYPE {other:?}; use ivf_rq_1bit | ivf_rq_8bit | ivf_pq"
-        ),
+        other => {
+            panic!("unknown SPBENCH_INDEX_TYPE {other:?}; use ivf_rq_1bit | ivf_rq_8bit | ivf_pq")
+        }
     }
 }
 
@@ -601,8 +602,9 @@ async fn run_fixture(
     );
     println!("SPBENCH {prefix}s2={s2}");
 
-    // Stage 4: REMAP (tagged remap job; AddressOnly when SEGMENTS > 1, the
-    // free-case restamp when SEGMENTS == 1).
+    // Stage 4: REMAP (tagged remap job; the free-case restamp when the
+    // segment fully covers the partition, a clean skip when it only partially
+    // covers it).
     if let Some(kb) = vmhwm_kb() {
         println!("SPBENCH {prefix}vmhwm_before_remap_kb={kb}");
     } else {

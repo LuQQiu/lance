@@ -883,80 +883,6 @@ pub(crate) async fn derive_tagged_trim(dataset: &Dataset) -> lance_core::Result<
     })
 }
 
-/// Whether one retained manifest version provably never translates a row
-/// address through its tagged FRI history again, so garbage collection may
-/// stop counting that version's references to the history's stable-partition
-/// row-map payloads (`_fri/<map_id>/`).
-///
-/// This is a pure client-side GC policy over `ledger` (the version's decoded
-/// tagged FRI history), `entry` (the version's tagged FRI entry metadata,
-/// whose `dataset_version` stamp is rewritten by every ledger append), and
-/// `indices` (the version's full stored index metadata list). It changes
-/// nothing on the wire: the ledger content bytes, the entry, and the format
-/// are untouched, exactly like the v1 precedent where version-gated mapping
-/// deletion has always been implementation behavior, never format.
-///
-/// Coarse catch-up predicate (all transitions or none for the version):
-/// every non-system index segment must satisfy one of
-/// * its stored fragment bitmap is disjoint from the union of ALL
-///   transitions' source and destination fragment ids (it holds no address
-///   the history moves; fragment ids are never reused), or
-/// * `segment.dataset_version >= entry.dataset_version` -- the segment was
-///   remapped or rebuilt past everything the ledger holds.
-///
-/// A segment this build cannot serve (`index_is_usable` false, the same
-/// filter the trim and the superseded prune use) conservatively FAILS the
-/// predicate: its translation needs are invisible. A segment without a
-/// stored fragment bitmap fails unless its stamp is caught up. A ledger
-/// carrying records this client cannot interpret never passes (mirroring the
-/// GC resolver's refusal).
-///
-/// # Soundness
-///
-/// The stamp arm relies on the invariant that no tagged code path advances a
-/// user index segment's `dataset_version` without a completed remap or
-/// rebuild (pinned by `stable_partition_commit_leaves_user_index_stamp_alone`);
-/// it holds within this writer family. If third-party tagged writers ever
-/// appear, the invariant graduates to a spec sentence; until then this stays
-/// client policy.
-pub(crate) fn frag_reuse_version_needs_no_translation(
-    ledger: &lance_table::system_index::frag_reuse::ledger::FragReuseLedger,
-    entry: &IndexMetadata,
-    indices: &[IndexMetadata],
-) -> bool {
-    if ledger.has_unsupported_transitions() {
-        return false;
-    }
-    // The chain bitmap: every fragment any transition touches. Destinations
-    // are included deliberately: a deferred-remap commit can advance a
-    // covering segment's bitmap onto them before its stored addresses are
-    // remapped, so an old-frag-only check could clear a still-stale segment.
-    let mut chain = RoaringBitmap::new();
-    for transition in ledger.transitions() {
-        chain.extend(transition.sources().iter().map(|digest| digest.id as u32));
-        chain.extend(
-            transition
-                .destinations()
-                .iter()
-                .map(|digest| digest.id as u32),
-        );
-    }
-    indices
-        .iter()
-        .filter(|segment| !is_system_index(segment))
-        .all(|segment| {
-            if !crate::index::index_is_usable(segment) {
-                return false;
-            }
-            if let Some(bitmap) = segment.fragment_bitmap.as_ref()
-                && bitmap.is_disjoint(&chain)
-            {
-                return true;
-            }
-            segment.dataset_version >= entry.dataset_version
-        })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1394,24 +1320,20 @@ mod tests {
             }
         }
 
-        fn sp_transition(sources: &[u64], destinations: &[u64]) -> pb_fri::Transition {
-            pb_fri::Transition {
-                sources: sources.iter().copied().map(digest).collect(),
-                destinations: destinations.iter().copied().map(digest).collect(),
-                mapping: Some(pb_fri::transition::Mapping::StablePartition(
-                    pb_fri::StablePartition {
-                        map_id: Uuid::new_v4().to_string(),
-                        map_size_bytes: 1,
-                        base_id: None,
-                    },
-                )),
-            }
-        }
-
         fn transition_element(sources: &[u64], destinations: &[u64]) -> TrimElement {
             TrimElement {
                 raw: Vec::new(),
-                record: TrimRecord::Transition(sp_transition(sources, destinations)),
+                record: TrimRecord::Transition(pb_fri::Transition {
+                    sources: sources.iter().copied().map(digest).collect(),
+                    destinations: destinations.iter().copied().map(digest).collect(),
+                    mapping: Some(pb_fri::transition::Mapping::StablePartition(
+                        pb_fri::StablePartition {
+                            map_id: Uuid::new_v4().to_string(),
+                            map_size_bytes: 1,
+                            base_id: None,
+                        },
+                    )),
+                }),
             }
         }
 
@@ -1426,99 +1348,6 @@ mod tests {
             let mut index = super::index_covering(dataset_version, covered);
             index.name = name.into();
             index
-        }
-
-        async fn predicate_ledger(
-            transitions: Vec<pb_fri::Transition>,
-        ) -> lance_table::system_index::frag_reuse::ledger::FragReuseLedger {
-            use prost::Message;
-            let content = pb_fri::InlineContent {
-                legacy_versions: vec![],
-                transitions,
-            }
-            .encode_to_vec();
-            crate::index::frag_reuse::decode_frag_reuse_ledger_from_content(1, &content)
-                .await
-                .unwrap()
-        }
-
-        /// P1-P5: the payload-release catch-up predicate over one version's
-        /// ledger and stored index metadata: caught-up and disjoint segments
-        /// pass, a stale or unusable or bitmap-less segment pins, and system
-        /// indexes never count.
-        #[tokio::test]
-        async fn release_predicate_rules() {
-            let ledger = predicate_ledger(vec![sp_transition(&[1, 2], &[5, 6])]).await;
-            let entry = named_index(FRAG_REUSE_INDEX_NAME, 10, &[5, 6]);
-            let pass = |indices: &[IndexMetadata]| {
-                frag_reuse_version_needs_no_translation(&ledger, &entry, indices)
-            };
-
-            // P1: every segment stamped at/past the entry: caught up.
-            assert!(pass(&[entry.clone(), named_index("a_idx", 10, &[5, 6])]));
-            // P2: one stale segment intersecting the chain fails the version,
-            // no matter how many siblings are caught up.
-            assert!(!pass(&[
-                entry.clone(),
-                named_index("a_idx", 10, &[5, 6]),
-                named_index("b_idx", 9, &[2, 3]),
-            ]));
-            // Destinations count as intersecting too: a deferred-remap commit
-            // advances coverage onto them before the addresses move.
-            assert!(!pass(&[entry.clone(), named_index("a_idx", 9, &[5])]));
-            // P3: a disjoint segment does not block, no matter how stale.
-            assert!(pass(&[entry.clone(), named_index("a_idx", 1, &[3, 4])]));
-            // A missing bitmap is conservative unless the stamp is caught up.
-            let mut no_bitmap = named_index("a_idx", 9, &[]);
-            no_bitmap.fragment_bitmap = None;
-            assert!(!pass(&[entry.clone(), no_bitmap.clone()]));
-            no_bitmap.dataset_version = 10;
-            assert!(pass(&[entry.clone(), no_bitmap]));
-            // P4: a segment this build cannot serve pins, even disjoint and
-            // stamped past the entry: its translation needs are invisible.
-            let mut unusable = named_index("a_idx", 10, &[3, 4]);
-            unusable.index_details = unusable_details();
-            assert!(!pass(&[entry.clone(), unusable]));
-            // P5: system indexes are ignored, however stale their stamps.
-            assert!(pass(&[
-                entry.clone(),
-                named_index(FRAG_REUSE_INDEX_NAME, 1, &[1, 2]),
-            ]));
-        }
-
-        /// P6: a ledger carrying records this client cannot interpret never
-        /// passes, even over a fully caught-up (or empty) segment set.
-        #[tokio::test]
-        async fn release_predicate_refuses_unsupported_ledger() {
-            use prost::Message;
-            let mut content = pb_fri::InlineContent {
-                legacy_versions: vec![],
-                transitions: vec![sp_transition(&[1], &[2])],
-            }
-            .encode_to_vec();
-            prost::encoding::encode_key(
-                9,
-                prost::encoding::WireType::LengthDelimited,
-                &mut content,
-            );
-            prost::encoding::encode_varint(6, &mut content);
-            content.extend_from_slice(b"future");
-            let ledger =
-                crate::index::frag_reuse::decode_frag_reuse_ledger_from_content(1, &content)
-                    .await
-                    .unwrap();
-            assert!(ledger.has_unsupported_transitions());
-            let entry = named_index(FRAG_REUSE_INDEX_NAME, 10, &[2]);
-            assert!(!frag_reuse_version_needs_no_translation(
-                &ledger,
-                &entry,
-                &[entry.clone(), named_index("a_idx", 10, &[1, 2])],
-            ));
-            assert!(!frag_reuse_version_needs_no_translation(
-                &ledger,
-                &entry,
-                &[]
-            ));
         }
 
         /// The per-transition retention rule (B1-B5, B7-B9): retain iff some

@@ -329,15 +329,6 @@ struct CleanupInspection {
     /// `_fri/` garbage collection is skipped for the run rather than risking
     /// row maps the branch references invisibly.
     skip_frag_reuse_gc: bool,
-    /// The full stored index metadata of each retained (working-set)
-    /// manifest version that carries a tagged FRI entry. Recorded only when
-    /// `CleanupPolicy::release_caught_up_row_maps` is on, so the catch-up
-    /// predicate can run per version during row-map reference resolution.
-    frag_reuse_version_indexes: HashMap<u64, Vec<IndexMetadata>>,
-    /// Manifest versions retained outside the normal working-set walk (a
-    /// branch rescue): their index metadata was not recorded above, so their
-    /// row-map references are conservatively never released.
-    frag_reuse_pinned_versions: HashSet<u64>,
     /// The earliest timestamp of all retained manifests.
     earliest_retained_manifest_time: Option<DateTime<Utc>>,
     /// The latest timestamp of all manifests that will be removed.
@@ -706,19 +697,6 @@ impl<'a> CleanupTask<'a> {
                     .push(index.uuid);
             }
         }
-        // The release policy needs this version's full segment metadata to
-        // evaluate the catch-up predicate at reference-resolution time (the
-        // ledger is only decoded there, once per unique entry).
-        if in_working_set
-            && self.policy.release_caught_up_row_maps
-            && inspection
-                .frag_reuse_entry_versions
-                .contains_key(&manifest.version)
-        {
-            inspection
-                .frag_reuse_version_indexes
-                .insert(manifest.version, indexes.clone());
-        }
         Ok(())
     }
 
@@ -742,7 +720,7 @@ impl<'a> CleanupTask<'a> {
     async fn resolve_frag_reuse_map_ids(&self, inspection: &mut CleanupInspection) -> bool {
         let entries = std::mem::take(&mut inspection.frag_reuse_entries);
         for (uuid, (entry, in_working_set)) in entries.iter() {
-            let resolution = async {
+            let map_ids = async {
                 let content =
                     crate::index::frag_reuse::load_raw_frag_reuse_content(self.dataset, entry)
                         .await?;
@@ -756,12 +734,8 @@ impl<'a> CleanupTask<'a> {
                         "the tagged FRI history carries transitions this client cannot interpret",
                     ));
                 }
-                Ok::<_, Error>(ledger)
-            }
-            .await;
-            match resolution {
-                Ok(ledger) => {
-                    let map_ids: Vec<String> = ledger
+                Ok::<Vec<String>, Error>(
+                    ledger
                         .transitions()
                         .iter()
                         .filter_map(|transition| {
@@ -772,22 +746,12 @@ impl<'a> CleanupTask<'a> {
                             _ => None,
                         }
                         })
-                        .collect();
-                    if map_ids.is_empty() {
-                        continue;
-                    }
-                    if *in_working_set
-                        && self.policy.release_caught_up_row_maps
-                        && self.frag_reuse_entry_caught_up(uuid, entry, &ledger, inspection)
-                    {
-                        // Released: every retained version carrying this
-                        // entry provably never translates through the
-                        // history again, so nothing references its row maps.
-                        // They age out through the existing
-                        // unverified-retention ladder; no commit, no marker,
-                        // and the entry content bytes are untouched.
-                        continue;
-                    }
+                        .collect(),
+                )
+            }
+            .await;
+            match map_ids {
+                Ok(map_ids) => {
                     let target = if *in_working_set {
                         &mut inspection.referenced_files
                     } else {
@@ -807,46 +771,6 @@ impl<'a> CleanupTask<'a> {
             }
         }
         true
-    }
-
-    /// Whether every retained manifest version carrying this tagged FRI
-    /// entry passes the catch-up predicate, so the entry's row-map
-    /// references can be released under
-    /// `CleanupPolicy::release_caught_up_row_maps`.
-    ///
-    /// Conservative on both edges: a version pinned by a branch rescue (its
-    /// segment metadata was never recorded) fails, and an entry with no
-    /// recorded retained version at all fails. Expiring versions carrying
-    /// the entry impose nothing: their references disappear with them.
-    fn frag_reuse_entry_caught_up(
-        &self,
-        uuid: &uuid::Uuid,
-        entry: &IndexMetadata,
-        ledger: &lance_table::system_index::frag_reuse::ledger::FragReuseLedger,
-        inspection: &CleanupInspection,
-    ) -> bool {
-        let mut evaluated = false;
-        for (version, uuids) in inspection.frag_reuse_entry_versions.iter() {
-            if !uuids.contains(uuid) {
-                continue;
-            }
-            if inspection.frag_reuse_pinned_versions.contains(version) {
-                return false;
-            }
-            let Some(indexes) = inspection.frag_reuse_version_indexes.get(version) else {
-                // An expiring version: it stops referencing the maps when it
-                // goes, and while both it and the entry are retained the
-                // working-set walk records its metadata.
-                continue;
-            };
-            evaluated = true;
-            if !crate::dataset::index::frag_reuse::frag_reuse_version_needs_no_translation(
-                ledger, entry, indexes,
-            ) {
-                return false;
-            }
-        }
-        evaluated
     }
 
     async fn delete_unreferenced_files(
@@ -1690,12 +1614,6 @@ impl<'a> CleanupTask<'a> {
                         entry.1 = true;
                     }
                 }
-                // Rescued outside the working-set walk: no segment metadata
-                // was recorded for it, so the release policy must never drop
-                // this version's row-map references.
-                inspection
-                    .frag_reuse_pinned_versions
-                    .insert(referenced_version);
             }
         }
 
@@ -1742,15 +1660,6 @@ pub struct CleanupPolicy {
     /// On stores with bulk delete, each request can include multiple paths.
     /// For example, `Some(100)` limits deletions to 100 delete requests per second.
     pub delete_rate_limit: Option<u64>,
-    /// If true, release fragment-reuse row-map payloads (`_fri/<map_id>/`)
-    /// whose retained manifest versions have all caught up: a version counts
-    /// a reference only while some usable non-system index segment could
-    /// still translate addresses through the history (see
-    /// `frag_reuse_version_needs_no_translation`). Released payloads age out
-    /// through the existing unverified-retention ladder; nothing is
-    /// committed and the entry bytes are untouched. Default false: behavior
-    /// is byte-identical to previous releases when off.
-    pub release_caught_up_row_maps: bool,
 }
 
 impl CleanupPolicy {
@@ -1779,7 +1688,6 @@ impl Default for CleanupPolicy {
             error_if_tagged_old_versions: true,
             clean_referenced_branches: false,
             delete_rate_limit: None,
-            release_caught_up_row_maps: false,
         }
     }
 }
@@ -1877,19 +1785,6 @@ impl CleanupPolicyBuilder {
         }
         self.policy.delete_rate_limit = Some(rate);
         Ok(self)
-    }
-
-    /// Release fragment-reuse row-map payloads once every retained manifest
-    /// version has caught up (every usable non-system index segment is
-    /// address-remapped or rebuilt past the history, or disjoint from it).
-    ///
-    /// A purely client-side GC policy: nothing is committed, the entry
-    /// content bytes are untouched, and released payloads are collected by
-    /// the existing three-state `_fri/` cleanup ladder. Off by default;
-    /// when off, behavior is byte-identical to previous releases.
-    pub fn release_caught_up_row_maps(mut self, release: bool) -> Self {
-        self.policy.release_caught_up_row_maps = release;
-        self
     }
 
     pub fn build(self) -> CleanupPolicy {
@@ -5700,22 +5595,6 @@ mod tests {
                 ids.sort();
                 ids
             }
-
-            /// Delete a `_fri/<map_id>/` payload directory out from under
-            /// the dataset, simulating a released (or lost) row map.
-            async fn delete_fri_map_dir(&self, map_id: &str) {
-                let registry = Arc::new(ObjectStoreRegistry::default());
-                let (os, path) = ObjectStore::from_uri_and_params(
-                    registry,
-                    &self.dataset_path,
-                    &self.os_params(),
-                )
-                .await
-                .unwrap();
-                os.remove_dir_all(path.join("_fri").join(map_id))
-                    .await
-                    .unwrap();
-            }
         }
 
         async fn reserve_fragments(dataset: &mut Dataset, num_fragments: u32) {
@@ -6288,286 +6167,6 @@ mod tests {
             assert!(fixture.list_fri_map_dirs().await.is_empty());
             let reopened = fixture.open().await.unwrap();
             assert_eq!(reopened.count_rows(None).await.unwrap(), all_rows);
-        }
-
-        /// One remap of `i_idx` past the fixture's stable partition
-        /// (Phase 1's address-only/free-case job).
-        async fn remap_i_idx(dataset: &mut Dataset) {
-            crate::dataset::optimize::remapping::remap_column_index(
-                dataset,
-                &["i"],
-                Some("i_idx".into()),
-            )
-            .await
-            .unwrap();
-        }
-
-        /// A cleanup policy expiring versions strictly below `version`, with
-        /// the row-map release switch set as given.
-        fn policy_before_version(version: u64, release: bool) -> CleanupPolicy {
-            let mut policy = CleanupPolicyBuilder::default()
-                .release_caught_up_row_maps(release)
-                .build();
-            policy.before_version = Some(version);
-            policy
-        }
-
-        /// R1: the release flag alone never drops a map that a retained
-        /// version still translates through: with `i_idx` not remapped, the
-        /// catch-up predicate fails and the map stays referenced, however
-        /// old its files are.
-        #[tokio::test]
-        #[serial_test::serial(frag_reuse_maintenance)]
-        async fn release_flag_keeps_map_while_a_segment_translates() {
-            let fixture = MockDatasetFixture::try_new().unwrap();
-            let (_, map_id) = make_tagged(&fixture).await;
-
-            MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
-            fixture
-                .run_cleanup_with_policy(
-                    CleanupPolicyBuilder::default()
-                        .before_timestamp(utc_now() - TimeDelta::try_seconds(1).unwrap())
-                        .release_caught_up_row_maps(true)
-                        .build(),
-                )
-                .await
-                .unwrap();
-
-            assert_eq!(fixture.list_fri_map_dirs().await, vec![map_id]);
-            let reopened = fixture.open().await.unwrap();
-            assert!(
-                reopened
-                    .load_index_by_name(FRAG_REUSE_INDEX_NAME)
-                    .await
-                    .unwrap()
-                    .is_some()
-            );
-            // The stale segment still answers through the payload.
-            assert_eq!(
-                reopened
-                    .count_rows(Some("i >= 4".to_string()))
-                    .await
-                    .unwrap(),
-                4
-            );
-        }
-
-        /// R2: once the Phase 1 remap catches every segment up, a flag-OFF
-        /// cleanup keeps the payload (today's behavior, byte-identical) and
-        /// a flag-ON cleanup collects it -- while the ledger record stays in
-        /// the entry and cold queries stay exact with zero `_fri` IO.
-        #[tokio::test]
-        #[serial_test::serial(frag_reuse_maintenance)]
-        async fn caught_up_map_released_only_under_the_flag() {
-            let fixture = MockDatasetFixture::try_new().unwrap();
-            let (mut dataset, map_id) = make_tagged(&fixture).await;
-            remap_i_idx(&mut dataset).await;
-
-            MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
-            // Flag OFF over the fully caught-up state: the retained version
-            // keeps referencing the map, exactly as before this feature.
-            fixture
-                .run_cleanup(utc_now() - TimeDelta::try_seconds(1).unwrap())
-                .await
-                .unwrap();
-            assert_eq!(fixture.list_fri_map_dirs().await, vec![map_id.clone()]);
-
-            // Flag ON over the same state: nothing references the map any
-            // more, and its files are past the unverified threshold.
-            fixture
-                .run_cleanup_with_policy(
-                    CleanupPolicyBuilder::default()
-                        .before_timestamp(utc_now() - TimeDelta::try_seconds(1).unwrap())
-                        .release_caught_up_row_maps(true)
-                        .build(),
-                )
-                .await
-                .unwrap();
-            assert!(fixture.list_fri_map_dirs().await.is_empty());
-
-            // The entry and its transition record are untouched.
-            let reopened = fixture.open().await.unwrap();
-            let entry = reopened
-                .load_index_by_name(FRAG_REUSE_INDEX_NAME)
-                .await
-                .unwrap()
-                .expect("the release must keep the entry for coverage");
-            let content = crate::index::frag_reuse::load_raw_frag_reuse_content(&reopened, &entry)
-                .await
-                .unwrap();
-            let ledger = crate::index::frag_reuse::decode_frag_reuse_ledger_from_content(
-                entry.index_version,
-                &content,
-            )
-            .await
-            .unwrap();
-            assert!(!ledger.has_unsupported_transitions());
-            assert_eq!(ledger.transitions().len(), 1);
-
-            // Cold queries: exact results, zero row-map IO (the A12 check).
-            reopened.object_store.as_ref().io_stats_incremental(); // reset
-            assert_eq!(reopened.count_rows(None).await.unwrap(), 8);
-            assert_eq!(
-                reopened
-                    .count_rows(Some("i >= 4".to_string()))
-                    .await
-                    .unwrap(),
-                4
-            );
-            let stats = reopened.object_store.as_ref().io_stats_incremental();
-            assert!(stats.read_iops > 0, "the reads must have touched storage");
-            let row_map_reads: Vec<_> = stats
-                .requests
-                .iter()
-                .filter(|request| request.path.as_ref().contains("_fri"))
-                .collect();
-            assert!(
-                row_map_reads.is_empty(),
-                "reads over remapped segments must not touch the row map: {row_map_reads:?}"
-            );
-        }
-
-        /// R3: retention protection. An OLDER retained version still carries
-        /// the un-remapped segment, so the map stays put under either flag;
-        /// it is released only once that version expires.
-        #[tokio::test]
-        #[serial_test::serial(frag_reuse_maintenance)]
-        async fn older_retained_version_pins_the_map_until_it_expires() {
-            let fixture = MockDatasetFixture::try_new().unwrap();
-            let (mut dataset, map_id) = make_tagged(&fixture).await;
-            let sp_version = dataset.manifest.version;
-            remap_i_idx(&mut dataset).await;
-            let latest = dataset.manifest.version;
-            assert!(latest > sp_version);
-
-            MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
-            // Retain both the caught-up latest and the stale SP version.
-            fixture
-                .run_cleanup_with_policy(policy_before_version(sp_version, false))
-                .await
-                .unwrap();
-            assert_eq!(fixture.list_fri_map_dirs().await, vec![map_id.clone()]);
-            fixture
-                .run_cleanup_with_policy(policy_before_version(sp_version, true))
-                .await
-                .unwrap();
-            assert_eq!(
-                fixture.list_fri_map_dirs().await,
-                vec![map_id.clone()],
-                "a retained version with an un-remapped segment must pin the map"
-            );
-
-            // Expire the stale version: every retained version now passes.
-            fixture
-                .run_cleanup_with_policy(policy_before_version(latest, true))
-                .await
-                .unwrap();
-            assert!(fixture.list_fri_map_dirs().await.is_empty());
-            let reopened = fixture.open().await.unwrap();
-            assert_eq!(reopened.count_rows(None).await.unwrap(), 8);
-        }
-
-        /// R4: loud failure. A payload deleted while an un-remapped segment
-        /// still translates through it must error with the release hint at
-        /// query time, never return wrong or silently-empty results.
-        #[tokio::test]
-        #[serial_test::serial(frag_reuse_maintenance)]
-        async fn missing_row_map_fails_loudly_with_the_release_hint() {
-            let fixture = MockDatasetFixture::try_new().unwrap();
-            let (_, map_id) = make_tagged(&fixture).await;
-
-            // Tracker sanity: with the payload present, the stale segment's
-            // filtered query reads it.
-            let db = fixture.open().await.unwrap();
-            db.object_store.as_ref().io_stats_incremental(); // reset
-            assert_eq!(db.count_rows(Some("i >= 4".to_string())).await.unwrap(), 4);
-            let stats = db.object_store.as_ref().io_stats_incremental();
-            assert!(
-                stats
-                    .requests
-                    .iter()
-                    .any(|request| request.path.as_ref().contains("_fri")),
-                "the un-remapped segment must translate through the row map"
-            );
-
-            fixture.delete_fri_map_dir(&map_id).await;
-
-            // A fresh handle (cold caches) fails loudly with the context.
-            let db = fixture.open().await.unwrap();
-            let error = db
-                .count_rows(Some("i >= 4".to_string()))
-                .await
-                .expect_err("a missing row map must fail the query, not degrade it");
-            let message = error.to_string();
-            assert!(
-                message.contains("may have been released after all index segments caught up"),
-                "the error must carry the release hint: {message}"
-            );
-            assert!(
-                message.contains(&map_id),
-                "the error must name the released row map: {message}"
-            );
-        }
-
-        /// R5: no wire change. A flag-ON release cycle leaves the entry
-        /// content bytes identical, and production trim/prune maintenance
-        /// still operates on the table with no unsupported refusals.
-        #[tokio::test]
-        #[serial_test::serial(frag_reuse_maintenance)]
-        async fn release_cycle_leaves_entry_bytes_and_maintenance_untouched() {
-            let fixture = MockDatasetFixture::try_new().unwrap();
-            let (mut dataset, _map_id) = make_tagged(&fixture).await;
-            remap_i_idx(&mut dataset).await;
-            let entry_before = dataset
-                .load_index_by_name(FRAG_REUSE_INDEX_NAME)
-                .await
-                .unwrap()
-                .unwrap();
-            let content_before =
-                crate::index::frag_reuse::load_raw_frag_reuse_content(&dataset, &entry_before)
-                    .await
-                    .unwrap();
-
-            MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
-            fixture
-                .run_cleanup_with_policy(
-                    CleanupPolicyBuilder::default()
-                        .before_timestamp(utc_now() - TimeDelta::try_seconds(1).unwrap())
-                        .release_caught_up_row_maps(true)
-                        .build(),
-                )
-                .await
-                .unwrap();
-            assert!(fixture.list_fri_map_dirs().await.is_empty());
-
-            let mut reopened = *fixture.open().await.unwrap();
-            let entry_after = reopened
-                .load_index_by_name(FRAG_REUSE_INDEX_NAME)
-                .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(entry_after.uuid, entry_before.uuid);
-            let content_after =
-                crate::index::frag_reuse::load_raw_frag_reuse_content(&reopened, &entry_after)
-                    .await
-                    .unwrap();
-            assert_eq!(
-                content_after, content_before,
-                "a release is pure GC: the entry content bytes never change"
-            );
-
-            // Production maintenance still interprets the history: the
-            // trim/prune entry point runs clean (it may well trim the fully
-            // caught-up transition -- that is its normal job).
-            cleanup_frag_reuse_index(&mut reopened).await.unwrap();
-            assert_eq!(reopened.count_rows(None).await.unwrap(), 8);
-            assert_eq!(
-                reopened
-                    .count_rows(Some("i >= 4".to_string()))
-                    .await
-                    .unwrap(),
-                4
-            );
         }
 
         /// D-guard: a v0 dataset records no tagged entries and has no `_fri`

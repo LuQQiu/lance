@@ -346,9 +346,7 @@ impl FragmentReuseIndex {
 
     /// Diagnosable failure through a stable-partition transition whose
     /// row-map payload is gone: the payload lives outside the entry (in
-    /// `_fri/<map_id>/`) and may have been legitimately garbage-collected
-    /// under `CleanupPolicy::release_caught_up_row_maps` after every index
-    /// segment caught up, so a bare not-found error would read as
+    /// `_fri/<map_id>/`), so a bare not-found error would read as
     /// corruption. Name the map and the transition, and say what to do.
     fn with_missing_row_map_context(&self, index: usize, error: Error) -> Error {
         if !error.is_not_found() {
@@ -361,10 +359,9 @@ impl FragmentReuseIndex {
             return error;
         };
         Error::not_found(format!(
-            "fragment reuse row map _fri/{} is missing: it may have been released after \
-             all index segments caught up (rebuild the index to restore coverage), or the \
-             dataset is corrupt. Translating addresses through transition {:?} -> {:?} \
-             failed with: {error}",
+            "fragment reuse row map _fri/{} is missing (rebuild the index to restore \
+             coverage), or the dataset is corrupt. Translating addresses through \
+             transition {:?} -> {:?} failed with: {error}",
             reference.map_id,
             transition
                 .sources()

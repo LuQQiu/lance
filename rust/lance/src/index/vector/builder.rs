@@ -503,50 +503,22 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         };
 
         log::info!("remap {} partitions", ivf.num_partitions());
-        // REMAP_BREAKDOWN instrumentation: cumulative per-category nanos across the
-        // concurrently-run per-partition tasks. These SUM across parallel workers, so the
-        // totals can exceed wall time; that is expected and shows total work per category.
-        let load_nanos = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let storage_remap_nanos = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let index_remap_nanos = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let remap_wall_start = std::time::Instant::now();
         let existing_index = self.existing_indices[0].index.clone();
         let mapping = Arc::new(mapping.clone());
-        let load_nanos_c = load_nanos.clone();
-        let storage_remap_nanos_c = storage_remap_nanos.clone();
-        let index_remap_nanos_c = index_remap_nanos.clone();
         let build_iter = (0..ivf.num_partitions()).map(move |part_id| {
             let existing_index = existing_index.clone();
             let mapping = mapping.clone();
-            let load_nanos = load_nanos_c.clone();
-            let storage_remap_nanos = storage_remap_nanos_c.clone();
-            let index_remap_nanos = index_remap_nanos_c.clone();
             async move {
                 let ivf_index = existing_index
                     .as_any()
                     .downcast_ref::<IVFIndex<S, Q>>()
                     .ok_or(Error::invalid_input("existing index is not IVF index"))?;
-                let t_load = std::time::Instant::now();
                 let part = ivf_index
                     .load_partition(part_id, false, &NoOpMetricsCollector)
                     .await?;
-                load_nanos.fetch_add(
-                    t_load.elapsed().as_nanos() as u64,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
 
-                let t_storage = std::time::Instant::now();
                 let storage = part.storage.remap(&mapping)?;
-                storage_remap_nanos.fetch_add(
-                    t_storage.elapsed().as_nanos() as u64,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
-                let t_index = std::time::Instant::now();
                 let index = part.index.remap(&mapping, &storage)?;
-                index_remap_nanos.fetch_add(
-                    t_index.elapsed().as_nanos() as u64,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
                 Result::Ok(Budgeted::untracked(PartitionBuildResult {
                     partition_id: part_id,
                     built: Some((storage, index, 0.0)),
@@ -554,7 +526,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             }
         });
 
-        let t_merge = std::time::Instant::now();
         let files = self
             .merge_partitions(
                 stream::iter(build_iter)
@@ -562,16 +533,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     .boxed(),
             )
             .await?;
-        let merge_secs = t_merge.elapsed().as_secs_f64();
-        let wall_secs = remap_wall_start.elapsed().as_secs_f64();
-        log::warn!(
-            "REMAP_BREAKDOWN load={:.1}s storage_remap={:.1}s index_remap={:.1}s merge={:.1}s wall={:.1}s",
-            load_nanos.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9,
-            storage_remap_nanos.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9,
-            index_remap_nanos.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9,
-            merge_secs,
-            wall_secs,
-        );
         Ok(files)
     }
 

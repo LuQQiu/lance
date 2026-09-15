@@ -3730,9 +3730,6 @@ fn extract_cleanup_policy(env: &mut JNIEnv<'_>, jpolicy: &JObject) -> Result<Cle
         error_if_tagged_old_versions,
         clean_referenced_branches,
         delete_rate_limit,
-        // The row-map release policy is not surfaced through the Java API
-        // yet; keep today's behavior.
-        release_caught_up_row_maps: false,
     })
 }
 
