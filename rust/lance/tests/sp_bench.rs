@@ -415,9 +415,17 @@ async fn stable_partition_all(dataset: Dataset, dataset_dir: &str, cfg: &Config)
     }
 
     // Row map for the transition, written under `_fri/<uuid>/` exactly like
-    // the reader-test helper (labels in source scan order).
+    // the reader-test helper (labels in source scan order). For an object-store
+    // URI (az://container/path) the object path is the URL path component only
+    // (the store is already rooted at the container); for a local path use the
+    // absolute path directly.
     let map_id = Uuid::new_v4();
-    let base = ObjPath::from_absolute_path(dataset_dir).unwrap();
+    let base = if dataset_dir.contains("://") {
+        let url = url::Url::parse(dataset_dir).expect("dataset_dir is a valid URI");
+        ObjPath::from(url.path().trim_start_matches('/'))
+    } else {
+        ObjPath::from_absolute_path(dataset_dir).unwrap()
+    };
     let store = LanceIndexStore::with_format_version(
         dataset.object_store(None).await.unwrap(),
         base.join("_fri").join(map_id.to_string()),
