@@ -242,4 +242,99 @@ mod tests {
         assert_eq!(excluded.len(), 3);
         assert!(!excluded.contains(3));
     }
+
+    #[tokio::test]
+    async fn test_incremental_update_adds_segment_without_touching_old() {
+        use crate::index::create::CreateIndexBuilder;
+
+        let test_uri = TempStrDir::default();
+        let (schema, batch) = int_batch(0, 200);
+        let params = WriteParams {
+            max_rows_per_file: 100,
+            ..Default::default()
+        };
+        let mut dataset = crate::Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema.clone()),
+            &test_uri,
+            Some(params),
+        )
+        .await
+        .unwrap();
+
+        let index_params = ScalarIndexParams::new("FragmentColumnStats".to_string());
+        let first_segment = CreateIndexBuilder::new(
+            &mut dataset,
+            &["i"],
+            IndexType::FragmentColumnStats,
+            &index_params,
+        )
+        .name("i_stats".to_string())
+        .execute_uncommitted()
+        .await
+        .unwrap();
+        dataset
+            .commit_existing_index_segments("i_stats", "i", vec![first_segment])
+            .await
+            .unwrap();
+        let first_uuid = dataset.load_indices_by_name("i_stats").await.unwrap()[0].uuid;
+
+        // Append a new fragment, then backfill ONLY that fragment into a new
+        // add-only segment.
+        let (_, batch) = int_batch(200, 300);
+        let append_params = WriteParams {
+            mode: WriteMode::Append,
+            max_rows_per_file: 100,
+            ..Default::default()
+        };
+        let mut dataset = crate::Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            Arc::new(dataset),
+            Some(append_params),
+        )
+        .await
+        .unwrap();
+        let new_segment = CreateIndexBuilder::new(
+            &mut dataset,
+            &["i"],
+            IndexType::FragmentColumnStats,
+            &index_params,
+        )
+        .name("i_stats".to_string())
+        .replace(true)
+        .fragments(vec![2])
+        .execute_uncommitted()
+        .await
+        .unwrap();
+        assert_eq!(
+            new_segment.fragment_bitmap.as_ref().unwrap().len(),
+            1,
+            "the new segment covers only the appended fragment"
+        );
+        dataset
+            .commit_existing_index_segments("i_stats", "i", vec![new_segment])
+            .await
+            .unwrap();
+
+        let segments = dataset.load_indices_by_name("i_stats").await.unwrap();
+        assert_eq!(segments.len(), 2, "old segment retained, new one added");
+        assert!(
+            segments.iter().any(|s| s.uuid == first_uuid),
+            "the original segment UUID must survive the incremental update"
+        );
+        let mut union = roaring::RoaringBitmap::new();
+        for segment in &segments {
+            union |= segment.fragment_bitmap.as_ref().unwrap();
+        }
+        assert_eq!(union.len(), 3);
+
+        // Both segments feed the resolver: a filter on the appended range
+        // excludes the two old fragments.
+        let mut scanner = dataset.scan();
+        scanner.filter("i >= 250").unwrap();
+        let analyzed = scanner.analyze_plan().await.unwrap();
+        assert!(
+            analyzed.contains("num_fragments=1"),
+            "expected num_fragments=1 in plan:\n{analyzed}"
+        );
+    }
 }
