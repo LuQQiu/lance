@@ -59,14 +59,14 @@ const ZONEMAP_INDEX_VERSION: u32 = 0;
 /// Basic stats about zonemap index
 #[derive(Debug, PartialEq, Clone)]
 pub(crate) struct ZoneMapStatistics {
-    min: ScalarValue,
-    max: ScalarValue,
-    null_count: u32,
+    pub(crate) min: ScalarValue,
+    pub(crate) max: ScalarValue,
+    pub(crate) null_count: u32,
     // only apply to float type
-    nan_count: u32,
+    pub(crate) nan_count: u32,
     // Bound of this zone within the fragment. Persisted as three separate columns
     // (fragment_id, zone_start, zone_length) in the index file.
-    bound: ZoneBound,
+    pub(crate) bound: ZoneBound,
 }
 
 impl DeepSizeOf for ZoneMapStatistics {
@@ -238,10 +238,23 @@ impl ZoneMapIndex {
         zone: &ZoneMapStatistics,
         query: &SargableQuery,
     ) -> Result<bool> {
+        Self::evaluate_stats_against_query(&self.data_type, zone, query)
+    }
+
+    /// Evaluates whether summary statistics could match `query`.
+    ///
+    /// Shared with the fragment column statistics index, which folds one
+    /// summary per fragment and needs identical NaN/null/missing-extrema
+    /// conservatism without holding a `ZoneMapIndex`.
+    pub(crate) fn evaluate_stats_against_query(
+        data_type: &DataType,
+        zone: &ZoneMapStatistics,
+        query: &SargableQuery,
+    ) -> Result<bool> {
         use std::ops::Bound;
 
         // For nested types we only track null_count; prune only when certain.
-        if self.data_type.is_nested() {
+        if data_type.is_nested() {
             let all_null = zone.null_count as usize == zone.bound.length;
             return match query {
                 SargableQuery::IsNull() => Ok(zone.null_count > 0),
@@ -1241,13 +1254,13 @@ impl ZoneMapIndexBuilder {
 /// For nested types (List, FixedSizeList, Struct, Map, etc.), tracks only
 /// null_count; min and max are stored as typed null values.
 #[derive(Debug)]
-struct ZoneMapProcessor {
+pub(crate) struct ZoneMapProcessor {
     data_type: DataType,
     statistics: StatisticsAccumulator,
 }
 
 impl ZoneMapProcessor {
-    fn new(data_type: DataType) -> Result<Self> {
+    pub(crate) fn new(data_type: DataType) -> Result<Self> {
         let statistics = StatisticsAccumulator::new(&data_type);
         Ok(Self {
             data_type,

@@ -309,3 +309,13 @@ message MinHashLshIndexDetails {
    */
   uint32 signature_version = 5;
 }
+
+/* Fragment column statistics index details.
+ *
+ * One record per fragment for a single column: typed min/max bounds, null and
+ * NaN counts, and the covered row span, folded from the zone-level statistics
+ * embedded in each fragment's data file footers at write time. Used for
+ * planning-time fragment pruning. Version 0 carries no parameters; readers
+ * that do not recognize this message ignore the index.
+ */
+message FragmentColumnStatsIndexDetails {}
