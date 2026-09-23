@@ -418,6 +418,28 @@ impl<'a> CreateIndexBuilder<'a> {
                     .await?
                 }
             }
+            (IndexType::FragmentColumnStats, LANCE_SCALAR_INDEX) => {
+                if self.preprocessed_data.is_some() {
+                    return Err(Error::invalid_input(
+                        "fragment column stats index does not accept preprocessed data"
+                            .to_string(),
+                    ));
+                }
+                let requested_fragments = if train { self.fragments.clone() } else { Some(Vec::new()) };
+                let (created_index, covered_fragments) =
+                    crate::index::fragstats::build_fragment_stats_index_from_seeds(
+                        self.dataset,
+                        column,
+                        index_id,
+                        requested_fragments,
+                    )
+                    .await?;
+                // The committed bitmap must claim only fragments that actually
+                // received records: fragments without complete write-time zone
+                // statistics stay unindexed and remain scan candidates.
+                self.fragments = Some(covered_fragments);
+                created_index
+            }
             (IndexType::Scalar, LANCE_SCALAR_INDEX) => {
                 // Guess the index type
                 let params = self

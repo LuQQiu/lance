@@ -230,6 +230,13 @@ impl<'a> FragmentCreateBuilder<'a> {
         } else {
             None
         };
+        let seed_writers = crate::dataset::versions::create_seed_writers(
+            version,
+            existing_dataset.as_ref(),
+            &params,
+            &schema,
+        )
+        .await?;
         crate::dataset::versions::write_fragments_direct(
             version,
             existing_dataset.as_ref(),
@@ -239,7 +246,7 @@ impl<'a> FragmentCreateBuilder<'a> {
             stream,
             params,
             target_bases_info,
-            Vec::new(),
+            seed_writers,
             None,
         )
         .await

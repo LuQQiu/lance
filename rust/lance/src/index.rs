@@ -82,6 +82,7 @@ pub(crate) mod append;
 mod create;
 pub mod frag_reuse;
 pub mod frag_reuse_reader;
+pub(crate) mod fragstats;
 pub mod mem_wal;
 pub mod prefilter;
 pub mod scalar;

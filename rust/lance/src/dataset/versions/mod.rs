@@ -105,17 +105,20 @@ pub fn schema_compare_options(version: ConcreteFileVersion) -> SchemaCompareOpti
     }
 }
 
-async fn create_seed_writers(
+pub(crate) async fn create_seed_writers(
     version: ConcreteFileVersion,
     dataset: Option<&Dataset>,
     params: &WriteParams,
+    schema: &Schema,
 ) -> Result<Vec<Box<dyn IndexSeedWriter>>> {
     match version {
         ConcreteFileVersion::V1 => Ok(Vec::new()),
         ConcreteFileVersion::V2_0
         | ConcreteFileVersion::V2_1
         | ConcreteFileVersion::V2_2
-        | ConcreteFileVersion::V2_3 => write::create_seed_writers_current(dataset, params).await,
+        | ConcreteFileVersion::V2_3 => {
+            write::create_seed_writers_current(dataset, params, schema).await
+        }
     }
 }
 
@@ -166,7 +169,7 @@ pub async fn write_fragments(
             write::validate_blob_v2_write_schema(&schema)?;
         }
     }
-    let seed_writers = create_seed_writers(version, dataset, &params).await?;
+    let seed_writers = create_seed_writers(version, dataset, &params, &schema).await?;
     let fragments = write_fragments_direct(
         version,
         dataset,

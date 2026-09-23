@@ -692,6 +692,14 @@ pub struct WriteParams {
     /// when writing legacy V1 files. If not set, the file writer uses its
     /// configured defaults.
     pub file_writer_options: Option<FileWriterOptions>,
+
+    /// Whether to collect fragment-local column statistics (zone-level
+    /// min/max/null summaries embedded in data file footers) for supported
+    /// column types on every write. `None` means on by default. These payloads
+    /// feed the fragment column statistics index without rescanning data; they
+    /// are collected from the dataset's first write and do not require any
+    /// index to exist.
+    pub collect_fragment_stats: Option<bool>,
 }
 
 impl Default for WriteParams {
@@ -723,6 +731,7 @@ impl Default for WriteParams {
             external_blob_mode: ExternalBlobMode::Reference,
             blob_pack_file_size_threshold: None,
             file_writer_options: None,
+            collect_fragment_stats: None,
         }
     }
 }
@@ -1880,49 +1889,98 @@ pub(super) fn validate_blob_v2_write_schema(schema: &Schema) -> Result<()> {
 pub(crate) async fn create_seed_writers_current(
     dataset: Option<&Dataset>,
     params: &WriteParams,
+    schema: &Schema,
 ) -> Result<Vec<Box<dyn lance_index::scalar::seed::IndexSeedWriter>>> {
-    // Seeds only make sense when appending to an existing dataset.
-    if !matches!(params.mode, WriteMode::Append) {
-        return Ok(Vec::new());
-    }
-    let Some(dataset) = dataset else {
-        return Ok(Vec::new());
-    };
-
-    // Seeds depend on index configuration, not FRI-derived query coverage.
-    let indices: Arc<Vec<IndexMetadata>> = load_all_indices(dataset).await?;
     let mut writers: Vec<Box<dyn lance_index::scalar::seed::IndexSeedWriter>> = Vec::new();
 
-    for index in indices.iter().filter(|index| index_is_usable(index)) {
-        // A covered index lists its carried columns in `fields` too; the seed
-        // writer keys on the single keyed column. System indices commit no
-        // fields at all, so this also skips them.
-        let Some(field_id) = index.keyed_field() else {
-            continue;
-        };
-        let Ok(field_path) = dataset.schema().field_path(field_id) else {
-            continue;
-        };
-        let Some(data_type) = dataset.schema().field(&field_path).map(|f| f.data_type()) else {
-            continue;
-        };
+    // Index-driven seed writers: only meaningful when appending to an
+    // existing dataset. Seeds depend on index configuration, not FRI-derived
+    // query coverage.
+    if matches!(params.mode, WriteMode::Append) {
+        if let Some(dataset) = dataset {
+            let indices: Arc<Vec<IndexMetadata>> = load_all_indices(dataset).await?;
 
-        let Ok(index_details) = fetch_index_details(dataset, &field_path, index).await else {
-            continue;
-        };
-        let details = IndexDetails(index_details.clone());
-        let Ok(plugin) = details.get_plugin() else {
-            continue;
-        };
-        if let Some(writer) = plugin
-            .create_seed_writer(&field_path, &data_type, &index_details)
-            .await?
-        {
-            writers.push(writer);
+            for index in indices.iter().filter(|index| index_is_usable(index)) {
+                // A covered index lists its carried columns in `fields` too; the seed
+                // writer keys on the single keyed column. System indices commit no
+                // fields at all, so this also skips them.
+                let Some(field_id) = index.keyed_field() else {
+                    continue;
+                };
+                let Ok(field_path) = dataset.schema().field_path(field_id) else {
+                    continue;
+                };
+                let Some(data_type) = dataset.schema().field(&field_path).map(|f| f.data_type())
+                else {
+                    continue;
+                };
+
+                let Ok(index_details) = fetch_index_details(dataset, &field_path, index).await
+                else {
+                    continue;
+                };
+                let details = IndexDetails(index_details.clone());
+                let Ok(plugin) = details.get_plugin() else {
+                    continue;
+                };
+                if let Some(writer) = plugin
+                    .create_seed_writer(&field_path, &data_type, &index_details)
+                    .await?
+                {
+                    writers.push(writer);
+                }
+            }
+        }
+    }
+
+    // Default-on fragment statistics collection: every write mode, every
+    // supported top-level column, from the dataset's first write. Not gated on
+    // any index existing; the fragment column statistics index later folds
+    // these payloads without rescanning column data.
+    if params.collect_fragment_stats.unwrap_or(true) {
+        for field in schema.fields.iter() {
+            let data_type = field.data_type();
+            if !fragment_stats_supported(&data_type) {
+                continue;
+            }
+            let key = format!(
+                "{}{}",
+                lance_index::scalar::seed::SEED_META_KEY_PREFIX,
+                field.name
+            );
+            if writers
+                .iter()
+                .any(|writer| writer.schema_metadata_key() == key)
+            {
+                continue;
+            }
+            // Unsupported edge cases fall out silently: the fragment simply
+            // carries no statistics for this column and stays a candidate.
+            if let Ok(writer) = lance_index::scalar::zonemap::ZoneMapSeedWriter::new(
+                &field.name,
+                lance_index::scalar::fragstats::FRAGMENT_STATS_DEFAULT_ROWS_PER_ZONE,
+                data_type,
+            ) {
+                writers.push(Box::new(writer));
+            }
         }
     }
 
     Ok(writers)
+}
+
+/// Column types that receive default-on fragment statistics collection.
+/// Conservative allowlist: fixed-width primitives and strings. Large binary
+/// payloads and nested/vector columns are excluded from the default.
+fn fragment_stats_supported(data_type: &arrow_schema::DataType) -> bool {
+    data_type.is_numeric()
+        || data_type.is_temporal()
+        || matches!(
+            data_type,
+            arrow_schema::DataType::Boolean
+                | arrow_schema::DataType::Utf8
+                | arrow_schema::DataType::LargeUtf8
+        )
 }
 
 fn legacy_blob_field_path(schema: &Schema) -> Option<String> {
@@ -5502,7 +5560,7 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            !create_seed_writers_current(Some(&dataset), &append_params)
+            !create_seed_writers_current(Some(&dataset), &append_params, dataset.schema())
                 .await
                 .unwrap()
                 .is_empty(),
@@ -5575,9 +5633,10 @@ mod tests {
             ..Default::default()
         };
 
-        let baseline = create_seed_writers_current(Some(&dataset), &append_params)
-            .await
-            .unwrap();
+        let baseline =
+            create_seed_writers_current(Some(&dataset), &append_params, dataset.schema())
+                .await
+                .unwrap();
         assert!(
             !baseline.is_empty(),
             "a plain scalar index should produce a seed writer; if this is empty \
@@ -5605,9 +5664,10 @@ mod tests {
             .await
             .unwrap();
 
-        let covered_writers = create_seed_writers_current(Some(&dataset), &append_params)
-            .await
-            .unwrap();
+        let covered_writers =
+            create_seed_writers_current(Some(&dataset), &append_params, dataset.schema())
+                .await
+                .unwrap();
         assert_eq!(
             covered_writers.len(),
             baseline.len(),
