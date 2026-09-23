@@ -7239,6 +7239,9 @@ mod tests {
 
         let test_dir = TempStrDir::default();
         let write_params = WriteParams {
+            // This test budgets the minimal write path; keep the
+            // default-on fragment statistics payloads out of the byte counts.
+            collect_fragment_stats: Some(false),
             max_rows_per_file: rows_per_batch * num_batches,
             max_rows_per_group: rows_per_batch,
             data_storage_version: Some(LanceFileVersion::V2_1),
@@ -7385,6 +7388,9 @@ mod tests {
         .unwrap();
         let session = Arc::new(Session::default());
         let write_params = WriteParams {
+            // This test budgets the minimal write path; keep the
+            // default-on fragment statistics payloads out of the byte counts.
+            collect_fragment_stats: Some(false),
             session: Some(session.clone()),
             ..Default::default()
         };

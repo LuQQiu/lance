@@ -398,6 +398,35 @@ impl FragmentColumnStatsIndex {
         self.records.len()
     }
 
+    /// Bench-only synthetic index: `count` fragments holding sequential,
+    /// disjoint Int64 ranges of `rows_per_fragment` values each. Used by the
+    /// scale microbenchmark to measure resident memory and scope-evaluation
+    /// CPU without materializing real data. Not part of the public API.
+    #[doc(hidden)]
+    pub fn synthetic_i64(count: u32, rows_per_fragment: u64) -> Self {
+        let records = (0..count)
+            .map(|fragment_id| {
+                let lo = fragment_id as i64 * rows_per_fragment as i64;
+                let hi = lo + rows_per_fragment as i64 - 1;
+                ZoneMapStatistics {
+                    min: ScalarValue::Int64(Some(lo)),
+                    max: ScalarValue::Int64(Some(hi)),
+                    null_count: 0,
+                    nan_count: 0,
+                    bound: ZoneBound {
+                        fragment_id: fragment_id as u64,
+                        start: 0,
+                        length: rows_per_fragment as usize,
+                    },
+                }
+            })
+            .collect();
+        Self {
+            records,
+            data_type: DataType::Int64,
+        }
+    }
+
     pub fn value_data_type(&self) -> &DataType {
         &self.data_type
     }

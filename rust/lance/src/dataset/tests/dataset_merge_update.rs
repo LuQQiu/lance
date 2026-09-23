@@ -768,6 +768,7 @@ async fn test_datafile_replacement() {
     let data_file = frag.data_file_for_field(0).unwrap();
     let mut new_data_file = data_file.clone();
     new_data_file.path = "test.lance".to_string();
+    new_data_file.file_size_bytes = Default::default();
 
     let dataset = Dataset::commit(
         WriteDestination::Dataset(Arc::new(dataset)),
@@ -2615,6 +2616,7 @@ async fn test_data_replacement_advances_row_lineage() {
     let frag = dataset.get_fragment(0).unwrap();
     let mut new_data_file = frag.data_file_for_field(0).unwrap().clone();
     new_data_file.path = "lineage_replacement.lance".to_string();
+    new_data_file.file_size_bytes = Default::default();
 
     let read_version = dataset.version().version;
     let dataset = Dataset::commit(
@@ -3127,6 +3129,7 @@ async fn test_fts_stale_entries_after_data_replacement() {
 
     let mut new_data_file = old_data_file.clone();
     new_data_file.path = "replacement.lance".to_string();
+    new_data_file.file_size_bytes = Default::default();
 
     let read_version = dataset.manifest.version;
     let dataset = Dataset::commit(
@@ -3438,6 +3441,7 @@ async fn test_vector_index_after_data_replacement() {
 
     let mut new_data_file = old_data_file.clone();
     new_data_file.path = "replacement.lance".to_string();
+    new_data_file.file_size_bytes = Default::default();
 
     let read_version = dataset.manifest.version;
     let dataset = Dataset::commit(

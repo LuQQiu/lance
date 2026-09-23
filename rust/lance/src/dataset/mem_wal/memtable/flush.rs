@@ -393,7 +393,12 @@ impl MemTableFlusher {
         // Inherit the base dataset's storage version so the SSTable
         // matches it (a 2.2 base also fixes the v2.1 miniblock 32 KiB chunk cap
         // that the dense HNSW graph List columns overflow at scale).
+        // MemWAL generations are ephemeral LSM levels merged into the base
+        // table later; fragment statistics belong to the base table, and the
+        // generation scan path expects data-file layouts without extra footer
+        // payloads.
         let write_params = WriteParams {
+            collect_fragment_stats: Some(false),
             max_rows_per_file: usize::MAX,
             data_storage_version: Some(self.base_storage_version().await?.to_selector()),
             // Write the generation through the base's store params + session so it
