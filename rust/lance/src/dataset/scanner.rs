@@ -1159,6 +1159,11 @@ pub struct Scanner {
     /// to handle this better in the future as well)
     use_scalar_index: bool,
 
+    /// If true (default), use fragment column statistics indices to exclude
+    /// whole fragments at planning time. Fragments without statistics are
+    /// never excluded.
+    use_fragment_stats: bool,
+
     /// Whether to use statistics to optimize the scan (default: true)
     ///
     /// This is used for debugging or benchmarking purposes.
@@ -1434,6 +1439,7 @@ impl Scanner {
             index_segments: None,
             fast_search: false,
             use_scalar_index: true,
+            use_fragment_stats: true,
             include_deleted_rows: false,
             scan_stats_callback: None,
             strict_batch_size: false,
@@ -1883,6 +1889,15 @@ impl Scanner {
     /// This option allows users to disable scalar indices for a query.
     pub fn use_scalar_index(&mut self, use_scalar_index: bool) -> &mut Self {
         self.use_scalar_index = use_scalar_index;
+        self
+    }
+
+    /// Set whether to use fragment column statistics for planning-time
+    /// fragment pruning (default: true).
+    ///
+    /// Disable to compare plans with and without statistics-based pruning.
+    pub fn use_fragment_stats(&mut self, use_fragment_stats: bool) -> &mut Self {
+        self.use_fragment_stats = use_fragment_stats;
         self
     }
 
@@ -3615,6 +3630,33 @@ impl Scanner {
 
         if let Some(fragments) = fragments {
             read_options = read_options.with_fragments(fragments);
+        }
+
+        // Fragment column statistics scope: planning-time exclusion of whole
+        // fragments from per-fragment min/max/null records. Subtractive and
+        // conservative: fragments without valid statistics always stay.
+        // The narrowed fragment list also feeds the scalar-index fragment
+        // scope below, so excluded fragments cost no index I/O either.
+        if self.use_fragment_stats
+            && let Some(full_expr) = filter_plan.full_expr.as_ref()
+        {
+            let excluded = crate::dataset::fragstats_scope::fragment_stats_excluded(
+                self.dataset.as_ref(),
+                full_expr,
+            )
+            .await?;
+            if !excluded.is_empty() {
+                let base = read_options
+                    .fragments
+                    .clone()
+                    .unwrap_or_else(|| self.dataset.fragments().clone());
+                let retained: Vec<Fragment> = base
+                    .iter()
+                    .filter(|fragment| !excluded.contains(fragment.id as u32))
+                    .cloned()
+                    .collect();
+                read_options = read_options.with_fragments(Arc::new(retained));
+            }
         }
 
         if let Some(scan_range) = scan_range {
