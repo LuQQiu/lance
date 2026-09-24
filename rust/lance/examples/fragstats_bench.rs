@@ -461,6 +461,132 @@ fn mem_tier() {
     );
 }
 
+fn qn_tier() {
+    use lance_index::scalar::fragstats::{PackedFragmentStats, synthetic_for_bench};
+    use std::ops::Bound;
+    use std::sync::Arc as StdArc;
+
+    println!("\n== Tier QN: compound predicates, multi-column residency, concurrency ==\n");
+    let count = 1_000_000u32;
+    let rows_per_fragment = 1_000_000u64;
+    let make_range = |lo: i64, hi: Option<i64>| {
+        SargableQuery::Range(
+            Bound::Included(datafusion::common::ScalarValue::Int64(Some(lo))),
+            match hi {
+                Some(hi) => Bound::Excluded(datafusion::common::ScalarValue::Int64(Some(hi))),
+                None => Bound::Unbounded,
+            },
+        )
+    };
+
+    // Two columns with the same clustered domain shape.
+    let col_a = StdArc::new(
+        PackedFragmentStats::try_from_index(&synthetic_for_bench(count, rows_per_fragment, "i64"))
+            .unwrap(),
+    );
+    let col_b = StdArc::new(
+        PackedFragmentStats::try_from_index(&synthetic_for_bench(count, rows_per_fragment, "i64"))
+            .unwrap(),
+    );
+    let live: RoaringBitmap = (0..count).collect();
+    let domain = count as i64 * rows_per_fragment as i64;
+    // A: top 1%; B: a 5% band overlapping half of A's range.
+    let query_a = make_range(domain * 99 / 100, None);
+    let query_b = make_range(domain * 985 / 1000, Some(domain * 995 / 1000));
+
+    // Compound candidate generation, run-based exclusion per column.
+    let and_ms = {
+        let start = Instant::now();
+        let mut out = 0u64;
+        for _ in 0..5 {
+            let ex =
+                col_a.excluded_fragments_runs(&query_a) | col_b.excluded_fragments_runs(&query_b);
+            out = (&live - &ex).len();
+        }
+        (start.elapsed().as_secs_f64() * 1000.0 / 5.0, out)
+    };
+    let or_ms = {
+        let start = Instant::now();
+        let mut out = 0u64;
+        for _ in 0..5 {
+            let ex =
+                col_a.excluded_fragments_runs(&query_a) & col_b.excluded_fragments_runs(&query_b);
+            out = (&live - &ex).len();
+        }
+        (start.elapsed().as_secs_f64() * 1000.0 / 5.0, out)
+    };
+    println!("| compound (1M frags, 2 cols) | candidates | total ms |");
+    println!("|---|---|---|");
+    println!("| A AND B | {} | {:.2} |", and_ms.1, and_ms.0);
+    println!("| A OR B | {} | {:.2} |", or_ms.1, or_ms.0);
+
+    // Ten cached columns: actual instances, summed residency.
+    let mut ten_total = 0usize;
+    let mut ten = Vec::new();
+    for i in 0..10 {
+        let kind = if i < 6 { "i64" } else { "utf8" };
+        let packed = PackedFragmentStats::try_from_index(&synthetic_for_bench(
+            count,
+            rows_per_fragment,
+            kind,
+        ))
+        .unwrap();
+        ten_total += packed.resident_bytes();
+        ten.push(packed);
+    }
+    println!(
+        "\n10 cached columns at 1M fragments (6 numeric + 4 short-string): {:.1} MB actual resident",
+        ten_total as f64 / 1024.0 / 1024.0
+    );
+    drop(ten);
+
+    // Concurrency: shared 1M-fragment column, run-based candidate generation.
+    println!("\n| threads | QPS | p50 ms | p99 ms |");
+    println!("|---|---|---|---|");
+    for threads in [8usize, 32, 128] {
+        let mut handles = Vec::new();
+        let stop = StdArc::new(std::sync::atomic::AtomicBool::new(false));
+        for t in 0..threads {
+            let col = col_a.clone();
+            let live = live.clone();
+            let stop = stop.clone();
+            handles.push(std::thread::spawn(move || {
+                let mut latencies = Vec::with_capacity(4096);
+                let mut i = t as i64;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let lo = (i * 7919) % 99; // vary the range start
+                    let query = SargableQuery::Range(
+                        Bound::Included(datafusion::common::ScalarValue::Int64(Some(
+                            1_000_000i64 * 1_000_000 * lo / 100,
+                        ))),
+                        Bound::Excluded(datafusion::common::ScalarValue::Int64(Some(
+                            1_000_000i64 * 1_000_000 * (lo + 1) / 100,
+                        ))),
+                    );
+                    let start = Instant::now();
+                    let excluded = col.excluded_fragments_runs(&query);
+                    let candidates = &live - &excluded;
+                    std::hint::black_box(candidates.len());
+                    latencies.push(start.elapsed().as_secs_f64() * 1000.0);
+                    i += 1;
+                }
+                latencies
+            }));
+        }
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let mut all: Vec<f64> = handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect();
+        all.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let qps = all.len() as f64 / 3.0;
+        let p50 = all[all.len() / 2];
+        let p99 = all[(all.len() as f64 * 0.99) as usize];
+        println!("| {threads} | {qps:.0} | {p50:.2} | {p99:.2} |");
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let rows = env_usize("ROWS", 1_000_000);
@@ -477,5 +603,8 @@ async fn main() {
     }
     if tier == "mem" {
         mem_tier();
+    }
+    if tier == "qn" {
+        qn_tier();
     }
 }
