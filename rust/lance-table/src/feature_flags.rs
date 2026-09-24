@@ -82,8 +82,9 @@ pub const FLAG_FRAGMENT_REUSE_INDEX: u64 = 1 << 10;
 pub const FLAG_UNSTABLE_SPILLED_ROW_LINEAGE: u64 = 1 << 11;
 /// Writer-only protection for provider-neutral clustering metadata.
 ///
-/// Reserved, not supported, until writers preserve declarations and maintain
-/// fragment references across every operation. Ordinary readers need no bit.
+/// Reserved, not supported, until writers preserve configuration and maintain
+/// fragment markers across every operation. This is one common capability,
+/// not a bit per provider or layout version. Ordinary readers need no bit.
 pub const FLAG_CLUSTERING_METADATA: u64 = 1 << 12;
 /// The first bit that is unknown as a feature flag
 pub const FLAG_UNKNOWN: u64 = 1 << 13;

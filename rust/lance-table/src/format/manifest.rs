@@ -1189,16 +1189,12 @@ mod tests {
 
     #[test]
     fn clustering_proto_retains_provider_versions_and_unknown_payloads() {
-        let references = [
-            pb::ClusteringReference {
+        let markers = [
+            pb::FragmentClustering {
                 provider: "org.example.first".into(),
                 version: 7,
             },
-            pb::ClusteringReference {
-                provider: "org.example.first".into(),
-                version: 8,
-            },
-            pb::ClusteringReference {
+            pb::FragmentClustering {
                 provider: "org.example.second".into(),
                 version: 7,
             },
@@ -1210,23 +1206,18 @@ mod tests {
         // Test the wire contract only; runtime state handling is not enabled yet.
         let manifest = pb::Manifest {
             writer_feature_flags: crate::feature_flags::FLAG_CLUSTERING_METADATA,
-            clustering: Some(pb::ClusteringState {
-                current: Some(references[1].clone()),
-                declarations: references
-                    .iter()
-                    .map(|reference| pb::ClusteringDeclaration {
-                        reference: Some(reference.clone()),
-                        columns: vec![0],
-                        provider_metadata: Some(unknown_configuration.clone()),
-                    })
-                    .collect(),
+            clustering: Some(pb::Clustering {
+                columns: vec![0],
+                provider: "org.example.first".into(),
+                version: 8,
+                provider_metadata: Some(unknown_configuration),
             }),
-            fragments: [references[0].clone(), references[2].clone()]
+            fragments: markers
                 .into_iter()
                 .enumerate()
-                .map(|(id, reference)| pb::DataFragment {
+                .map(|(id, marker)| pb::DataFragment {
                     id: id as u64,
-                    clustering: Some(reference),
+                    clustering: Some(marker),
                     ..Default::default()
                 })
                 .collect(),
@@ -1235,6 +1226,15 @@ mod tests {
         let decoded = pb::Manifest::decode(manifest.encode_to_vec().as_slice()).unwrap();
         assert_eq!(decoded, manifest);
         assert_eq!(decoded.reader_feature_flags, 0);
+        // Disabling new clustering work does not erase historical fragment markers.
+        let disabled = pb::Manifest {
+            clustering: None,
+            ..manifest
+        };
+        assert_eq!(
+            pb::Manifest::decode(disabled.encode_to_vec().as_slice()).unwrap(),
+            disabled
+        );
     }
 
     /// A shallow clone points every local file at the parent through `base_id`.
