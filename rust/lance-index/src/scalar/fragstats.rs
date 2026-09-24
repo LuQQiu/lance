@@ -862,6 +862,9 @@ pub struct PackedFragmentStats {
     comparable: Option<Vec<u64>>,
     /// None = all true.
     bounds_valid: Option<Vec<u64>>,
+    /// Truncation overflow: set bits mean the stored max is unbounded
+    /// (upper-side comparisons must keep the fragment). None = none set.
+    max_unbounded: Option<Vec<u64>>,
     bounds: PackedBounds,
 }
 
@@ -980,6 +983,7 @@ impl PackedFragmentStats {
             null_counts,
             comparable,
             bounds_valid,
+            max_unbounded: None,
             bounds,
         })
     }
@@ -1012,6 +1016,9 @@ impl PackedFragmentStats {
             bytes += words.capacity() * 8;
         }
         if let Some(words) = &self.bounds_valid {
+            bytes += words.capacity() * 8;
+        }
+        if let Some(words) = &self.max_unbounded {
             bytes += words.capacity() * 8;
         }
         match &self.bounds {
@@ -1133,6 +1140,96 @@ impl PackedFragmentStats {
         excluded
     }
 
+    /// Truncated-bounds variant for Utf8 columns: min truncated down to the
+    /// first `k` bytes, max truncated UP (last byte incremented, 0xFF bytes
+    /// dropped; a max that overflows entirely becomes unbounded on that side).
+    /// Bounds only widen, so pruning stays conservative; memory shrinks and
+    /// comparisons get shorter. Precision loss depends on key prefix entropy
+    /// and is measured, not assumed.
+    #[doc(hidden)]
+    pub fn try_from_index_utf8_truncated(
+        index: &FragmentColumnStatsIndex,
+        k: usize,
+    ) -> Option<Self> {
+        if !matches!(index.data_type, DataType::Utf8 | DataType::LargeUtf8) {
+            return None;
+        }
+        let mut packed = Self::try_from_index(index)?;
+        let PackedBounds::Utf8 {
+            min_arena,
+            min_offsets,
+            max_arena,
+            max_offsets,
+        } = &packed.bounds
+        else {
+            return None;
+        };
+        let n = packed.len;
+        let mut new_min_arena = Vec::new();
+        let mut new_min_offsets = Vec::with_capacity(n + 1);
+        let mut new_max_arena = Vec::new();
+        let mut new_max_offsets = Vec::with_capacity(n + 1);
+        let mut unbounded_bits = vec![false; n];
+        new_min_offsets.push(0u32);
+        new_max_offsets.push(0u32);
+        for i in 0..n {
+            let min = &min_arena[min_offsets[i] as usize..min_offsets[i + 1] as usize];
+            let max = &max_arena[max_offsets[i] as usize..max_offsets[i + 1] as usize];
+            new_min_arena.extend_from_slice(&min[..min.len().min(k)]);
+            new_min_offsets.push(new_min_arena.len() as u32);
+            if max.len() <= k {
+                new_max_arena.extend_from_slice(max);
+            } else {
+                let mut upper = max[..k].to_vec();
+                while let Some(last) = upper.last_mut() {
+                    if *last < 0xFF {
+                        *last += 1;
+                        break;
+                    }
+                    upper.pop();
+                }
+                if upper.is_empty() {
+                    unbounded_bits[i] = true;
+                } else {
+                    new_max_arena.extend_from_slice(&upper);
+                }
+            }
+            new_max_offsets.push(new_max_arena.len() as u32);
+        }
+        new_min_arena.shrink_to_fit();
+        new_max_arena.shrink_to_fit();
+        packed.bounds = PackedBounds::Utf8 {
+            min_arena: new_min_arena,
+            min_offsets: new_min_offsets,
+            max_arena: new_max_arena,
+            max_offsets: new_max_offsets,
+        };
+        packed.max_unbounded = if unbounded_bits.iter().any(|b| *b) {
+            Some(
+                unbounded_bits
+                    .chunks(64)
+                    .map(|chunk| {
+                        chunk
+                            .iter()
+                            .enumerate()
+                            .fold(0u64, |w, (j, b)| w | (u64::from(*b) << j))
+                    })
+                    .collect(),
+            )
+        } else {
+            None
+        };
+        Some(packed)
+    }
+
+    #[inline(always)]
+    fn max_is_unbounded(&self, i: usize) -> bool {
+        match &self.max_unbounded {
+            None => false,
+            Some(words) => (words[i / 64] >> (i % 64)) & 1 == 1,
+        }
+    }
+
     /// Same exclusion semantics as the compact scheme, over packed storage.
     /// Supports Range / Equals / IsNull; other queries refuse to exclude.
     pub fn excluded_fragments(&self, query: &SargableQuery) -> RoaringBitmap {
@@ -1188,7 +1285,7 @@ impl PackedFragmentStats {
                                     [min_offsets[i] as usize..min_offsets[i + 1] as usize];
                                 let max = &max_arena
                                     [max_offsets[i] as usize..max_offsets[i + 1] as usize];
-                                t >= min && t <= max
+                                t >= min && (self.max_is_unbounded(i) || t <= max)
                             };
                             if !may {
                                 excluded.insert(self.id(i));
@@ -1259,11 +1356,12 @@ impl PackedFragmentStats {
                                 &min_arena[min_offsets[i] as usize..min_offsets[i + 1] as usize];
                             let max =
                                 &max_arena[max_offsets[i] as usize..max_offsets[i + 1] as usize];
-                            let start_ok = match &start {
-                                None => true,
-                                Some((s, true)) => max >= s.as_slice(),
-                                Some((s, false)) => max > s.as_slice(),
-                            };
+                            let start_ok = self.max_is_unbounded(i)
+                                || match &start {
+                                    None => true,
+                                    Some((s, true)) => max >= s.as_slice(),
+                                    Some((s, false)) => max > s.as_slice(),
+                                };
                             let end_ok = match &end {
                                 None => true,
                                 Some((e, true)) => min <= e.as_slice(),
@@ -1324,6 +1422,30 @@ pub fn synthetic_for_bench(
                     (
                         ScalarValue::Utf8(Some(format!("user-{:012}-aaaaaaaa", i))),
                         ScalarValue::Utf8(Some(format!("user-{:012}-zzzzzzzz", i))),
+                    )
+                }),
+            ),
+            // High-entropy clustered keys: the distinguishing bytes sit at the
+            // very front (base36 of the fragment ordinal), like uuid/hash keys
+            // after clustering. Same ~26B length as the "utf8" kind.
+            "utf8hi" => (
+                DataType::Utf8,
+                Box::new(move |i| {
+                    let mut v = i;
+                    let mut prefix = [b'0'; 4];
+                    for slot in (0..4).rev() {
+                        let digit = (v % 36) as u8;
+                        prefix[slot] = if digit < 10 {
+                            b'0' + digit
+                        } else {
+                            b'a' + digit - 10
+                        };
+                        v /= 36;
+                    }
+                    let prefix = std::str::from_utf8(&prefix).unwrap().to_string();
+                    (
+                        ScalarValue::Utf8(Some(format!("{prefix}-{:012}-aaaaaaa", i))),
+                        ScalarValue::Utf8(Some(format!("{prefix}-{:012}-zzzzzzz", i))),
                     )
                 }),
             ),

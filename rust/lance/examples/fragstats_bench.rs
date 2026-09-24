@@ -587,6 +587,80 @@ fn qn_tier() {
     }
 }
 
+fn trunc_tier() {
+    use lance_index::scalar::fragstats::{PackedFragmentStats, synthetic_for_bench};
+    use std::ops::Bound;
+
+    println!("\n== Tier T: truncated string bounds (1M fragments) ==\n");
+    println!(
+        "| key distribution | variant | resident bytes | bytes/rec | range eval ms | candidates (full baseline) | extra candidates |"
+    );
+    println!("|---|---|---|---|---|---|---|");
+    let count = 1_000_000u32;
+    for kind in ["utf8", "utf8hi"] {
+        let object = synthetic_for_bench(count, 1_000_000, kind);
+        let live: RoaringBitmap = (0..count).collect();
+        let full = PackedFragmentStats::try_from_index(&object).unwrap();
+        // ~1% range near the top of each domain, matching the key shapes.
+        let (lo, hi) = if kind == "utf8" {
+            (
+                format!("user-{:012}-a", count * 99 / 100),
+                format!("user-{:012}-a", count),
+            )
+        } else {
+            let base36 = |mut v: u32| {
+                let mut prefix = [b'0'; 4];
+                for slot in (0..4).rev() {
+                    let digit = (v % 36) as u8;
+                    prefix[slot] = if digit < 10 {
+                        b'0' + digit
+                    } else {
+                        b'a' + digit - 10
+                    };
+                    v /= 36;
+                }
+                String::from_utf8(prefix.to_vec()).unwrap()
+            };
+            (
+                format!("{}-{:012}-a", base36(count * 99 / 100), count * 99 / 100),
+                format!("{}-{:012}-a", base36(count), count),
+            )
+        };
+        let query = SargableQuery::Range(
+            Bound::Included(datafusion::common::ScalarValue::Utf8(Some(lo))),
+            Bound::Excluded(datafusion::common::ScalarValue::Utf8(Some(hi))),
+        );
+
+        let baseline = &live - &full.excluded_fragments(&query);
+        let mut variants: Vec<(String, PackedFragmentStats)> = vec![("full".to_string(), full)];
+        for k in [16usize, 8] {
+            variants.push((
+                format!("trunc({k})"),
+                PackedFragmentStats::try_from_index_utf8_truncated(&object, k).unwrap(),
+            ));
+        }
+        for (name, packed) in &variants {
+            let start = Instant::now();
+            let mut candidates = RoaringBitmap::new();
+            for _ in 0..5 {
+                candidates = &live - &packed.excluded_fragments(&query);
+            }
+            let ms = start.elapsed().as_secs_f64() * 1000.0 / 5.0;
+            assert!(
+                baseline.is_subset(&candidates),
+                "truncated bounds must only widen the candidate set"
+            );
+            let extra = candidates.len() - baseline.len();
+            println!(
+                "| {kind} | {name} | {} | {:.1} | {ms:.2} | {} | +{extra} |",
+                packed.resident_bytes(),
+                packed.resident_bytes() as f64 / count as f64,
+                baseline.len(),
+            );
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let rows = env_usize("ROWS", 1_000_000);
@@ -606,5 +680,8 @@ async fn main() {
     }
     if tier == "qn" {
         qn_tier();
+    }
+    if tier == "trunc" {
+        trunc_tier();
     }
 }
