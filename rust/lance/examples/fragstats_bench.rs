@@ -139,6 +139,136 @@ async fn tier1(rows: usize, frag_rows: usize) {
     }
 }
 
+async fn tier1_vector(rows: usize, frag_rows: usize) {
+    use arrow_array::{FixedSizeListArray, Float32Array};
+    use lance::index::vector::VectorIndexParams;
+    use lance_arrow::FixedSizeListArrayExt;
+    use lance_linalg::distance::MetricType;
+
+    const DIM: usize = 16;
+    println!("\n== Tier 1v: vector search + prefilter (clustered, {rows} rows) ==\n");
+    let schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("ts", DataType::Int64, false),
+        Field::new(
+            "vec",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                DIM as i32,
+            ),
+            true,
+        ),
+    ]));
+    let make_batch = |start: i64, end: i64| {
+        let values = Float32Array::from_iter_values(
+            (start..end).flat_map(|v| std::iter::repeat_n(v as f32, DIM)),
+        );
+        let vecs = FixedSizeListArray::try_new_from_values(values, DIM as i32).unwrap();
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from_iter_values(start..end)),
+                Arc::new(vecs),
+            ],
+        )
+        .unwrap()
+    };
+
+    let dir = TempStrDir::default();
+    // First 60% of rows written and covered by the vector index; the last 40%
+    // appended afterwards stay unindexed (flat fallback territory).
+    let split = (rows as i64) * 6 / 10;
+    let params = WriteParams {
+        max_rows_per_file: frag_rows,
+        ..Default::default()
+    };
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(make_batch(0, split))], schema.clone()),
+        dir.as_str(),
+        Some(params),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["vec"],
+            IndexType::Vector,
+            None,
+            &VectorIndexParams::ivf_flat(8, MetricType::L2),
+            true,
+        )
+        .await
+        .unwrap();
+    let append = WriteParams {
+        mode: lance::dataset::WriteMode::Append,
+        max_rows_per_file: frag_rows,
+        ..Default::default()
+    };
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(make_batch(split, rows as i64))], schema.clone()),
+        Arc::new(dataset),
+        Some(append),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["ts"],
+            IndexType::FragmentColumnStats,
+            None,
+            &ScalarIndexParams::new("FragmentColumnStats".to_string()),
+            true,
+        )
+        .await
+        .unwrap();
+
+    println!("| filter | stats | deltas_searched | fallback fragments | latency ms |");
+    println!("|---|---|---|---|---|");
+    // Three regimes: candidates entirely in indexed range, entirely in the
+    // unindexed tail, and straddling the boundary.
+    let filters = [
+        format!("ts < {}", rows / 100),
+        format!("ts >= {}", rows - rows / 100),
+        format!("ts >= {} AND ts < {}", split - 5000, split as usize + 5000),
+    ];
+    for filter in &filters {
+        for use_stats in [false, true] {
+            let query = Float32Array::from_iter_values(std::iter::repeat_n(1.0f32, DIM));
+            let mut scanner = dataset.scan();
+            scanner.nearest("vec", &query, 10).unwrap();
+            scanner.prefilter(true);
+            scanner.filter(filter).unwrap();
+            scanner.use_fragment_stats(use_stats);
+            let start = Instant::now();
+            let _batches: Vec<RecordBatch> = scanner
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+            let ms = start.elapsed().as_secs_f64() * 1000.0;
+
+            let mut scanner = dataset.scan();
+            scanner.nearest("vec", &query, 10).unwrap();
+            scanner.prefilter(true);
+            scanner.filter(filter).unwrap();
+            scanner.use_fragment_stats(use_stats);
+            let analyzed = scanner.analyze_plan().await.unwrap();
+            let deltas = extract_metric(&analyzed, "deltas_searched=");
+            let frags = extract_metric(&analyzed, "num_fragments=");
+            println!(
+                "| {filter} | {} | {deltas} | {frags} | {ms:.1} |",
+                if use_stats { "on" } else { "off" },
+            );
+            if filter == &filters[1] {
+                println!(
+                    "\n--- analyze_plan [vector, {filter}, stats={use_stats}] ---\n{analyzed}\n"
+                );
+            }
+        }
+    }
+}
+
 fn tier2() {
     use lance_core::deepsize::DeepSizeOf;
     println!("\n== Tier 2: synthetic summary scale ==\n");
@@ -171,6 +301,9 @@ async fn main() {
     let tier = std::env::var("TIER").unwrap_or_else(|_| "both".to_string());
     if tier == "1" || tier == "both" {
         tier1(rows, frag_rows).await;
+    }
+    if tier == "1v" || tier == "both" {
+        tier1_vector(rows, frag_rows).await;
     }
     if tier == "2" || tier == "both" {
         tier2();
