@@ -534,6 +534,832 @@ impl ScalarIndex for FragmentColumnStatsIndex {
     }
 }
 
+/// Bench-only compact columnar representation of the same records.
+///
+/// Round-2 measurement target: resident memory and candidate-generation CPU
+/// versus the object representation, over identical statistics. Not wired
+/// into the query path. Evaluation semantics mirror
+/// [`ZoneMapIndex::evaluate_stats_against_query`] for Range / Equals / IsIn /
+/// IsNull on Int64, timestamp (microseconds), and Utf8 columns; anything else
+/// conservatively refuses to exclude.
+#[doc(hidden)]
+pub struct CompactFragmentStats {
+    fragment_ids: Vec<u32>,
+    null_counts: Vec<u32>,
+    /// span > null_count + nan_count, i.e. the fragment holds comparable values.
+    comparable: Vec<bool>,
+    /// min/max are usable bounds (false for all-null fragments).
+    bounds_valid: Vec<bool>,
+    bounds: CompactBounds,
+}
+
+#[doc(hidden)]
+pub enum CompactBounds {
+    I64 {
+        mins: Vec<i64>,
+        maxs: Vec<i64>,
+    },
+    Utf8 {
+        mins: Vec<String>,
+        maxs: Vec<String>,
+    },
+}
+
+fn scalar_as_i64(value: &ScalarValue) -> Option<i64> {
+    match value {
+        ScalarValue::Int64(Some(v)) => Some(*v),
+        ScalarValue::TimestampMicrosecond(Some(v), _) => Some(*v),
+        _ => None,
+    }
+}
+
+fn scalar_as_str(value: &ScalarValue) -> Option<&str> {
+    match value {
+        ScalarValue::Utf8(Some(v)) | ScalarValue::LargeUtf8(Some(v)) => Some(v.as_str()),
+        _ => None,
+    }
+}
+
+impl CompactFragmentStats {
+    pub fn try_from_index(index: &FragmentColumnStatsIndex) -> Option<Self> {
+        let n = index.records.len();
+        let mut fragment_ids = Vec::with_capacity(n);
+        let mut null_counts = Vec::with_capacity(n);
+        let mut comparable = Vec::with_capacity(n);
+        let mut bounds_valid = Vec::with_capacity(n);
+
+        enum B {
+            I64(Vec<i64>, Vec<i64>),
+            Utf8(Vec<String>, Vec<String>),
+        }
+        let mut bounds = match &index.data_type {
+            DataType::Int64 | DataType::Timestamp(_, _) => {
+                B::I64(Vec::with_capacity(n), Vec::with_capacity(n))
+            }
+            DataType::Utf8 | DataType::LargeUtf8 => {
+                B::Utf8(Vec::with_capacity(n), Vec::with_capacity(n))
+            }
+            _ => return None,
+        };
+
+        for record in &index.records {
+            fragment_ids.push(record.bound.fragment_id as u32);
+            null_counts.push(record.null_count);
+            comparable.push(
+                record.bound.length as u128
+                    > u128::from(record.null_count) + u128::from(record.nan_count),
+            );
+            let valid = !record.min.is_null() && !record.max.is_null();
+            bounds_valid.push(valid);
+            match &mut bounds {
+                B::I64(mins, maxs) => {
+                    mins.push(scalar_as_i64(&record.min).unwrap_or(i64::MIN));
+                    maxs.push(scalar_as_i64(&record.max).unwrap_or(i64::MAX));
+                }
+                B::Utf8(mins, maxs) => {
+                    mins.push(scalar_as_str(&record.min).unwrap_or("").to_string());
+                    maxs.push(scalar_as_str(&record.max).unwrap_or("").to_string());
+                }
+            }
+        }
+        let bounds = match bounds {
+            B::I64(mins, maxs) => CompactBounds::I64 { mins, maxs },
+            B::Utf8(mins, maxs) => CompactBounds::Utf8 { mins, maxs },
+        };
+        Some(Self {
+            fragment_ids,
+            null_counts,
+            comparable,
+            bounds_valid,
+            bounds,
+        })
+    }
+
+    /// Resident heap bytes, including string payloads and auxiliary vectors.
+    pub fn resident_bytes(&self) -> usize {
+        let mut bytes = self.fragment_ids.capacity() * 4
+            + self.null_counts.capacity() * 4
+            + self.comparable.capacity()
+            + self.bounds_valid.capacity();
+        match &self.bounds {
+            CompactBounds::I64 { mins, maxs } => {
+                bytes += mins.capacity() * 8 + maxs.capacity() * 8;
+            }
+            CompactBounds::Utf8 { mins, maxs } => {
+                bytes += mins.capacity() * std::mem::size_of::<String>()
+                    + maxs.capacity() * std::mem::size_of::<String>();
+                bytes += mins.iter().map(|s| s.capacity()).sum::<usize>();
+                bytes += maxs.iter().map(|s| s.capacity()).sum::<usize>();
+            }
+        }
+        bytes
+    }
+
+    /// Mirror of the object-path exclusion for the supported query kinds.
+    pub fn excluded_fragments(&self, query: &SargableQuery) -> RoaringBitmap {
+        use std::ops::Bound;
+        let n = self.fragment_ids.len();
+        let mut excluded = RoaringBitmap::new();
+        let mut push_excluded = |may_match: &dyn Fn(usize) -> bool, this: &Self| {
+            for i in 0..n {
+                if !may_match(i) {
+                    excluded.insert(this.fragment_ids[i]);
+                }
+            }
+        };
+        match query {
+            SargableQuery::IsNull() => {
+                for i in 0..n {
+                    if self.null_counts[i] == 0 {
+                        excluded.insert(self.fragment_ids[i]);
+                    }
+                }
+            }
+            SargableQuery::Equals(target) => {
+                if target.is_null() {
+                    for i in 0..n {
+                        if self.null_counts[i] == 0 {
+                            excluded.insert(self.fragment_ids[i]);
+                        }
+                    }
+                    return excluded;
+                }
+                match (&self.bounds, scalar_as_i64(target), scalar_as_str(target)) {
+                    (CompactBounds::I64 { mins, maxs }, Some(t), _) => {
+                        push_excluded(
+                            &|i| {
+                                if !self.bounds_valid[i] {
+                                    self.comparable[i]
+                                } else {
+                                    t >= mins[i] && t <= maxs[i]
+                                }
+                            },
+                            self,
+                        );
+                    }
+                    (CompactBounds::Utf8 { mins, maxs }, _, Some(t)) => {
+                        push_excluded(
+                            &|i| {
+                                if !self.bounds_valid[i] {
+                                    self.comparable[i]
+                                } else {
+                                    t >= mins[i].as_str() && t <= maxs[i].as_str()
+                                }
+                            },
+                            self,
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            SargableQuery::Range(start, end) => match &self.bounds {
+                CompactBounds::I64 { mins, maxs } => {
+                    let start = match start {
+                        Bound::Unbounded => None,
+                        Bound::Included(s) => match scalar_as_i64(s) {
+                            Some(v) => Some((v, true)),
+                            None => return excluded,
+                        },
+                        Bound::Excluded(s) => match scalar_as_i64(s) {
+                            Some(v) => Some((v, false)),
+                            None => return excluded,
+                        },
+                    };
+                    let end = match end {
+                        Bound::Unbounded => None,
+                        Bound::Included(e) => match scalar_as_i64(e) {
+                            Some(v) => Some((v, true)),
+                            None => return excluded,
+                        },
+                        Bound::Excluded(e) => match scalar_as_i64(e) {
+                            Some(v) => Some((v, false)),
+                            None => return excluded,
+                        },
+                    };
+                    for i in 0..n {
+                        let may = if !self.bounds_valid[i] {
+                            self.comparable[i]
+                        } else {
+                            let start_ok = match start {
+                                None => true,
+                                Some((s, true)) => maxs[i] >= s,
+                                Some((s, false)) => maxs[i] > s,
+                            };
+                            let end_ok = match end {
+                                None => true,
+                                Some((e, true)) => mins[i] <= e,
+                                Some((e, false)) => mins[i] < e,
+                            };
+                            start_ok && end_ok
+                        };
+                        if !may {
+                            excluded.insert(self.fragment_ids[i]);
+                        }
+                    }
+                }
+                CompactBounds::Utf8 { mins, maxs } => {
+                    let bound_str = |b: &Bound<ScalarValue>| -> Option<Option<(String, bool)>> {
+                        match b {
+                            Bound::Unbounded => Some(None),
+                            Bound::Included(v) => {
+                                scalar_as_str(v).map(|s| Some((s.to_string(), true)))
+                            }
+                            Bound::Excluded(v) => {
+                                scalar_as_str(v).map(|s| Some((s.to_string(), false)))
+                            }
+                        }
+                    };
+                    let (Some(start), Some(end)) = (bound_str(start), bound_str(end)) else {
+                        return excluded;
+                    };
+                    for i in 0..n {
+                        let may = if !self.bounds_valid[i] {
+                            self.comparable[i]
+                        } else {
+                            let start_ok = match &start {
+                                None => true,
+                                Some((s, true)) => maxs[i].as_str() >= s.as_str(),
+                                Some((s, false)) => maxs[i].as_str() > s.as_str(),
+                            };
+                            let end_ok = match &end {
+                                None => true,
+                                Some((e, true)) => mins[i].as_str() <= e.as_str(),
+                                Some((e, false)) => mins[i].as_str() < e.as_str(),
+                            };
+                            start_ok && end_ok
+                        };
+                        if !may {
+                            excluded.insert(self.fragment_ids[i]);
+                        }
+                    }
+                }
+            },
+            SargableQuery::IsIn(values) => {
+                for i in 0..n {
+                    let mut may = false;
+                    for value in values {
+                        if value.is_null() {
+                            if self.null_counts[i] > 0 {
+                                may = true;
+                                break;
+                            }
+                            continue;
+                        }
+                        if !self.bounds_valid[i] {
+                            if self.comparable[i] {
+                                may = true;
+                                break;
+                            }
+                            continue;
+                        }
+                        let inside =
+                            match (&self.bounds, scalar_as_i64(value), scalar_as_str(value)) {
+                                (CompactBounds::I64 { mins, maxs }, Some(t), _) => {
+                                    t >= mins[i] && t <= maxs[i]
+                                }
+                                (CompactBounds::Utf8 { mins, maxs }, _, Some(t)) => {
+                                    t >= mins[i].as_str() && t <= maxs[i].as_str()
+                                }
+                                _ => true,
+                            };
+                        if inside {
+                            may = true;
+                            break;
+                        }
+                    }
+                    if !may {
+                        excluded.insert(self.fragment_ids[i]);
+                    }
+                }
+            }
+            _ => {}
+        }
+        excluded
+    }
+}
+
+/// Bench-only scheme 3: zero-read-cost packed representation.
+///
+/// Same evaluation semantics as [`CompactFragmentStats`], with structures
+/// that shrink memory WITHOUT adding per-access decode work (hard
+/// requirement: read performance must not regress):
+/// - sequential fragment ids stored implicitly,
+/// - all-zero count vectors elided,
+/// - bool vectors packed into bitsets (one AND+shift per access),
+/// - string bounds in a contiguous arena with u32 offsets (removes per-String
+///   header and allocator slack; access is a slice, typically faster).
+///
+/// Deliberately NOT done here: delta/frame-of-reference/prefix encodings of
+/// the bound values themselves, because they put a decode on the read path.
+#[doc(hidden)]
+pub struct PackedFragmentStats {
+    len: usize,
+    /// None = ids are exactly 0..len.
+    explicit_ids: Option<Vec<u32>>,
+    /// None = all zero.
+    null_counts: Option<Vec<u32>>,
+    /// None = all true.
+    comparable: Option<Vec<u64>>,
+    /// None = all true.
+    bounds_valid: Option<Vec<u64>>,
+    bounds: PackedBounds,
+}
+
+#[doc(hidden)]
+pub enum PackedBounds {
+    I64 {
+        mins: Vec<i64>,
+        maxs: Vec<i64>,
+    },
+    Utf8 {
+        min_arena: Vec<u8>,
+        min_offsets: Vec<u32>,
+        max_arena: Vec<u8>,
+        max_offsets: Vec<u32>,
+    },
+}
+
+fn pack_bits(bools: &[bool]) -> Option<Vec<u64>> {
+    if bools.iter().all(|b| *b) {
+        return None;
+    }
+    let mut words = vec![0u64; bools.len().div_ceil(64)];
+    for (i, b) in bools.iter().enumerate() {
+        if *b {
+            words[i / 64] |= 1u64 << (i % 64);
+        }
+    }
+    Some(words)
+}
+
+#[inline(always)]
+fn bit_at(words: &Option<Vec<u64>>, i: usize) -> bool {
+    match words {
+        None => true,
+        Some(words) => (words[i / 64] >> (i % 64)) & 1 == 1,
+    }
+}
+
+impl PackedFragmentStats {
+    pub fn try_from_index(index: &FragmentColumnStatsIndex) -> Option<Self> {
+        let n = index.records.len();
+        let sequential = index
+            .records
+            .iter()
+            .enumerate()
+            .all(|(i, r)| r.bound.fragment_id == i as u64);
+        let explicit_ids = if sequential {
+            None
+        } else {
+            Some(
+                index
+                    .records
+                    .iter()
+                    .map(|r| r.bound.fragment_id as u32)
+                    .collect(),
+            )
+        };
+        let null_counts = if index.records.iter().all(|r| r.null_count == 0) {
+            None
+        } else {
+            Some(index.records.iter().map(|r| r.null_count).collect())
+        };
+        let comparable_vec: Vec<bool> = index
+            .records
+            .iter()
+            .map(|r| r.bound.length as u128 > u128::from(r.null_count) + u128::from(r.nan_count))
+            .collect();
+        let valid_vec: Vec<bool> = index
+            .records
+            .iter()
+            .map(|r| !r.min.is_null() && !r.max.is_null())
+            .collect();
+        let comparable = pack_bits(&comparable_vec);
+        let bounds_valid = pack_bits(&valid_vec);
+
+        let bounds = match &index.data_type {
+            DataType::Int64 | DataType::Timestamp(_, _) => PackedBounds::I64 {
+                mins: index
+                    .records
+                    .iter()
+                    .map(|r| scalar_as_i64(&r.min).unwrap_or(i64::MIN))
+                    .collect(),
+                maxs: index
+                    .records
+                    .iter()
+                    .map(|r| scalar_as_i64(&r.max).unwrap_or(i64::MAX))
+                    .collect(),
+            },
+            DataType::Utf8 | DataType::LargeUtf8 => {
+                let mut min_arena = Vec::new();
+                let mut min_offsets = Vec::with_capacity(n + 1);
+                let mut max_arena = Vec::new();
+                let mut max_offsets = Vec::with_capacity(n + 1);
+                min_offsets.push(0u32);
+                max_offsets.push(0u32);
+                for r in &index.records {
+                    min_arena.extend_from_slice(scalar_as_str(&r.min).unwrap_or("").as_bytes());
+                    min_offsets.push(min_arena.len() as u32);
+                    max_arena.extend_from_slice(scalar_as_str(&r.max).unwrap_or("").as_bytes());
+                    max_offsets.push(max_arena.len() as u32);
+                }
+                min_arena.shrink_to_fit();
+                max_arena.shrink_to_fit();
+                PackedBounds::Utf8 {
+                    min_arena,
+                    min_offsets,
+                    max_arena,
+                    max_offsets,
+                }
+            }
+            _ => return None,
+        };
+        Some(Self {
+            len: n,
+            explicit_ids,
+            null_counts,
+            comparable,
+            bounds_valid,
+            bounds,
+        })
+    }
+
+    #[inline(always)]
+    fn id(&self, i: usize) -> u32 {
+        match &self.explicit_ids {
+            None => i as u32,
+            Some(ids) => ids[i],
+        }
+    }
+
+    #[inline(always)]
+    fn null_count(&self, i: usize) -> u32 {
+        match &self.null_counts {
+            None => 0,
+            Some(counts) => counts[i],
+        }
+    }
+
+    pub fn resident_bytes(&self) -> usize {
+        let mut bytes = 0usize;
+        if let Some(ids) = &self.explicit_ids {
+            bytes += ids.capacity() * 4;
+        }
+        if let Some(counts) = &self.null_counts {
+            bytes += counts.capacity() * 4;
+        }
+        if let Some(words) = &self.comparable {
+            bytes += words.capacity() * 8;
+        }
+        if let Some(words) = &self.bounds_valid {
+            bytes += words.capacity() * 8;
+        }
+        match &self.bounds {
+            PackedBounds::I64 { mins, maxs } => {
+                bytes += mins.capacity() * 8 + maxs.capacity() * 8;
+            }
+            PackedBounds::Utf8 {
+                min_arena,
+                min_offsets,
+                max_arena,
+                max_offsets,
+            } => {
+                bytes += min_arena.capacity()
+                    + max_arena.capacity()
+                    + min_offsets.capacity() * 4
+                    + max_offsets.capacity() * 4;
+            }
+        }
+        bytes
+    }
+
+    /// Attribution helper: count exclusions without building any bitmap.
+    /// Range queries on i64 bounds only; other inputs return 0.
+    #[doc(hidden)]
+    pub fn count_excluded(&self, query: &SargableQuery) -> u64 {
+        use std::ops::Bound;
+        let SargableQuery::Range(start, end) = query else {
+            return 0;
+        };
+        let PackedBounds::I64 { mins, maxs } = &self.bounds else {
+            return 0;
+        };
+        let start = match start {
+            Bound::Unbounded => None,
+            Bound::Included(s) => scalar_as_i64(s).map(|v| (v, true)),
+            Bound::Excluded(s) => scalar_as_i64(s).map(|v| (v, false)),
+        };
+        let end = match end {
+            Bound::Unbounded => None,
+            Bound::Included(e) => scalar_as_i64(e).map(|v| (v, true)),
+            Bound::Excluded(e) => scalar_as_i64(e).map(|v| (v, false)),
+        };
+        let mut excluded = 0u64;
+        for i in 0..self.len {
+            let may = if !bit_at(&self.bounds_valid, i) {
+                bit_at(&self.comparable, i)
+            } else {
+                let start_ok = match start {
+                    None => true,
+                    Some((s, true)) => maxs[i] >= s,
+                    Some((s, false)) => maxs[i] > s,
+                };
+                let end_ok = match end {
+                    None => true,
+                    Some((e, true)) => mins[i] <= e,
+                    Some((e, false)) => mins[i] < e,
+                };
+                start_ok && end_ok
+            };
+            excluded += u64::from(!may);
+        }
+        excluded
+    }
+
+    /// Attribution helper: same exclusion scan, but consecutive excluded
+    /// fragments are inserted as ranges (clustered layouts produce long runs).
+    /// Range queries on i64 bounds with implicit sequential ids only.
+    #[doc(hidden)]
+    pub fn excluded_fragments_runs(&self, query: &SargableQuery) -> RoaringBitmap {
+        use std::ops::Bound;
+        let mut excluded = RoaringBitmap::new();
+        let SargableQuery::Range(start, end) = query else {
+            return excluded;
+        };
+        let PackedBounds::I64 { mins, maxs } = &self.bounds else {
+            return excluded;
+        };
+        if self.explicit_ids.is_some() {
+            return self.excluded_fragments(query);
+        }
+        let start = match start {
+            Bound::Unbounded => None,
+            Bound::Included(s) => scalar_as_i64(s).map(|v| (v, true)),
+            Bound::Excluded(s) => scalar_as_i64(s).map(|v| (v, false)),
+        };
+        let end = match end {
+            Bound::Unbounded => None,
+            Bound::Included(e) => scalar_as_i64(e).map(|v| (v, true)),
+            Bound::Excluded(e) => scalar_as_i64(e).map(|v| (v, false)),
+        };
+        let mut run_start: Option<u32> = None;
+        for i in 0..self.len {
+            let may = if !bit_at(&self.bounds_valid, i) {
+                bit_at(&self.comparable, i)
+            } else {
+                let start_ok = match start {
+                    None => true,
+                    Some((s, true)) => maxs[i] >= s,
+                    Some((s, false)) => maxs[i] > s,
+                };
+                let end_ok = match end {
+                    None => true,
+                    Some((e, true)) => mins[i] <= e,
+                    Some((e, false)) => mins[i] < e,
+                };
+                start_ok && end_ok
+            };
+            if !may {
+                if run_start.is_none() {
+                    run_start = Some(i as u32);
+                }
+            } else if let Some(first) = run_start.take() {
+                excluded.insert_range(first..i as u32);
+            }
+        }
+        if let Some(first) = run_start.take() {
+            excluded.insert_range(first..self.len as u32);
+        }
+        excluded
+    }
+
+    /// Same exclusion semantics as the compact scheme, over packed storage.
+    /// Supports Range / Equals / IsNull; other queries refuse to exclude.
+    pub fn excluded_fragments(&self, query: &SargableQuery) -> RoaringBitmap {
+        use std::ops::Bound;
+        let n = self.len;
+        let mut excluded = RoaringBitmap::new();
+        match query {
+            SargableQuery::IsNull() => {
+                for i in 0..n {
+                    if self.null_count(i) == 0 {
+                        excluded.insert(self.id(i));
+                    }
+                }
+            }
+            SargableQuery::Equals(target) => {
+                if target.is_null() {
+                    for i in 0..n {
+                        if self.null_count(i) == 0 {
+                            excluded.insert(self.id(i));
+                        }
+                    }
+                    return excluded;
+                }
+                match (&self.bounds, scalar_as_i64(target), scalar_as_str(target)) {
+                    (PackedBounds::I64 { mins, maxs }, Some(t), _) => {
+                        for i in 0..n {
+                            let may = if !bit_at(&self.bounds_valid, i) {
+                                bit_at(&self.comparable, i)
+                            } else {
+                                t >= mins[i] && t <= maxs[i]
+                            };
+                            if !may {
+                                excluded.insert(self.id(i));
+                            }
+                        }
+                    }
+                    (
+                        PackedBounds::Utf8 {
+                            min_arena,
+                            min_offsets,
+                            max_arena,
+                            max_offsets,
+                        },
+                        _,
+                        Some(t),
+                    ) => {
+                        let t = t.as_bytes();
+                        for i in 0..n {
+                            let may = if !bit_at(&self.bounds_valid, i) {
+                                bit_at(&self.comparable, i)
+                            } else {
+                                let min = &min_arena
+                                    [min_offsets[i] as usize..min_offsets[i + 1] as usize];
+                                let max = &max_arena
+                                    [max_offsets[i] as usize..max_offsets[i + 1] as usize];
+                                t >= min && t <= max
+                            };
+                            if !may {
+                                excluded.insert(self.id(i));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            SargableQuery::Range(start, end) => match &self.bounds {
+                PackedBounds::I64 { mins, maxs } => {
+                    let to_i64 = |b: &Bound<ScalarValue>| -> Option<Option<(i64, bool)>> {
+                        match b {
+                            Bound::Unbounded => Some(None),
+                            Bound::Included(v) => scalar_as_i64(v).map(|v| Some((v, true))),
+                            Bound::Excluded(v) => scalar_as_i64(v).map(|v| Some((v, false))),
+                        }
+                    };
+                    let (Some(start), Some(end)) = (to_i64(start), to_i64(end)) else {
+                        return excluded;
+                    };
+                    for i in 0..n {
+                        let may = if !bit_at(&self.bounds_valid, i) {
+                            bit_at(&self.comparable, i)
+                        } else {
+                            let start_ok = match start {
+                                None => true,
+                                Some((s, true)) => maxs[i] >= s,
+                                Some((s, false)) => maxs[i] > s,
+                            };
+                            let end_ok = match end {
+                                None => true,
+                                Some((e, true)) => mins[i] <= e,
+                                Some((e, false)) => mins[i] < e,
+                            };
+                            start_ok && end_ok
+                        };
+                        if !may {
+                            excluded.insert(self.id(i));
+                        }
+                    }
+                }
+                PackedBounds::Utf8 {
+                    min_arena,
+                    min_offsets,
+                    max_arena,
+                    max_offsets,
+                } => {
+                    let to_bytes = |b: &Bound<ScalarValue>| -> Option<Option<(Vec<u8>, bool)>> {
+                        match b {
+                            Bound::Unbounded => Some(None),
+                            Bound::Included(v) => {
+                                scalar_as_str(v).map(|s| Some((s.as_bytes().to_vec(), true)))
+                            }
+                            Bound::Excluded(v) => {
+                                scalar_as_str(v).map(|s| Some((s.as_bytes().to_vec(), false)))
+                            }
+                        }
+                    };
+                    let (Some(start), Some(end)) = (to_bytes(start), to_bytes(end)) else {
+                        return excluded;
+                    };
+                    for i in 0..n {
+                        let may = if !bit_at(&self.bounds_valid, i) {
+                            bit_at(&self.comparable, i)
+                        } else {
+                            let min =
+                                &min_arena[min_offsets[i] as usize..min_offsets[i + 1] as usize];
+                            let max =
+                                &max_arena[max_offsets[i] as usize..max_offsets[i + 1] as usize];
+                            let start_ok = match &start {
+                                None => true,
+                                Some((s, true)) => max >= s.as_slice(),
+                                Some((s, false)) => max > s.as_slice(),
+                            };
+                            let end_ok = match &end {
+                                None => true,
+                                Some((e, true)) => min <= e.as_slice(),
+                                Some((e, false)) => min < e.as_slice(),
+                            };
+                            start_ok && end_ok
+                        };
+                        if !may {
+                            excluded.insert(self.id(i));
+                        }
+                    }
+                }
+            },
+            _ => {}
+        }
+        excluded
+    }
+}
+
+/// Bench-only synthetic index generator over a chosen column kind.
+///
+/// Sequential disjoint ranges, with every 997th fragment all-null to exercise
+/// the missing-bounds path. `kind`: "i64", "timestamp", or "utf8".
+#[doc(hidden)]
+pub fn synthetic_for_bench(
+    count: u32,
+    rows_per_fragment: u64,
+    kind: &str,
+) -> FragmentColumnStatsIndex {
+    let (data_type, make_bounds): (DataType, Box<dyn Fn(u32) -> (ScalarValue, ScalarValue)>) =
+        match kind {
+            "i64" => (
+                DataType::Int64,
+                Box::new(move |i| {
+                    let lo = i as i64 * rows_per_fragment as i64;
+                    (
+                        ScalarValue::Int64(Some(lo)),
+                        ScalarValue::Int64(Some(lo + rows_per_fragment as i64 - 1)),
+                    )
+                }),
+            ),
+            "timestamp" => (
+                DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
+                Box::new(move |i| {
+                    let lo = i as i64 * rows_per_fragment as i64;
+                    (
+                        ScalarValue::TimestampMicrosecond(Some(lo), None),
+                        ScalarValue::TimestampMicrosecond(
+                            Some(lo + rows_per_fragment as i64 - 1),
+                            None,
+                        ),
+                    )
+                }),
+            ),
+            "utf8" => (
+                DataType::Utf8,
+                Box::new(move |i| {
+                    (
+                        ScalarValue::Utf8(Some(format!("user-{:012}-aaaaaaaa", i))),
+                        ScalarValue::Utf8(Some(format!("user-{:012}-zzzzzzzz", i))),
+                    )
+                }),
+            ),
+            other => panic!("unknown synthetic kind {other}"),
+        };
+    let records = (0..count)
+        .map(|i| {
+            let all_null = i % 997 == 0;
+            let (min, max) = if all_null {
+                (
+                    ScalarValue::try_new_null(&data_type).unwrap(),
+                    ScalarValue::try_new_null(&data_type).unwrap(),
+                )
+            } else {
+                make_bounds(i)
+            };
+            ZoneMapStatistics {
+                min,
+                max,
+                null_count: if all_null {
+                    rows_per_fragment as u32
+                } else {
+                    0
+                },
+                nan_count: 0,
+                bound: ZoneBound {
+                    fragment_id: i as u64,
+                    start: 0,
+                    length: rows_per_fragment as usize,
+                },
+            }
+        })
+        .collect();
+    FragmentColumnStatsIndex { records, data_type }
+}
+
 pub struct FragmentColumnStatsTrainingRequest {
     criteria: TrainingCriteria,
 }

@@ -25,6 +25,7 @@ use lance_index::scalar::SargableQuery;
 use lance_index::scalar::ScalarIndexParams;
 use lance_index::scalar::fragstats::FragmentColumnStatsIndex;
 use rand::seq::SliceRandom;
+use roaring::RoaringBitmap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -294,6 +295,172 @@ fn tier2() {
     }
 }
 
+fn median_ms<F: FnMut() -> RoaringBitmap>(mut f: F) -> (f64, RoaringBitmap) {
+    let mut times = Vec::with_capacity(5);
+    let mut out = RoaringBitmap::new();
+    for _ in 0..5 {
+        let start = Instant::now();
+        out = f();
+        times.push(start.elapsed().as_secs_f64() * 1000.0);
+    }
+    times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    (times[2], out)
+}
+
+fn mem_tier() {
+    use lance_core::deepsize::DeepSizeOf;
+    use lance_index::scalar::fragstats::{
+        CompactFragmentStats, PackedFragmentStats, synthetic_for_bench,
+    };
+    use std::ops::Bound;
+
+    println!("\n== Tier M: memory representations (object vs compact vs packed) ==\n");
+    println!(
+        "| kind | fragments | scheme | resident bytes | bytes/rec | build ms | range eval ms | equals eval ms | candidates identical |"
+    );
+    println!("|---|---|---|---|---|---|---|---|---|");
+
+    for kind in ["i64", "utf8"] {
+        for count in [100_000u32, 1_000_000] {
+            let rows_per_fragment = 1_000_000u64;
+            let object = synthetic_for_bench(count, rows_per_fragment, kind);
+            let live: RoaringBitmap = (0..count).collect();
+
+            let build_start = Instant::now();
+            let compact = CompactFragmentStats::try_from_index(&object).unwrap();
+            let compact_build = build_start.elapsed().as_secs_f64() * 1000.0;
+            let build_start = Instant::now();
+            let packed = PackedFragmentStats::try_from_index(&object).unwrap();
+            let packed_build = build_start.elapsed().as_secs_f64() * 1000.0;
+
+            // ~1% range at the top of the domain, plus a point query.
+            let (range_query, equals_query) = if kind == "utf8" {
+                (
+                    SargableQuery::Range(
+                        Bound::Included(datafusion::common::ScalarValue::Utf8(Some(format!(
+                            "user-{:012}-a",
+                            count as u64 * 99 / 100
+                        )))),
+                        Bound::Unbounded,
+                    ),
+                    SargableQuery::Equals(datafusion::common::ScalarValue::Utf8(Some(format!(
+                        "user-{:012}-mmm",
+                        count as u64 / 2
+                    )))),
+                )
+            } else {
+                let lo = (count as i64) * rows_per_fragment as i64 * 99 / 100;
+                let make = |v: i64| {
+                    if kind == "timestamp" {
+                        datafusion::common::ScalarValue::TimestampMicrosecond(Some(v), None)
+                    } else {
+                        datafusion::common::ScalarValue::Int64(Some(v))
+                    }
+                };
+                (
+                    SargableQuery::Range(Bound::Included(make(lo)), Bound::Unbounded),
+                    SargableQuery::Equals(make((count as i64 / 2) * rows_per_fragment as i64 + 17)),
+                )
+            };
+
+            // Candidate-list generation timed end to end: exclusion scan PLUS
+            // the live-minus-excluded bitmap subtraction.
+            let schemes: Vec<(&str, usize, f64)> = vec![
+                ("object", object.deep_size_of(), 0.0),
+                ("compact", compact.resident_bytes(), compact_build),
+                ("packed", packed.resident_bytes(), packed_build),
+            ];
+            let mut range_results: Vec<RoaringBitmap> = Vec::new();
+            let mut equals_results: Vec<RoaringBitmap> = Vec::new();
+            let mut range_times = Vec::new();
+            let mut equals_times = Vec::new();
+            for scheme in ["object", "compact", "packed"] {
+                let (rt, rres) = median_ms(|| {
+                    let excluded = match scheme {
+                        "object" => object.excluded_fragments(&range_query).unwrap(),
+                        "compact" => compact.excluded_fragments(&range_query),
+                        _ => packed.excluded_fragments(&range_query),
+                    };
+                    &live - &excluded
+                });
+                let (et, eres) = median_ms(|| {
+                    let excluded = match scheme {
+                        "object" => object.excluded_fragments(&equals_query).unwrap(),
+                        "compact" => compact.excluded_fragments(&equals_query),
+                        _ => packed.excluded_fragments(&equals_query),
+                    };
+                    &live - &excluded
+                });
+                range_results.push(rres);
+                equals_results.push(eres);
+                range_times.push(rt);
+                equals_times.push(et);
+            }
+            let identical = range_results.windows(2).all(|w| w[0] == w[1])
+                && equals_results.windows(2).all(|w| w[0] == w[1]);
+
+            for (i, (name, bytes, build)) in schemes.iter().enumerate() {
+                println!(
+                    "| {kind} | {count} | {name} | {bytes} | {:.1} | {:.1} | {:.2} | {:.2} | {identical} |",
+                    *bytes as f64 / count as f64,
+                    build,
+                    range_times[i],
+                    equals_times[i],
+                );
+            }
+        }
+    }
+
+    // Attribution: at 1M fragments, is the cost the comparisons or the
+    // result-bitmap construction? Pure count vs per-item insert vs
+    // run-detected insert_range, on the packed i64 scheme.
+    {
+        use lance_index::scalar::fragstats::{PackedFragmentStats, synthetic_for_bench};
+        use std::ops::Bound;
+        let object = synthetic_for_bench(1_000_000, 1_000_000, "i64");
+        let packed = PackedFragmentStats::try_from_index(&object).unwrap();
+        let lo = 1_000_000i64 * 1_000_000 * 99 / 100;
+        let query = SargableQuery::Range(
+            Bound::Included(datafusion::common::ScalarValue::Int64(Some(lo))),
+            Bound::Unbounded,
+        );
+        let start = Instant::now();
+        let mut excl_count = 0u64;
+        for _ in 0..5 {
+            excl_count = packed.count_excluded(&query);
+        }
+        let count_ms = start.elapsed().as_secs_f64() * 1000.0 / 5.0;
+        let start = Instant::now();
+        let mut bitmap_len = 0u64;
+        for _ in 0..5 {
+            bitmap_len = packed.excluded_fragments(&query).len();
+        }
+        let insert_ms = start.elapsed().as_secs_f64() * 1000.0 / 5.0;
+        let start = Instant::now();
+        let mut runs_len = 0u64;
+        for _ in 0..5 {
+            runs_len = packed.excluded_fragments_runs(&query).len();
+        }
+        let runs_ms = start.elapsed().as_secs_f64() * 1000.0 / 5.0;
+        assert_eq!(excl_count, bitmap_len);
+        assert_eq!(bitmap_len, runs_len);
+        println!("\nAttribution (packed i64, 1M fragments, 1% range, {excl_count} excluded):");
+        println!("| pure comparison scan (count only) | {count_ms:.2} ms |");
+        println!("| per-item bitmap insert            | {insert_ms:.2} ms |");
+        println!("| run-detected insert_range         | {runs_ms:.2} ms |");
+    }
+
+    println!(
+        "\nNote: candidate bitmap for the 1% range over 1M fragments serializes to ~{} bytes.",
+        {
+            let live: RoaringBitmap = (0..1_000_000u32).collect();
+            let candidates: RoaringBitmap = (990_000u32..1_000_000).collect();
+            let _ = live;
+            candidates.serialized_size()
+        }
+    );
+}
+
 #[tokio::main]
 async fn main() {
     let rows = env_usize("ROWS", 1_000_000);
@@ -307,5 +474,8 @@ async fn main() {
     }
     if tier == "2" || tier == "both" {
         tier2();
+    }
+    if tier == "mem" {
+        mem_tier();
     }
 }
