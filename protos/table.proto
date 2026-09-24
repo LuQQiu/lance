@@ -32,6 +32,47 @@ message UUID {
   bytes uuid = 1;
 }
 
+/* Identifies a provider-defined clustering layout within a table.
+ * This is a small reference, not an extension point for fragment metadata.
+ */
+message ClusteringReference {
+  // Non-empty, case-sensitive implementation name. Namespaced names are recommended.
+  string provider = 1;
+  /* Provider-assigned layout identifier. Zero is invalid. This is neither a
+   * dataset version nor the version of the provider's software.
+   */
+  uint64 version = 2;
+}
+
+// An immutable clustering declaration, interpreted by its named provider.
+message ClusteringDeclaration {
+  // Required. Unique among the declarations in one manifest.
+  ClusteringReference reference = 1;
+  /* Ordered, non-empty list of distinct schema field IDs, not column names.
+   * These identify all columns on which the layout depends.
+   */
+  repeated int32 columns = 2;
+  /* Optional provider-defined configuration. Absence means no configuration.
+   * Unknown type URLs and payload bytes must be preserved without interpretation.
+   * The provider defines its configuration schema and compatibility rules.
+   */
+  google.protobuf.Any provider_metadata = 3;
+}
+
+/* Table-level clustering intent and declarations still referenced by fragments.
+ * No clustering algorithm is prescribed by the table format.
+ */
+message ClusteringState {
+  /* Optional reference to the declaration selected for new clustering work.
+   * Absence disables new work without invalidating existing fragment references.
+   */
+  ClusteringReference current = 1;
+  /* Includes the current declaration and every declaration referenced by a live
+   * fragment. Unreferenced declarations may be retained or removed.
+   */
+  repeated ClusteringDeclaration declarations = 2;
+}
+
 // Manifest is a global section shared between all the files.
 message Manifest {
   // All fields of the dataset, including the nested fields.
@@ -146,6 +187,8 @@ message Manifest {
    *
    * The flag identities are the same as for reader_feature_flags, but the values of
    * reader_feature_flags and writer_feature_flags are not required to be identical.
+   * Bit 1 << 12 protects clustering declarations and fragment layout references.
+   * It is writer-only: readers do not need to interpret clustering metadata.
    */
   uint64 writer_feature_flags = 10;
 
@@ -243,6 +286,11 @@ message Manifest {
 
   // The branch of the dataset. None means main branch.
   optional string branch = 20;
+
+  /* Optional provider-neutral clustering metadata. Absence means no declaration
+   * or fragment clustering references. Requires writer feature flag 1 << 12.
+   */
+  ClusteringState clustering = 22;
 } // Manifest
 
 // external dataset base path
@@ -457,6 +505,12 @@ message DataFragment {
    * `deletion_file.num_deleted_rows` from this value.
    */
   uint64 physical_rows = 4;
+
+  /* Optional reference to the declaration used to organize this fragment.
+   * Absence makes no clustering claim. A reference must resolve in the same
+   * manifest's clustering declarations; a generic rewrite must not inherit it.
+   */
+  ClusteringReference clustering = 15;
 }
 
 message DataFile {

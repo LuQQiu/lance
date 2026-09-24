@@ -1071,6 +1071,7 @@ impl From<&Manifest> for pb::Manifest {
                 .collect(),
             version: m.version,
             branch: m.branch.clone(),
+            clustering: None,
             writer_version: m
                 .writer_version
                 .as_ref()
@@ -1185,6 +1186,56 @@ mod tests {
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_core::datatypes::Field;
     use roaring::RoaringBitmap;
+
+    #[test]
+    fn clustering_proto_retains_provider_versions_and_unknown_payloads() {
+        let references = [
+            pb::ClusteringReference {
+                provider: "org.example.first".into(),
+                version: 7,
+            },
+            pb::ClusteringReference {
+                provider: "org.example.first".into(),
+                version: 8,
+            },
+            pb::ClusteringReference {
+                provider: "org.example.second".into(),
+                version: 7,
+            },
+        ];
+        let unknown_configuration = prost_types::Any {
+            type_url: "type.example.org/example.ClusteringConfig".into(),
+            value: vec![0x08, 0x07, 0xa0, 0x06, 0x01],
+        };
+        // Test the wire contract only; runtime state handling is not enabled yet.
+        let manifest = pb::Manifest {
+            writer_feature_flags: crate::feature_flags::FLAG_CLUSTERING_METADATA,
+            clustering: Some(pb::ClusteringState {
+                current: Some(references[1].clone()),
+                declarations: references
+                    .iter()
+                    .map(|reference| pb::ClusteringDeclaration {
+                        reference: Some(reference.clone()),
+                        columns: vec![0],
+                        provider_metadata: Some(unknown_configuration.clone()),
+                    })
+                    .collect(),
+            }),
+            fragments: [references[0].clone(), references[2].clone()]
+                .into_iter()
+                .enumerate()
+                .map(|(id, reference)| pb::DataFragment {
+                    id: id as u64,
+                    clustering: Some(reference),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let decoded = pb::Manifest::decode(manifest.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded, manifest);
+        assert_eq!(decoded.reader_feature_flags, 0);
+    }
 
     /// A shallow clone points every local file at the parent through `base_id`.
     /// An overlay's data file lives in the parent too, so it needs the same
