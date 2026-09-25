@@ -60,9 +60,14 @@ not prove sort order, disjoint ranges, size, or query coverage. Fragments carry
 no opaque payload or arbitrary key-value map.
 
 Only a writer that understands the relevant configuration may assign its marker.
-Providers may define generations, groups, and other layout concepts without
-standardizing them in the table format. A marker may remain when the current
-table configuration is absent or different.
+The layout `version` already identifies a configuration generation; there is no
+separate generation field. Rewrite groups, buckets, and their fragment membership
+are provider-specific concepts, not public fragment fields. Providers that need
+them manage their records in table-level `provider_metadata`; no common keys or
+value schemas are prescribed. These records must be revalidated against live
+fragments and their markers before use, since ordinary writers do not maintain
+opaque provider bookkeeping. A marker may remain when the current table
+configuration is absent or different.
 
 By default, clustering maintenance selects unstamped fragments or fragments
 belonging to the same provider, or an implementation it explicitly supersedes.
