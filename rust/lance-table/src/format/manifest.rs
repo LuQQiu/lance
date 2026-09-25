@@ -1188,7 +1188,7 @@ mod tests {
     use roaring::RoaringBitmap;
 
     #[test]
-    fn clustering_proto_retains_provider_versions_and_unknown_payloads() {
+    fn clustering_proto_retains_provider_versions_and_unknown_metadata() {
         let markers = [
             pb::FragmentClustering {
                 provider: "org.example.first".into(),
@@ -1199,10 +1199,12 @@ mod tests {
                 version: 7,
             },
         ];
-        let unknown_configuration = prost_types::Any {
-            type_url: "type.example.org/example.ClusteringConfig".into(),
-            value: vec![0x08, 0x07, 0xa0, 0x06, 0x01],
-        };
+        let unknown_configuration = HashMap::from([
+            ("schema_version".into(), "1".into()),
+            ("boundaries".into(), "[0, 100, 200]".into()),
+            ("unknown_option".into(), "  opaque value: 東京  ".into()),
+            ("empty_option".into(), String::new()),
+        ]);
         // Test the wire contract only; runtime state handling is not enabled yet.
         let manifest = pb::Manifest {
             writer_feature_flags: crate::feature_flags::FLAG_CLUSTERING_METADATA,
@@ -1210,7 +1212,7 @@ mod tests {
                 columns: vec![0],
                 provider: "org.example.first".into(),
                 version: 8,
-                provider_metadata: Some(unknown_configuration),
+                provider_metadata: unknown_configuration,
             }),
             fragments: markers
                 .into_iter()
@@ -1226,6 +1228,17 @@ mod tests {
         let decoded = pb::Manifest::decode(manifest.encode_to_vec().as_slice()).unwrap();
         assert_eq!(decoded, manifest);
         assert_eq!(decoded.reader_feature_flags, 0);
+        let mut empty_metadata = manifest.clone();
+        empty_metadata
+            .clustering
+            .as_mut()
+            .unwrap()
+            .provider_metadata
+            .clear();
+        assert_eq!(
+            pb::Manifest::decode(empty_metadata.encode_to_vec().as_slice()).unwrap(),
+            empty_metadata
+        );
         // Disabling new clustering work does not erase historical fragment markers.
         let disabled = pb::Manifest {
             clustering: None,

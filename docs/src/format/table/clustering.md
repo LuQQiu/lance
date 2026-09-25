@@ -19,9 +19,10 @@ invalidation rules are implemented.
   are recommended to avoid collisions.
 - `version`: a non-zero `uint64` identifying a provider-defined layout or
   configuration, not a dataset version or software release.
-- `provider_metadata`: optional `google.protobuf.Any` configuration. Absence
-  means no configuration; a present value must have a non-empty type URL. The
-  provider defines its schema and compatibility, including payload versioning.
+- `provider_metadata`: a `map<string, string>`, like `Manifest.config`. An empty
+  map means no provider-specific configuration. The provider defines the keys,
+  value encoding, schema versioning, and compatibility. Structured values may be
+  serialized as JSON strings; Lance does not interpret or normalize them.
 
 Absence of table configuration disables new clustering work but does not clear
 existing fragment markers. Appends need not be clustered even when a
@@ -39,10 +40,10 @@ current provider or version does not relabel or rewrite old fragments. A marker
 may name an older version or another provider. If its configuration is unavailable
 or unsupported, it must not be interpreted using the current configuration.
 
-Provider metadata is inline. Paths in `Any` acquire no file-retention or clone
-semantics; external artifacts require a separate lifecycle contract. Providers
-must tolerate ordinary writers replacing fragments or clearing markers without
-updating opaque bookkeeping. Such bookkeeping is not authoritative table state.
+Provider metadata is inline. Paths in metadata values acquire no file-retention
+or clone semantics; external artifacts require a separate lifecycle contract.
+Providers must tolerate ordinary writers replacing fragments or clearing markers
+without updating opaque bookkeeping. Such bookkeeping is not authoritative table state.
 
 When `Manifest.clustering` is present, its `columns` are the source of clustering
 keys. Writers must clear `Field.unenforced_clustering_key_position` and the older
@@ -75,9 +76,9 @@ provider must not by itself prohibit append, update, delete, or compaction.
 ## Writer Requirements
 
 Writers supporting the common feature preserve unknown provider names, versions,
-type URLs, and payload bytes on unrelated commits. Not understanding a provider
-does not authorize changing its configuration. It also does not require stopping
-ordinary writes: the generic rules below suffice.
+and all metadata keys and string values on unrelated commits. Not understanding
+a provider does not authorize changing its configuration. It also does not require
+stopping ordinary writes: the generic rules below suffice.
 
 - Append preserves existing metadata. New fragments are unstamped unless a
   provider verifies their layout.
@@ -105,7 +106,9 @@ its opaque payload. Explicit configuration changes and schema invalidation above
 are distinct from unrelated commits that must preserve the configuration.
 
 Each commit must publish valid configuration and markers atomically and revalidate
-them against concurrent changes. A rewrite may publish unstamped output and mark
+them against concurrent changes. The provider, version, columns, and metadata
+form one configuration; the map shape does not permit generic per-key merging of
+concurrent configuration changes. A rewrite may publish unstamped output and mark
 it in a later commit only after validating that the output has not changed.
 Restore restores the selected snapshot's configuration and markers together.
 Clone or import must preserve layout identity to retain markers; conflicting
@@ -141,7 +144,7 @@ Adding a provider, changing layout versions, or evolving a provider's payload
 does not allocate another Lance feature bit. Providers do not own global reader
 or writer bits. Layout versions identify configurations, not an ordered
 compatibility threshold; interpretation belongs to the provider. Payload schema
-compatibility can be expressed in the `Any` type or payload.
+compatibility can be expressed through provider-defined metadata keys and values.
 
 A provider cannot use opaque metadata to impose extra correctness requirements
 on ordinary readers or writers. Behavior that cannot safely be ignored,

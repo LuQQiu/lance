@@ -52,11 +52,12 @@ message Clustering {
   string provider = 2;
   // Non-zero, provider-assigned layout/configuration version, not a software version.
   uint64 version = 3;
-  /* Optional provider-defined configuration. Absence means no configuration.
-   * Unknown type URLs and payload bytes must be preserved without interpretation.
-   * The provider defines its configuration schema and compatibility rules.
+  /* Provider-defined configuration, using the same string key-value shape as
+   * Manifest.config. An empty map means no provider-specific configuration.
+   * Unknown keys and values must be preserved without interpretation.
+   * The provider defines value encoding, schema versioning, and compatibility.
    */
-  google.protobuf.Any provider_metadata = 4;
+  map<string, string> provider_metadata = 4;
 }
 
 // Manifest is a global section shared between all the files.
