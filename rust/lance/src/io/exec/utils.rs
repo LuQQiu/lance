@@ -72,6 +72,13 @@ pub enum PreFilterSource {
     FilteredRowIds(Arc<dyn ExecutionPlan>),
     /// The prefilter input is a selection vector from an index query
     ScalarIndexQuery(Arc<dyn ExecutionPlan>),
+    /// The prefilter is an already-materialized allow mask, passed in memory.
+    ///
+    /// Used when an upstream operator on the same node already holds the row
+    /// mask (e.g. a distributed prefilter assembled locally), so it can hand
+    /// the `RowAddrMask` directly to the vector search instead of serializing
+    /// it into a batch that the search would immediately decode again.
+    InMemoryMask(Arc<RowAddrMask>),
     /// There is no prefilter
     None,
 }
@@ -230,14 +237,14 @@ impl PreFilterSource {
                     })
                     .collect()
             }
-            Self::None => vec![self.clone(); field_count],
+            Self::None | Self::InMemoryMask(_) => vec![self.clone(); field_count],
         }
     }
 
     pub(crate) fn execution_plan(&self) -> Option<&Arc<dyn ExecutionPlan>> {
         match self {
             Self::FilteredRowIds(source) | Self::ScalarIndexQuery(source) => Some(source),
-            Self::None => None,
+            Self::None | Self::InMemoryMask(_) => None,
         }
     }
 
@@ -248,7 +255,7 @@ impl PreFilterSource {
         match self {
             Self::FilteredRowIds(_) => Ok(Self::FilteredRowIds(source)),
             Self::ScalarIndexQuery(_) => Ok(Self::ScalarIndexQuery(source)),
-            Self::None => Err(DataFusionError::Internal(
+            Self::None | Self::InMemoryMask(_) => Err(DataFusionError::Internal(
                 "prefilter source received an unexpected execution-plan child".to_string(),
             )),
         }
@@ -412,6 +419,9 @@ pub(crate) fn build_prefilter(
                 Some(Box::new(SelectionVectorToPrefilter(stream)) as Box<dyn FilterLoader>)
             }
         }
+        PreFilterSource::InMemoryMask(mask) => {
+            Some(Box::new(InMemoryMaskPrefilter(mask.clone())) as Box<dyn FilterLoader>)
+        }
         PreFilterSource::None => None,
     };
     // Combine the external row-address mask (logical AND) with whatever the
@@ -549,6 +559,17 @@ impl FilterLoader for SelectionVectorToPrefilter {
         // that ScalarIndexExec may emit.
         let (result, _) = IndexExprResult::deserialize(&batch)?;
         Ok(result.upper)
+    }
+}
+
+/// Hands an already-materialized allow mask to the prefilter without any
+/// batch round-trip. Backs [`PreFilterSource::InMemoryMask`].
+pub(crate) struct InMemoryMaskPrefilter(pub Arc<RowAddrMask>);
+
+#[async_trait]
+impl FilterLoader for InMemoryMaskPrefilter {
+    async fn load(self: Box<Self>) -> Result<RowAddrMask> {
+        Ok(self.0.as_ref().clone())
     }
 }
 

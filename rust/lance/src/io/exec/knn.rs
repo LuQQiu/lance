@@ -71,8 +71,9 @@ use lance_arrow::*;
 
 use super::row_addr_mask::MaskAndLoader;
 use super::utils::{
-    FilteredRowIdsToPrefilter, IndexMetrics, InstrumentedRecordBatchStreamAdapter, PreFilterMasks,
-    PreFilterSource, SelectionVectorToPrefilter,
+    FilteredRowIdsToPrefilter, InMemoryMaskPrefilter, IndexMetrics,
+    InstrumentedRecordBatchStreamAdapter, PreFilterMasks, PreFilterSource,
+    SelectionVectorToPrefilter,
 };
 
 mod adaptive_probe;
@@ -1249,6 +1250,9 @@ fn build_dataset_prefilter(
             let stream = src_node.execute(partition, context)?;
             Some(Box::new(SelectionVectorToPrefilter(stream)) as Box<dyn FilterLoader>)
         }
+        PreFilterSource::InMemoryMask(mask) => {
+            Some(Box::new(InMemoryMaskPrefilter(mask.clone())) as Box<dyn FilterLoader>)
+        }
         PreFilterSource::None => None,
     };
     // AND the external row-address mask into whatever the filter produced.
@@ -2205,7 +2209,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         match &self.prefilter_source {
-            PreFilterSource::None => vec![&self.input],
+            PreFilterSource::None | PreFilterSource::InMemoryMask(_) => vec![&self.input],
             PreFilterSource::FilteredRowIds(src) => vec![&self.input, &src],
             PreFilterSource::ScalarIndexQuery(src) => vec![&self.input, &src],
         }
@@ -2233,6 +2237,13 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                     }
                     PreFilterSource::ScalarIndexQuery(_) => {
                         PreFilterSource::ScalarIndexQuery(prefilter)
+                    }
+                    // InMemoryMask carries no plan child, so it never yields a
+                    // second child here.
+                    PreFilterSource::InMemoryMask(_) => {
+                        return Err(DataFusionError::Internal(
+                            "InMemoryMask prefilter has no execution-plan child".to_string(),
+                        ));
                     }
                 }
             } else {
@@ -2641,7 +2652,7 @@ impl ExecutionPlan for ANNIvfBatchExec {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         match &self.prefilter_source {
-            PreFilterSource::None => vec![],
+            PreFilterSource::None | PreFilterSource::InMemoryMask(_) => vec![],
             PreFilterSource::FilteredRowIds(src) => vec![src],
             PreFilterSource::ScalarIndexQuery(src) => vec![src],
         }
@@ -2660,6 +2671,7 @@ impl ExecutionPlan for ANNIvfBatchExec {
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let prefilter_source = match (&self.prefilter_source, children.len()) {
             (PreFilterSource::None, 0) => PreFilterSource::None,
+            (PreFilterSource::InMemoryMask(mask), 0) => PreFilterSource::InMemoryMask(mask.clone()),
             (PreFilterSource::FilteredRowIds(_), 1) => {
                 PreFilterSource::FilteredRowIds(children.pop().expect("length checked"))
             }

@@ -225,6 +225,13 @@ pub async fn ann_ivf_sub_index_exec_to_proto(
         PreFilterSource::ScalarIndexQuery(_) => {
             pb::ann_ivf_sub_index_exec_proto::PreFilterType::ScalarIndexQuery as i32
         }
+        // InMemoryMask is a node-local hand-off; it must be assembled into the
+        // plan on the executing node, never serialized across the wire.
+        PreFilterSource::InMemoryMask(_) => {
+            return Err(Error::internal(
+                "InMemoryMask prefilter cannot be serialized to proto".to_string(),
+            ));
+        }
     };
 
     Ok(pb::AnnIvfSubIndexExecProto {
