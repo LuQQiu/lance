@@ -461,17 +461,9 @@ fn fragments_from_proto(fragment_ids: &[u64], dataset: &Arc<Dataset>) -> Result<
     fragment_ids
         .iter()
         .map(|id| {
-            dataset
-                .manifest
-                .fragments
-                .iter()
-                .find(|f| f.id == *id)
-                .cloned()
-                .ok_or_else(|| {
-                    Error::invalid_input_source(
-                        format!("Fragment {} not found in dataset", id).into(),
-                    )
-                })
+            dataset.find_fragment(*id).cloned().ok_or_else(|| {
+                Error::invalid_input_source(format!("Fragment {} not found in dataset", id).into())
+            })
         })
         .collect()
 }
@@ -747,6 +739,45 @@ mod tests {
             back.fragments.as_ref().unwrap()[0].id,
             options.fragments.as_ref().unwrap()[0].id
         );
+    }
+
+    #[tokio::test]
+    async fn test_fragment_ids_resolve_in_any_order_and_reject_unknown() {
+        let dataset = gen_batch()
+            .col("x", array::step::<UInt32Type>())
+            .into_ram_dataset(FragmentCount::from(5), FragmentRowCount::from(4))
+            .await
+            .unwrap();
+        let dataset = Arc::new(dataset);
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+        let filter_schema = Arc::new(prune_schema_for_substrait(&dataset.schema().into()));
+
+        // A subset in an order other than the manifest's, including the last
+        // fragment, survives the round trip with the ids in the sent order.
+        let frags = dataset.get_fragments();
+        let subset = vec![
+            frags[3].metadata().clone(),
+            frags[0].metadata().clone(),
+            frags[4].metadata().clone(),
+        ];
+        let options =
+            FilteredReadOptions::basic_full_read(&dataset).with_fragments(Arc::new(subset));
+        let proto = fr_options_to_proto(&options, &filter_schema, &state).unwrap();
+        assert_eq!(proto.fragment_ids, vec![3, 0, 4]);
+        let back = fr_options_from_proto(proto, &dataset, &state)
+            .await
+            .unwrap();
+        let back_ids: Vec<u64> = back.fragments.unwrap().iter().map(|f| f.id).collect();
+        assert_eq!(back_ids, vec![3, 0, 4]);
+
+        // An id the dataset does not have is an error, not a silently empty read.
+        let mut proto = fr_options_to_proto(&options, &filter_schema, &state).unwrap();
+        proto.fragment_ids = vec![0, 42];
+        let err = fr_options_from_proto(proto, &dataset, &state)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Fragment 42 not found"), "{err}");
     }
 
     #[tokio::test]
