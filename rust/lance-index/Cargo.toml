@@ -84,6 +84,7 @@ approx.workspace = true
 criterion.workspace = true
 env_logger.workspace = true
 geo-traits.workspace = true
+lance-arrow-scalar.workspace = true
 lance-datagen.workspace = true
 lance-datafusion = { workspace = true, features = ["datagen"] }
 lance-testing.workspace = true

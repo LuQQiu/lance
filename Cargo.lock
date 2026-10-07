@@ -4892,6 +4892,7 @@ dependencies = [
  "jieba-rs",
  "jsonb",
  "lance-arrow",
+ "lance-arrow-scalar",
  "lance-arrow-stats",
  "lance-bitpacking",
  "lance-core",

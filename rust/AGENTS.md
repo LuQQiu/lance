@@ -69,6 +69,13 @@ Also see [root AGENTS.md](../AGENTS.md) for cross-language standards.
 - Use plain `"memory://"` URIs in tests — no atomic counters or unique suffixes needed.
 - Assert on both error variant (`assert!(matches!(error, ErrorType::Variant { .. }))`) and message content — don't just check `is_err()`.
 
+## Arrow and DataFusion upgrades
+
+- Lance follows Arrow Rust's ordering (IEEE `totalOrder` for floats, byte-wise for strings, nulls first ascending for index training) rather than defining its own. `rust/lance-index/tests/arrow_ordering_compat.rs` pins that order with hand-written fixtures across every production comparison path (sort kernels, `make_comparator`, `ArrowNativeTypeOp::compare`, the `arrow_row` encoding behind `ArrowScalar`, `StatisticsAccumulator` extrema, `ScalarValue`, `SortExec` and `SortPreservingMergeExec`).
+- When bumping `arrow*` or `datafusion*`, read the upstream release notes for sorting, comparison and row-encoding changes, run `cargo test -p lance-index --test arrow_ordering_compat`, and report any difference and the Lance paths it affects in the PR.
+- A failure there is a finding, not a fixture to refresh. Before changing an expectation, record in the PR whether it is an upstream contract change, an upstream bug fix, or a change in how Lance calls the API; which Lance behaviours depend on it; and whether persisted btree pages, zone map or bloom filter extrema need compatibility handling. Add regression cases for any new edge case.
+- Passing fixtures show the covered cases are unchanged, not that every input orders identically.
+
 ## Documentation
 
 - Add doc comments to public API elements that convey semantic meaning, valid values, and effects — don't restate type signatures.
