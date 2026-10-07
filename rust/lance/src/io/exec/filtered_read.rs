@@ -2448,15 +2448,31 @@ impl FilteredReadExec {
             let ranges = match selection {
                 RowAddrSelection::Partial(bitmap) => bitmap_to_ranges(bitmap),
                 RowAddrSelection::Full => {
-                    let fragment = self
-                        .dataset
-                        .get_fragment(*fragment_id as usize)
-                        .ok_or_else(|| {
-                            Error::invalid_input_source(
-                                format!("Fragment {} not found", fragment_id).into(),
-                            )
-                        })?;
-                    let num_rows = fragment.physical_rows().await?;
+                    let metadata =
+                        self.dataset
+                            .find_fragment(*fragment_id as u64)
+                            .ok_or_else(|| {
+                                Error::invalid_input_source(
+                                    format!("Fragment {} not found", fragment_id).into(),
+                                )
+                            })?;
+                    // The manifest's row count, trusted on the same terms as
+                    // `FileFragment::physical_rows`; a plan over tens of
+                    // thousands of whole fragments must not build a
+                    // `FileFragment` per entry to read it.
+                    let num_rows = match metadata.physical_rows {
+                        Some(num_rows)
+                            if self.dataset.manifest.writer_version.is_some()
+                                && !metadata.files.is_empty() =>
+                        {
+                            num_rows
+                        }
+                        _ => {
+                            FileFragment::new(self.dataset.clone(), metadata.clone())
+                                .physical_rows()
+                                .await?
+                        }
+                    };
                     vec![0..num_rows as u64]
                 }
             };
