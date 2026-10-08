@@ -85,4 +85,14 @@ pub const DATASET_DELETING_EVENT: &str = "deleting";
 pub const DATASET_COMPACTING_EVENT: &str = "compacting";
 pub const DATASET_CLEANING_EVENT: &str = "cleaning";
 pub const DATASET_LOADING_EVENT: &str = "loading";
+/// Debug event: a scalar index merge rebuilt its new segment from write
+/// seeds instead of scanning the column.
+pub const INDEX_SEEDS_HARVESTED_EVENT: &str = "index_seeds_harvested";
+/// Debug event: a scalar index that expected write seeds scanned the column
+/// instead; `reason` is one of the `SEED_FALLBACK_*` values below.
+pub const INDEX_SEEDS_FALLBACK_EVENT: &str = "index_seeds_fallback_scan";
+/// At least one unindexed fragment had no readable seed buffer.
+pub const SEED_FALLBACK_SEED_MISSING: &str = "seed_missing";
+/// Seeds were found but the plugin rejected them as incompatible.
+pub const SEED_FALLBACK_SEED_REJECTED: &str = "seed_rejected";
 pub const TRACE_OBJECT_STORE_THROTTLE: &str = "lance::object_store::throttle";
