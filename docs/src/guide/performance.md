@@ -406,6 +406,71 @@ When a bitmap index is not fully loaded into the index cache, the search time wi
 need to be loaded from disk and the speed of storage. The parts_loaded metric in the execution metrics can tell you how many
 bitmaps were loaded from disk to satisfy a query.
 
+### Zone Map Index
+
+#### Write Seeds
+
+A zone map index can ask every later append to collect its statistics while the data is written. When the index was
+created with `use_seeds` enabled, each append observes the indexed column and stores one row per zone
+(`min`, `max`, `null_count`, `nan_count`, `zone_length`) plus a bitmap of the null positions in the data file footer, under
+the schema metadata key `lance.seed.<column>`. An incremental index update (`optimize_indices`) then reads those footer
+buffers instead of scanning the column. Seeds are only produced for columns that already have a zone map index, only when
+`use_seeds` is enabled for that index, and only on appends; the index creation itself still scans the data.
+
+`use_seeds` defaults to on for variable-width types (strings, binary), decimals, `FixedSizeBinary` wider than 8 bytes and
+nested types, and to off for fixed-width types of 8 bytes or less. The numbers below come from the
+`zone_map_seeds` benchmark in `rust/lance/benches` (Lance 14.0.0-beta.4, `release-with-debug` profile, AMD EPYC 9V65,
+local NVMe RAID 0, 8192 rows per zone, 1M rows per data file, median of 5 runs, every run in a fresh process with
+byte-identical input for both modes). "Append" is the wall time of appending 4M rows (1M rows for values of 2 KiB and
+more) to a table whose column has a zone map index; "update" is `optimize_indices` on that table from a fresh session.
+They are the cost of the seeds, not the resident size of the zone map index itself.
+
+| Column | Append with seeds | Seed writer per row | Seed size per 1M rows | Update without → with seeds | Bounds in seed |
+|---|---|---|---|---|---|
+| Int32, Int64, Float64, Date32, Timestamp | +17% to +22% (about +2.4 ms per 1M rows) | 2.0–2.5 ns | 5–6 KiB | 34–42 ms → 4–5 ms | yes |
+| Boolean | +135% (16 ms → 38 ms) | 5.5 ns | 4 KiB | 42 ms → 5 ms | yes |
+| Decimal128(38, 10) | +11% | 2.1 ns | 8 KiB | 54 ms → 4 ms | yes |
+| FixedSizeBinary(16) / (4096) | +4% / within noise | 0.1–0.2 ns | 8 KiB / 988 KiB | 48 ms → 4 ms / 509 ms → 5 ms | **no** |
+| Utf8, 32-character hex ids | +5% | 7 ns | 12 KiB | 152 ms → 5 ms | yes |
+| Utf8, 100 distinct words / `user_<n>` | +17% / +8% | 4.5–5 ns | 6–8 KiB | 78 ms → 5 ms / 90 ms → 5 ms | yes |
+| Utf8, ~256 B / ~2 KiB / ~8 KiB text | +1.5% / +0.3% / +0.1% | 36–43 ns | 53 KiB / 403 KiB / 1.6 MiB | 360 → 9 ms / 241 → 11 ms / 672 → 15 ms | yes |
+| Utf8 ~2 KiB, globally sorted | +0.4% | 29 ns | 403 KiB | 236 ms → 10 ms | yes |
+| Binary 64–256 B | +7.5% | 5.5 ns | 43 KiB | 239 ms → 6 ms | yes |
+| LargeBinary 20 KiB (random or sorted) | within noise | 11–14 ns | 4.8 MiB | 6.5 s → 16 ms | yes |
+| FixedSizeList<Float32, 768> | +206% (1.5 s → 4.7 s per 1M rows) | 3.1 µs | 765 KiB | 3.6 s → 5 ms | **no** |
+| List<Int32> | +2,600% (0.21 s → 5.7 s per 4M rows) | 1.3 µs | 5 KiB | 5.5 s → 6 ms | **no** |
+| Struct<Int32, Utf8> | +1% | 0.3 ns | 6 KiB | 104 ms → 6 ms | **no** |
+
+Observations from that matrix:
+
+- For fixed-width types the seed writer costs about 2 ns per row. That is a large fraction of a local NVMe append of
+  such narrow columns, which is why it shows up as +17% to +22%, but it is roughly +2.4 ms per million rows in absolute
+  terms. The update it saves scans the whole column (16–32 MB per 4M rows here), and the seeded update reads about 40 KB.
+- Wide values are cheap to seed relative to the write: for 2 KiB and 8 KiB strings and 20 KiB binary values the append
+  cost is within run-to-run noise. Pre-sorted input, which refreshes the running maximum on every batch, is no more
+  expensive than random input. Seed size is two whole values per zone, about 0.06% of the data for strings and 0.025% for
+  20 KiB binary values with 8192-row zones.
+- Nested types never carry `min`/`max` in a zone map; only the null statistics are kept. Seeding them is nevertheless the
+  most expensive case measured, because statistics are computed per list element before being discarded: 3 µs per row
+  for 768-float vectors and 1.3 µs per row for small integer lists, which tripled and multiplied by 27 the append time
+  respectively. `FixedSizeBinary` columns also get no bounds, since no min/max is computed for that type; their seeds hold
+  null counts only.
+- Nulls are the main driver of seed size and the second driver of cost. The seed stores every null position in a bitmap
+  and encodes it as hex, so for an `Int64` column 10% random nulls raise the append cost from +18% to +44% and the seed
+  from 6 KiB to 499 KiB per million rows, 50% random nulls give +48% and 518 KiB, and an all-null column gives +142% with a
+  seed as large as the data. Clustered nulls (one contiguous half of each file) cost about half of scattered nulls:
+  +26% and 262 KiB. For 2 KiB strings the same null ratios stay within +0.4% because the write itself is so much larger.
+- Smaller zones scale the seed linearly: 1024-row zones make the 32-character id seed 86 KiB per million rows (+7% append)
+  and the 2 KiB text seed 3.1 MiB (0.5% of the data); 65536-row zones shrink them to 3 KiB and 54 KiB.
+- Per-column costs add up on wide tables. With a zone map on every column of a 16-column table of mixed integer, float,
+  decimal, id and short text columns the append is +3.3% (+2.7% CPU); with 64 columns it is +14% wall for +4.5% CPU,
+  because the seed writers run on the writer's thread between batches. The seeded update of the 64 indexes takes 0.46 s
+  instead of 4.7 s.
+- Peak resident memory during the append did not differ measurably between seeds on and off: the seed writer keeps one
+  zone of statistics plus the completed zones of the current file, under 20 MiB even for 20 KiB values.
+
+The default enablement rule is under review based on these measurements and is not changed by them.
+
 ### Vector Index
 
 Vector indexes (IVF_PQ, IVF_HNSW_SQ, etc.) are built in multiple phases, each with different memory requirements.

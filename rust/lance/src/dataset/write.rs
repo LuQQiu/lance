@@ -5829,4 +5829,275 @@ mod tests {
             "a covered index must still produce a seed writer"
         );
     }
+
+    /// Counts the seed harvest and fallback events emitted while merging a
+    /// scalar index.
+    #[derive(Clone, Default)]
+    struct SeedEventCounter {
+        harvested: Arc<std::sync::atomic::AtomicUsize>,
+        fallback_reasons: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for SeedEventCounter {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            use lance_core::utils::tracing::{
+                INDEX_SEEDS_FALLBACK_EVENT, INDEX_SEEDS_HARVESTED_EVENT, TRACE_DATASET_EVENTS,
+            };
+
+            #[derive(Default)]
+            struct Fields {
+                event: Option<String>,
+                reason: Option<String>,
+            }
+            impl tracing::field::Visit for Fields {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    let text = format!("{value:?}").trim_matches('"').to_string();
+                    match field.name() {
+                        "event" => self.event = Some(text),
+                        "reason" => self.reason = Some(text),
+                        _ => {}
+                    }
+                }
+            }
+
+            if event.metadata().target() != TRACE_DATASET_EVENTS {
+                return;
+            }
+            let mut fields = Fields::default();
+            event.record(&mut fields);
+            match fields.event.as_deref() {
+                Some(name) if name == INDEX_SEEDS_HARVESTED_EVENT => {
+                    self.harvested
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                Some(name) if name == INDEX_SEEDS_FALLBACK_EVENT => {
+                    self.fallback_reasons
+                        .lock()
+                        .unwrap()
+                        .push(fields.reason.unwrap_or_default());
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Write `base`, index it with `use_seeds`, append `appended`, then
+    /// optimize while counting seed events. Returns the zone map's zones,
+    /// sorted by fragment and zone start, and the event counter.
+    async fn seeded_zone_map_after_optimize(
+        uri: &str,
+        base: arrow_array::Float64Array,
+        appended: arrow_array::Float64Array,
+        use_seeds: bool,
+    ) -> (RecordBatch, SeedEventCounter) {
+        use crate::dataset::index::LanceIndexStoreExt;
+        use crate::index::DatasetIndexExt;
+        use lance_index::scalar::IndexStore;
+        use lance_index::scalar::lance_format::LanceIndexStore;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "val",
+            DataType::Float64,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(base)]).unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema.clone()),
+            uri,
+            None,
+        )
+        .await
+        .unwrap();
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap)
+            .with_params(&serde_json::json!({"rows_per_zone": 4, "use_seeds": use_seeds}));
+        dataset
+            .create_index(&["val"], IndexType::ZoneMap, None, &params, false)
+            .await
+            .unwrap();
+
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(appended)]).unwrap();
+        Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            uri,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let counter = SeedEventCounter::default();
+        let subscriber = tracing_subscriber::registry().with(counter.clone());
+        // tracing caches each callsite's interest when it first fires. While
+        // exactly one dispatcher is registered that cache is built from the
+        // firing thread's default, so a merge running in another test would
+        // pin the seed callsites to "never" before this thread-local
+        // subscriber ever sees them. A second live dispatcher makes the cache
+        // consult every registered dispatcher instead.
+        let _second_dispatcher = tracing::Dispatch::new(tracing_subscriber::registry());
+        let mut dataset = Dataset::open(uri).await.unwrap();
+        {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            dataset.optimize_indices(&Default::default()).await.unwrap();
+        }
+
+        let dataset = Dataset::open(uri).await.unwrap();
+        let indices = dataset.load_indices().await.unwrap();
+        let index = indices.iter().find(|i| i.name == "val_idx").unwrap();
+        let store = LanceIndexStore::from_dataset_for_existing(&dataset, index)
+            .await
+            .unwrap();
+        let reader = store.open_index_file("zonemap.lance").await.unwrap();
+        let zones = reader.read_range(0..reader.num_rows(), None).await.unwrap();
+        let sort_columns = vec![
+            arrow_ord::sort::SortColumn {
+                values: zones.column_by_name("fragment_id").unwrap().clone(),
+                options: None,
+            },
+            arrow_ord::sort::SortColumn {
+                values: zones.column_by_name("zone_start").unwrap().clone(),
+                options: None,
+            },
+        ];
+        let order = arrow_ord::sort::lexsort_to_indices(&sort_columns, None).unwrap();
+        (
+            arrow_select::take::take_record_batch(&zones, &order).unwrap(),
+            counter,
+        )
+    }
+
+    /// A seed-built zone map must carry the same statistics as a scan-built
+    /// one, including the partial final zone, an all-null zone, NaN handling
+    /// and signed zeros, and the merge must report which path it took.
+    #[tokio::test]
+    async fn test_zone_map_seed_harvest_matches_scan_and_is_observable() {
+        use arrow_array::cast::AsArray;
+        use arrow_array::types::{Float64Type, UInt32Type};
+        use arrow_array::{Array, Float64Array};
+
+        let base = Float64Array::from(vec![Some(1.0), Some(-2.0), None, Some(3.5), Some(0.25)]);
+        // Zones of 4 rows: [NaN run], [all null], [signed zeros], partial [one value].
+        let appended = Float64Array::from(vec![
+            Some(1.0),
+            Some(f64::NAN),
+            Some(-7.0),
+            Some(2.0),
+            None,
+            None,
+            None,
+            None,
+            Some(-0.0),
+            Some(0.0),
+            Some(-0.0),
+            Some(5.0),
+            Some(-1.5),
+        ]);
+
+        let seeded_dir = lance_core::utils::tempfile::TempStrDir::default();
+        let (from_seeds, seeded_events) = seeded_zone_map_after_optimize(
+            seeded_dir.as_str(),
+            base.clone(),
+            appended.clone(),
+            true,
+        )
+        .await;
+        assert_eq!(
+            seeded_events
+                .harvested
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "seeds on: expected one harvest, fallback reasons {:?}",
+            seeded_events.fallback_reasons.lock().unwrap()
+        );
+        assert!(seeded_events.fallback_reasons.lock().unwrap().is_empty());
+
+        let scanned_dir = lance_core::utils::tempfile::TempStrDir::default();
+        let (from_scan, scanned_events) =
+            seeded_zone_map_after_optimize(scanned_dir.as_str(), base, appended, false).await;
+        assert_eq!(
+            scanned_events
+                .harvested
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            *scanned_events.fallback_reasons.lock().unwrap(),
+            vec![lance_core::utils::tracing::SEED_FALLBACK_PLUGIN_DECLINED.to_string()]
+        );
+
+        assert_eq!(from_seeds.num_rows(), from_scan.num_rows());
+        // Two base zones (4 + 1 rows) and four appended zones (4 + 4 + 4 + 1).
+        assert_eq!(from_seeds.num_rows(), 6);
+        for name in [
+            "fragment_id",
+            "zone_start",
+            "zone_length",
+            "null_count",
+            "nan_count",
+        ] {
+            assert_eq!(
+                from_seeds.column_by_name(name).unwrap(),
+                from_scan.column_by_name(name).unwrap(),
+                "{name} differs"
+            );
+        }
+        for name in ["min", "max"] {
+            let seeded = from_seeds
+                .column_by_name(name)
+                .unwrap()
+                .as_primitive::<Float64Type>();
+            let scanned = from_scan
+                .column_by_name(name)
+                .unwrap()
+                .as_primitive::<Float64Type>();
+            for zone in 0..seeded.len() {
+                assert_eq!(
+                    seeded.is_null(zone),
+                    scanned.is_null(zone),
+                    "{name} validity, zone {zone}"
+                );
+                if !seeded.is_null(zone) {
+                    assert_eq!(
+                        seeded.value(zone).to_bits(),
+                        scanned.value(zone).to_bits(),
+                        "{name} bits, zone {zone}"
+                    );
+                }
+            }
+        }
+        let null_counts = from_seeds
+            .column_by_name("null_count")
+            .unwrap()
+            .as_primitive::<UInt32Type>();
+        assert_eq!(null_counts.values(), &[1, 0, 0, 4, 0, 0]);
+        let nan_counts = from_seeds
+            .column_by_name("nan_count")
+            .unwrap()
+            .as_primitive::<UInt32Type>();
+        assert_eq!(nan_counts.values(), &[0, 0, 1, 0, 0, 0]);
+        let maxes = from_seeds
+            .column_by_name("max")
+            .unwrap()
+            .as_primitive::<Float64Type>();
+        assert!(
+            maxes.value(2).is_nan(),
+            "a zone with NaN reports NaN as max"
+        );
+        assert!(maxes.is_null(3), "an all-null zone has no max");
+        let mins = from_seeds
+            .column_by_name("min")
+            .unwrap()
+            .as_primitive::<Float64Type>();
+        assert_eq!(mins.value(4).to_bits(), (-0.0f64).to_bits());
+    }
 }

@@ -5,6 +5,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use futures::{FutureExt, TryStreamExt};
+use lance_core::utils::tracing::{
+    INDEX_SEEDS_FALLBACK_EVENT, INDEX_SEEDS_HARVESTED_EVENT, SEED_FALLBACK_PLUGIN_DECLINED,
+    SEED_FALLBACK_SEED_MISSING, SEED_FALLBACK_SEED_REJECTED, TRACE_DATASET_EVENTS,
+};
 use lance_core::{Error, Result};
 use lance_file::reader::FileReaderOptions;
 use lance_index::{
@@ -667,16 +671,33 @@ async fn merge_scalar_indices<'a>(
         let plugin = details.get_plugin()?;
         // Only open data files looking for seeds when the plugin confirms this
         // index type and configuration can actually produce them.
+        let index_name = old_indices[0].name.as_str();
         let maybe_created = if plugin.might_use_seeds(&index_details) {
-            if let Some(seeds) = try_harvest_seeds(dataset.as_ref(), unindexed, column_name).await?
-            {
-                plugin
-                    .update_from_seeds(seeds, reference_index.clone(), &index_details, &new_store)
-                    .await?
-            } else {
-                None
+            match try_harvest_seeds(dataset.as_ref(), unindexed, column_name).await? {
+                Some(seeds) => {
+                    let num_seeds = seeds.len();
+                    let created = plugin
+                        .update_from_seeds(
+                            seeds,
+                            reference_index.clone(),
+                            &index_details,
+                            &new_store,
+                        )
+                        .await?;
+                    if created.is_some() {
+                        tracing::info!(target: TRACE_DATASET_EVENTS, event=INDEX_SEEDS_HARVESTED_EVENT, index=index_name, column=column_name, fragments=num_seeds);
+                    } else {
+                        tracing::info!(target: TRACE_DATASET_EVENTS, event=INDEX_SEEDS_FALLBACK_EVENT, index=index_name, column=column_name, reason=SEED_FALLBACK_SEED_REJECTED);
+                    }
+                    created
+                }
+                None => {
+                    tracing::info!(target: TRACE_DATASET_EVENTS, event=INDEX_SEEDS_FALLBACK_EVENT, index=index_name, column=column_name, reason=SEED_FALLBACK_SEED_MISSING);
+                    None
+                }
             }
         } else {
+            tracing::info!(target: TRACE_DATASET_EVENTS, event=INDEX_SEEDS_FALLBACK_EVENT, index=index_name, column=column_name, reason=SEED_FALLBACK_PLUGIN_DECLINED);
             None
         };
 

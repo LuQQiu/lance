@@ -334,6 +334,10 @@ name = "concurrent_append"
 harness = false
 
 [[bench]]
+name = "zone_map_seeds"
+harness = false
+
+[[bench]]
 name = "hamming"
 harness = false
 
