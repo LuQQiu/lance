@@ -28,14 +28,17 @@
 //! | `arrow_ord::sort::lexsort_to_indices`   | DataFusion `SortExec` on several columns (`Scanner::order_by`, FTS and vector result ordering) |
 //! | `arrow_ord::ord::make_comparator`       | `BTreeLookup::pages_between` and the btree equality fallback   |
 //! | `ArrowNativeTypeOp::compare`            | the btree's inlined primitive comparator; DataFusion's single-column merge cursor |
-//! | `ArrowScalar` (`arrow_row` encoding)    | `StatisticsAccumulator` extrema (zone map, bloom filter), `HashJoiner` keys, DataFusion's row-based merge cursor |
+//! | `arrow_row::RowConverter`               | `HashJoiner` keys, `FirstByPk` keys, DataFusion's TopK (`SortExec` with a fetch) and its row-based merge cursor for non-primitive types |
+//! | `ArrowScalar` (`arrow_row` encoding)    | `StatisticsAccumulator` extrema (zone map, bloom filter)       |
 //! | `StatisticsAccumulator` min/max         | zone map and bloom filter statistics                            |
 //! | `OrderableScalarValue` / `ScalarValue`  | btree query bounds; zone map pruning                            |
-//! | `SortExec`, `SortPreservingMergeExec`   | `Scanner::order_by`; btree training over several inputs        |
+//! | `SortExec`, with and without a fetch    | `Scanner::order_by`, with `limit` taking the TopK path         |
+//! | `SortPreservingMergeExec`               | btree training over several inputs                             |
 //!
 //! Sorting and aggregate statistics are deliberately distinct contracts: a sort
-//! places every NaN above `+inf`, while `StatisticsAccumulator` leaves NaN out
-//! of `min`/`max` and reports it through `nan_count`. Both are pinned.
+//! places negative NaNs below `-inf` and positive NaNs above `+inf`, while
+//! `StatisticsAccumulator` leaves NaN of either sign out of `min`/`max` and
+//! reports it through `nan_count`. Both are pinned.
 //!
 //! # When a test here fails after a dependency upgrade
 //!
@@ -81,6 +84,7 @@ use arrow_array::{
 };
 use arrow_ord::ord::make_comparator;
 use arrow_ord::sort::{SortColumn, lexsort_to_indices, sort_to_indices};
+use arrow_row::{RowConverter, SortField};
 use arrow_schema::{DataType, Field, Schema, SortOptions};
 use arrow_select::concat::concat_batches;
 use datafusion::physical_expr::{PhysicalSortExpr, expressions::Column};
@@ -863,6 +867,42 @@ fn native_compare_matches_baseline(
     );
 }
 
+/// `RowConverter` with the caller's `SortOptions` is what the hash joiner,
+/// the mem-WAL `FirstByPk` operator and DataFusion's TopK and row cursors
+/// compare with, so every option combination is pinned, not only the default.
+#[rstest]
+fn row_converter_matches_baseline(
+    #[values(
+        float64(),
+        float32(),
+        float16(),
+        utf8(),
+        large_utf8(),
+        binary(),
+        int64(),
+        uint64(),
+        date32(),
+        timestamp_ns_utc(),
+        decimal128(),
+        decimal256(),
+        boolean()
+    )]
+    fixture: Fixture,
+    #[values(ASC_NULLS_FIRST, ASC_NULLS_LAST, DESC_NULLS_FIRST, DESC_NULLS_LAST)] opts: SortOptions,
+) {
+    let converter = RowConverter::new(vec![SortField::new_with_options(
+        fixture.input.data_type().clone(),
+        opts,
+    )])
+    .unwrap();
+    let rows = converter
+        .convert_columns(&[Arc::clone(&fixture.input)])
+        .unwrap();
+    let mut order = fixture.all_rows();
+    order.sort_by(|&left, &right| rows.row(left).cmp(&rows.row(right)));
+    fixture.assert_order("arrow_row::RowConverter", opts, &order);
+}
+
 #[rstest]
 fn arrow_scalar_matches_baseline(
     #[values(
@@ -922,13 +962,14 @@ fn scalar_value_matches_baseline(
         .map(|row| ScalarValue::try_from_array(fixture.input.as_ref(), row).unwrap())
         .collect();
     // The btree compares query bounds with its own `Ord` wrapper.
+    let orderable: Vec<OrderableScalarValue> = scalars
+        .iter()
+        .map(|scalar| OrderableScalarValue(scalar.clone()))
+        .collect();
     fixture.assert_pairwise(
         "OrderableScalarValue::cmp",
         &fixture.all_rows(),
-        |left, right| {
-            OrderableScalarValue(scalars[left].clone())
-                .cmp(&OrderableScalarValue(scalars[right].clone()))
-        },
+        |left, right| orderable[left].cmp(&orderable[right]),
     );
     // The zone map compares query values to zone extrema with DataFusion's
     // `PartialOrd`.
@@ -1025,6 +1066,93 @@ fn statistics_extrema_match_baseline(
     }
 }
 
+/// Signed zeros are the one pair that `==` calls equal and the total order
+/// does not. The mixed fixtures above always have the infinities as extrema,
+/// so only an input made of zeros shows whether statistics still tell them
+/// apart: the baseline is `min = -0.0`, `max = +0.0`, by bit pattern, in
+/// either input order and whether the two arrive in one batch or in two
+/// accumulators that are merged.
+#[rstest]
+#[case::f64_neg_first(
+    Arc::new(Float64Array::from(vec![f64::from_bits(0x8000_0000_0000_0000), f64::from_bits(0)])),
+    vec![0x8000_0000_0000_0000_u64.to_le_bytes().to_vec(), 0_u64.to_le_bytes().to_vec()]
+)]
+#[case::f64_pos_first(
+    Arc::new(Float64Array::from(vec![f64::from_bits(0), f64::from_bits(0x8000_0000_0000_0000)])),
+    vec![0_u64.to_le_bytes().to_vec(), 0x8000_0000_0000_0000_u64.to_le_bytes().to_vec()]
+)]
+#[case::f32_neg_first(
+    Arc::new(Float32Array::from(vec![f32::from_bits(0x8000_0000), f32::from_bits(0)])),
+    vec![0x8000_0000_u32.to_le_bytes().to_vec(), 0_u32.to_le_bytes().to_vec()]
+)]
+#[case::f32_pos_first(
+    Arc::new(Float32Array::from(vec![f32::from_bits(0), f32::from_bits(0x8000_0000)])),
+    vec![0_u32.to_le_bytes().to_vec(), 0x8000_0000_u32.to_le_bytes().to_vec()]
+)]
+#[case::f16_neg_first(
+    Arc::new(Float16Array::from(vec![f16::from_bits(0x8000), f16::from_bits(0)])),
+    vec![0x8000_u16.to_le_bytes().to_vec(), 0_u16.to_le_bytes().to_vec()]
+)]
+#[case::f16_pos_first(
+    Arc::new(Float16Array::from(vec![f16::from_bits(0), f16::from_bits(0x8000)])),
+    vec![0_u16.to_le_bytes().to_vec(), 0x8000_u16.to_le_bytes().to_vec()]
+)]
+fn statistics_keep_signed_zeros_apart(#[case] input: ArrayRef, #[case] identities: Vec<Vec<u8>>) {
+    let identity_of = match input.data_type() {
+        DataType::Float64 => float64().identity_of,
+        DataType::Float32 => float32().identity_of,
+        DataType::Float16 => float16().identity_of,
+        other => panic!("unexpected type {other}"),
+    };
+    let negative_zero = identities
+        .iter()
+        .find(|id| id.last().is_some_and(|byte| byte & 0x80 != 0))
+        .unwrap()
+        .clone();
+    let positive_zero = identities
+        .iter()
+        .find(|id| id.last().is_some_and(|byte| byte & 0x80 == 0))
+        .unwrap()
+        .clone();
+
+    let mut whole = StatisticsAccumulator::new(input.data_type());
+    whole.update(&input).unwrap();
+
+    // Each value in its own accumulator, merged in input order, goes through
+    // `ArrowScalar` ordering rather than the per-batch scan.
+    let mut merged = StatisticsAccumulator::new(input.data_type());
+    merged.update(&input.slice(0, 1)).unwrap();
+    let mut second = StatisticsAccumulator::new(input.data_type());
+    second.update(&input.slice(1, 1)).unwrap();
+    merged.merge(&second).unwrap();
+
+    for (path, stats) in [
+        ("StatisticsAccumulator::update", whole.finish()),
+        ("StatisticsAccumulator::merge", merged.finish()),
+    ] {
+        let min = stats
+            .min
+            .as_ref()
+            .map(|s| identity_of(s.as_array().as_ref(), 0));
+        let max = stats
+            .max
+            .as_ref()
+            .map(|s| identity_of(s.as_array().as_ref(), 0));
+        assert!(
+            min.as_ref() == Some(&negative_zero),
+            "{} via {path}: min expected -0.0 ({negative_zero:?}), got {:?} ({min:?})",
+            input.data_type(),
+            stats.min.as_ref().map(|s| s.to_string()),
+        );
+        assert!(
+            max.as_ref() == Some(&positive_zero),
+            "{} via {path}: max expected +0.0 ({positive_zero:?}), got {:?} ({max:?})",
+            input.data_type(),
+            stats.max.as_ref().map(|s| s.to_string()),
+        );
+    }
+}
+
 fn one_shot(batches: Vec<RecordBatch>, schema: Arc<Schema>) -> Arc<dyn ExecutionPlan> {
     let stream =
         RecordBatchStreamAdapter::new(schema, futures::stream::iter(batches.into_iter().map(Ok)));
@@ -1082,6 +1210,15 @@ async fn sort_exec_matches_baseline(
     let plan = Arc::new(SortExec::new([sort_expr(opts)].into(), input));
     let rows = output_rows(plan).await;
     fixture.assert_order("datafusion SortExec", opts, &rows);
+
+    // `Scanner::order_by` with a `limit` becomes a `SortExec` with a fetch,
+    // which DataFusion runs as a TopK over the row encoding instead of the
+    // sort kernel. A fetch of the full length keeps the whole order visible.
+    let input = one_shot(vec![batch.clone()], batch.schema());
+    let plan =
+        Arc::new(SortExec::new([sort_expr(opts)].into(), input).with_fetch(Some(fixture.len())));
+    let rows = output_rows(plan).await;
+    fixture.assert_order("datafusion SortExec with fetch (TopK)", opts, &rows);
 }
 
 /// Btree training merges several already-sorted inputs with a

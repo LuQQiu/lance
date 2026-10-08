@@ -84,6 +84,7 @@ approx.workspace = true
 criterion.workspace = true
 env_logger.workspace = true
 geo-traits.workspace = true
+arrow-row.workspace = true
 lance-arrow-scalar.workspace = true
 lance-datagen.workspace = true
 lance-datafusion = { workspace = true, features = ["datagen"] }
@@ -205,3 +206,11 @@ workspace = true
 [[bench]]
 name = "inverted_request_cache"
 harness = false
+
+# Pins the Arrow/DataFusion ordering contract. Not part of the default test run:
+# CI runs it from the `arrow-ordering-compat` job only when Cargo.lock changes an
+# ordering-relevant crate. Run by hand with
+# `cargo test -p lance-index --test arrow_ordering_compat`.
+[[test]]
+name = "arrow_ordering_compat"
+test = false

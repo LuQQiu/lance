@@ -4863,6 +4863,7 @@ dependencies = [
  "arrow-array",
  "arrow-ipc",
  "arrow-ord",
+ "arrow-row",
  "arrow-schema",
  "arrow-select",
  "async-channel",
