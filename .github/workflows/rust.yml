@@ -116,11 +116,13 @@ jobs:
     # Lance inherits its comparison semantics from Arrow, DataFusion and `half`.
     # The ordering fixtures are excluded from the default test run (`test =
     # false` in rust/lance-index/Cargo.toml); this is the only job that runs
-    # them, and only when a PR changes one of those versions in Cargo.lock. The
-    # fixtures *from the base branch* run first, so an upgrade cannot pass by
-    # refreshing the expectations in the same PR; a reviewed change is admitted
-    # with the `arrow-ordering-reviewed` label, read live so a re-run after
-    # labelling sees it. The PR's own copy runs after.
+    # them. It does so when a PR changes one of those versions in Cargo.lock,
+    # or when it touches the fixtures, this job, the detector, or the Lance
+    # crates the fixtures exercise, so edits to the check itself are verified.
+    # The fixtures *from the base branch* run first, so an upgrade cannot pass
+    # by refreshing the expectations in the same PR; a reviewed change is
+    # admitted with the `arrow-ordering-reviewed` label, read live so a re-run
+    # after labelling sees it. The PR's own copy runs after.
     name: Arrow ordering compatibility
     if: github.event_name == 'pull_request'
     runs-on: "ubuntu-24.04-8x"
@@ -136,28 +138,42 @@ jobs:
       FIXTURE: rust/lance-index/tests/arrow_ordering_compat.rs
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Detect Arrow, DataFusion or half version changes
+      - name: Detect dependency or fixture changes
         id: detect
         run: |
           git fetch --no-tags --depth=1 origin "$BASE_SHA"
           git show "$BASE_SHA:Cargo.lock" > "$RUNNER_TEMP/base.Cargo.lock"
           python3 ci/arrow_upgrade.py "$RUNNER_TEMP/base.Cargo.lock" Cargo.lock
+          # Changes to the check itself, or to the Lance crates it exercises,
+          # also run the fixtures so the check is never merged untested.
+          self_changed=$(git diff --name-only "$BASE_SHA" HEAD -- \
+            "$FIXTURE" ci/arrow_upgrade.py .github/workflows/rust.yml \
+            rust/lance-index/Cargo.toml rust/arrow-scalar rust/arrow-stats)
+          if [ -n "$self_changed" ]; then
+            echo "fixtures or the paths they exercise changed:"
+            echo "$self_changed"
+          fi
+          if [ -n "$self_changed" ] || grep -q '^changed=true$' "$GITHUB_OUTPUT"; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
       - name: Setup rust toolchain
-        if: steps.detect.outputs.changed == 'true'
+        if: steps.detect.outputs.run == 'true'
         run: |
           rustup toolchain install stable
           rustup default stable
       - uses: rui314/setup-mold@725a8794d15fc7563f59595bd9556495c0564878 # v1
-        if: steps.detect.outputs.changed == 'true'
+        if: steps.detect.outputs.run == 'true'
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
-        if: steps.detect.outputs.changed == 'true'
+        if: steps.detect.outputs.run == 'true'
       - name: Install protoc
-        if: steps.detect.outputs.changed == 'true'
+        if: steps.detect.outputs.run == 'true'
         uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # protoc
         with:
           tool: protoc
       - name: Run base-branch fixtures against the upgraded dependencies
-        if: steps.detect.outputs.changed == 'true'
+        if: steps.detect.outputs.run == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -194,7 +210,7 @@ jobs:
           echo "::error::Arrow ordering changed against the base-branch fixtures. Review the release notes in the job summary, record the affected Lance paths and any persisted-structure handling in the PR, then apply the arrow-ordering-reviewed label."
           exit 1
       - name: Run the PR's fixtures against the upgraded dependencies
-        if: steps.detect.outputs.changed == 'true'
+        if: steps.detect.outputs.run == 'true'
         run: |
           git checkout -- "$FIXTURE"
           cargo test --profile ci --locked -p lance-index --test arrow_ordering_compat
