@@ -14,12 +14,19 @@ from arrow_upgrade import (
 )
 
 
+CRATES_IO = "registry+https://github.com/rust-lang/crates.io-index"
+ARROW_GIT = "git+https://github.com/apache/arrow-rs?branch=main#"
+
+
 def lockfile(*packages):
-    """Render a minimal Cargo.lock holding the given (name, version) pairs."""
-    blocks = [
-        f'[[package]]\nname = "{name}"\nversion = "{version}"\n'
-        for name, version in packages
-    ]
+    """Render a minimal Cargo.lock holding (name, version) or (name, version, source) entries."""
+    blocks = []
+    for entry in packages:
+        name, version = entry[0], entry[1]
+        source = entry[2] if len(entry) > 2 else CRATES_IO
+        blocks.append(
+            f'[[package]]\nname = "{name}"\nversion = "{version}"\nsource = "{source}"\n'
+        )
     return "version = 4\n\n" + "\n".join(blocks)
 
 
@@ -47,7 +54,7 @@ def test_ordering_crates_keeps_every_resolved_version():
     text = lockfile(
         ("arrow-ord", "58.4.0"), ("arrow-ord", "57.0.0"), ("serde", "1.0.0")
     )
-    assert ordering_crates(text) == {"arrow-ord": {"58.4.0", "57.0.0"}}
+    assert ordering_crates(text) == {"arrow-ord": {("58.4.0", None), ("57.0.0", None)}}
 
 
 def test_diff_reports_bumps_additions_and_removals_sorted():
@@ -58,9 +65,29 @@ def test_diff_reports_bumps_additions_and_removals_sorted():
         lockfile(("arrow-ord", "59.0.0"), ("arrow-row", "59.0.0"), ("half", "2.4.1"))
     )
     assert diff(base, head) == [
-        ("arrow-ord", {"58.4.0"}, {"59.0.0"}),
-        ("arrow-row", set(), {"59.0.0"}),
-        ("datafusion", {"54.1.0"}, set()),
+        ("arrow-ord", {("58.4.0", None)}, {("59.0.0", None)}),
+        ("arrow-row", set(), {("59.0.0", None)}),
+        ("datafusion", {("54.1.0", None)}, set()),
+    ]
+
+
+def test_diff_sees_a_git_revision_change_at_the_same_version():
+    base = ordering_crates(lockfile(("arrow-ord", "58.4.0", ARROW_GIT + "aaa111")))
+    head = ordering_crates(lockfile(("arrow-ord", "58.4.0", ARROW_GIT + "bbb222")))
+    assert diff(base, head) == [
+        (
+            "arrow-ord",
+            {("58.4.0", ARROW_GIT + "aaa111")},
+            {("58.4.0", ARROW_GIT + "bbb222")},
+        ),
+    ]
+
+
+def test_diff_sees_a_move_between_crates_io_and_git():
+    base = ordering_crates(lockfile(("arrow-ord", "58.4.0")))
+    head = ordering_crates(lockfile(("arrow-ord", "58.4.0", ARROW_GIT + "aaa111")))
+    assert diff(base, head) == [
+        ("arrow-ord", {("58.4.0", None)}, {("58.4.0", ARROW_GIT + "aaa111")}),
     ]
 
 
@@ -91,12 +118,21 @@ def test_release_notes_url(name, version, expected):
 
 
 def test_summary_links_only_the_new_versions():
-    markdown = summary_markdown([("arrow-ord", {"58.4.0"}, {"58.4.0", "59.0.0"})])
+    markdown = summary_markdown(
+        [("arrow-ord", {("58.4.0", None)}, {("58.4.0", None), ("59.0.0", None)})]
+    )
     assert (
         "| `arrow-ord` | 58.4.0 | 58.4.0, 59.0.0 | [59.0.0](https://github.com/apache/arrow-rs/releases/tag/59.0.0) |"
         in markdown
     )
     assert "arrow-ordering-reviewed" in markdown
+
+
+def test_summary_shows_the_git_source():
+    markdown = summary_markdown(
+        [("arrow-ord", {("58.4.0", None)}, {("58.4.0", ARROW_GIT + "aaa111")})]
+    )
+    assert f"| `arrow-ord` | 58.4.0 | 58.4.0 from {ARROW_GIT}aaa111 |" in markdown
 
 
 def test_main_writes_github_outputs(tmp_path, monkeypatch, capsys):

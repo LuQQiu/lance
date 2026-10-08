@@ -133,7 +133,9 @@ jobs:
     env:
       CC: clang
       CXX: clang++
-      RUSTFLAGS: "-D warnings"
+      # No `-D warnings` here: this job builds with default features, under
+      # which feature-gated code warns as dead. The clippy job enforces
+      # warnings; this job's only question is whether the ordering changed.
       BASE_SHA: ${{ github.event.pull_request.base.sha }}
       FIXTURE: rust/lance-index/tests/arrow_ordering_compat.rs
     steps:

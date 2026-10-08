@@ -38,17 +38,26 @@ def is_ordering_crate(name):
     )
 
 
+CRATES_IO = "registry+https://github.com/rust-lang/crates.io-index"
+
+
 def ordering_crates(lock_text):
-    """Map each ordering crate in a Cargo.lock to the set of versions it resolves to.
+    """Map each ordering crate in a Cargo.lock to the set of (version, source) it resolves to.
 
     A lockfile can hold several versions of one crate when two dependencies
-    disagree, so the value is a set rather than a single version.
+    disagree, so the value is a set rather than a single entry. The source is
+    part of the identity because a git or patched dependency can change code
+    without changing its version: `arrow-ord 58.4.0` at one commit and at
+    another are different code. A crates.io source is recorded as `None`.
     """
     versions = {}
     for package in tomllib.loads(lock_text).get("package", []):
         name = package["name"]
         if is_ordering_crate(name):
-            versions.setdefault(name, set()).add(package["version"])
+            source = package.get("source")
+            if source == CRATES_IO:
+                source = None
+            versions.setdefault(name, set()).add((package["version"], source))
     return versions
 
 
@@ -75,7 +84,15 @@ def release_notes_url(name, version):
 
 
 def format_versions(versions):
-    return ", ".join(sorted(versions)) if versions else "(absent)"
+    """Render a set of (version, source) entries; crates.io entries show the version alone."""
+    if not versions:
+        return "(absent)"
+    return ", ".join(
+        version if source is None else f"{version} from {source}"
+        for version, source in sorted(
+            versions, key=lambda entry: (entry[0], entry[1] or "")
+        )
+    )
 
 
 def summary_markdown(changes):
@@ -90,7 +107,8 @@ def summary_markdown(changes):
     ]
     for name, before, after in changes:
         links = " ".join(
-            f"[{v}]({release_notes_url(name, v)})" for v in sorted(after - before)
+            f"[{version}]({release_notes_url(name, version)})"
+            for version in sorted({version for version, _ in after - before})
         )
         lines.append(
             f"| `{name}` | {format_versions(before)} | {format_versions(after)} | {links} |"
