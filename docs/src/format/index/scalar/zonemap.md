@@ -31,6 +31,7 @@ The zone map index stores zone statistics in a single file:
 | `max`         | {DataType} | true     | Maximum value in the zone               |
 | `null_count`  | UInt32     | false    | Number of null values in the zone       |
 | `nan_count`   | UInt32     | false    | Number of NaN values (for float types)  |
+| `negative_nan_count` | UInt32 | true  | Number of those NaN values with the sign bit set; null in indices written before this column existed |
 | `fragment_id` | UInt64     | false    | Fragment containing this zone           |
 | `zone_start`  | UInt64     | false    | Starting row offset within the fragment |
 | `zone_length` | UInt32     | false    | Number of rows in this zone             |
