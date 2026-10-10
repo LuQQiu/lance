@@ -17,6 +17,35 @@ use lance_core::Result;
 /// Schema metadata key prefix for all seed buffers: `"lance.seed.<column_name>"`.
 pub const SEED_META_KEY_PREFIX: &str = "lance.seed.";
 
+/// Seed metadata values are colon-separated. The first segment is always the
+/// global buffer index; plugin-specific segments follow. Writers that know the
+/// field id of the seeded column append it as the last segment so a harvester
+/// can prove the seed belongs to the field it is about to update even after the
+/// column was renamed. Values with only two segments come from older writers
+/// and carry no field id.
+pub const SEED_META_VALUE_SEPARATOR: char = ':';
+
+/// Minimum number of segments a value must have for its last segment to be
+/// the field id.
+const SEED_META_VALUE_SEGMENTS_WITH_FIELD_ID: usize = 3;
+
+/// The global buffer index recorded in a seed metadata value.
+pub fn seed_buffer_index(value: &str) -> Option<u32> {
+    value
+        .split(SEED_META_VALUE_SEPARATOR)
+        .next()
+        .and_then(|segment| segment.parse().ok())
+}
+
+/// The field id recorded in a seed metadata value, if the writer recorded one.
+pub fn seed_field_id(value: &str) -> Option<i32> {
+    let segments: Vec<&str> = value.split(SEED_META_VALUE_SEPARATOR).collect();
+    if segments.len() < SEED_META_VALUE_SEGMENTS_WITH_FIELD_ID {
+        return None;
+    }
+    segments.last().and_then(|segment| segment.parse().ok())
+}
+
 /// A hook registered during data file writes that observes column values batch
 /// by batch, accumulates compact statistics in memory, and serializes them to
 /// a byte buffer that is embedded in the data file footer as a global buffer.
@@ -51,6 +80,9 @@ pub trait IndexSeedWriter: Send + std::fmt::Debug {
 pub struct FragmentSeed {
     pub fragment_id: u64,
     pub bytes: Bytes,
+    /// Physical row count of the data file the seed was read from. Plugins
+    /// must reject a seed whose zones do not cover exactly this many rows.
+    pub num_rows: u64,
     /// The raw value that was stored in the data file's schema metadata under
     /// the seed key (i.e. the output of [`IndexSeedWriter::schema_metadata_value`]).
     /// Plugins can inspect this to validate that the seed is compatible with the

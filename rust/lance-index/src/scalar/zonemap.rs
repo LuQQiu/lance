@@ -31,6 +31,7 @@ use serde::{Deserialize, Serialize};
 use std::any::Any;
 use std::sync::LazyLock;
 
+use arrow::buffer::NullBuffer;
 use arrow_array::{
     ArrayRef, RecordBatch, UInt32Array, UInt64Array, new_empty_array, new_null_array,
 };
@@ -38,7 +39,10 @@ use arrow_schema::{DataType, Field};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion_common::ScalarValue;
 use lance_select::{RowAddrTreeMap, RowSetOps};
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use super::{AnyQuery, IndexStore, MetricsCollector, ScalarIndex, SearchResult};
 use crate::scalar::RowIdRemapper;
@@ -49,7 +53,7 @@ use lance_core::Result;
 use lance_core::deepsize::DeepSizeOf;
 use roaring::RoaringBitmap;
 
-use super::zoned::{ZoneBound, ZoneProcessor, ZoneTrainer, rebuild_zones, search_zones};
+use super::zoned::{ZoneBound, ZoneProcessor, ZoneTrainer, search_zones};
 const ROWS_PER_ZONE_DEFAULT: u64 = 8192; // 1 zone every two batches
 
 const ZONEMAP_FILENAME: &str = "zonemap.lance";
@@ -822,14 +826,19 @@ impl ScalarIndex for ZoneMapIndex {
         let options = ZoneMapIndexBuilderParams::new(self.rows_per_zone);
         let processor = ZoneMapProcessor::new(value_type.clone())?;
         let trainer = ZoneTrainer::new(processor, self.rows_per_zone)?;
-        let (updated_zones, new_null_rows) = rebuild_zones(&self.zones, trainer, new_data).await?;
+        let (mut new_zones, new_null_rows) = trainer.train(new_data).await?;
+
+        // A fragment in the new data is being re-indexed (its column was
+        // rewritten), so its old zones and null rows must not survive.
+        let reindexed: HashSet<u64> = new_zones.iter().map(|z| z.bound.fragment_id).collect();
+        let (mut updated_zones, retained_null_rows) = self.without_fragments(&reindexed);
+        updated_zones.append(&mut new_zones);
 
         // Merge existing and new null rows.  If the existing index had no null bitmap
         // (legacy format — null positions unknown), preserve that None: updating cannot
         // recover the missing information, and claiming the result has zero nulls would
         // be a false negative.  Only a full retrain produces a fresh, complete bitmap.
-        let merged_null_rows = self.null_rows.as_ref().map(|existing| {
-            let mut merged = existing.clone();
+        let merged_null_rows = retained_null_rows.map(|mut merged| {
             merged |= &new_null_rows;
             merged
         });
@@ -879,14 +888,37 @@ impl ScalarIndex for ZoneMapIndex {
 }
 
 impl ZoneMapIndex {
+    /// The index's zones and null rows without `fragments`, which are about to
+    /// be re-indexed from new data.
+    fn without_fragments(
+        &self,
+        fragments: &HashSet<u64>,
+    ) -> (Vec<ZoneMapStatistics>, Option<RowAddrTreeMap>) {
+        let zones: Vec<ZoneMapStatistics> = self
+            .zones
+            .iter()
+            .filter(|zone| !fragments.contains(&zone.bound.fragment_id))
+            .cloned()
+            .collect();
+        let null_rows = self.null_rows.as_ref().map(|rows| {
+            let mut rows = rows.clone();
+            let kept: HashSet<u32> = zones
+                .iter()
+                .map(|zone| zone.bound.fragment_id as u32)
+                .collect();
+            rows.retain_fragments(kept);
+            rows
+        });
+        (zones, null_rows)
+    }
+
     async fn try_update_with_seeds(
         &self,
         seeds: &[crate::scalar::seed::FragmentSeed],
         dest_store: &dyn IndexStore,
     ) -> Result<Option<CreatedIndex>> {
-        let mut new_zones = self.zones.clone();
-        let mut merged_null_rows = self.null_rows.clone();
-        let mut any_missing_bitmap = self.null_rows.is_none();
+        let reindexed: HashSet<u64> = seeds.iter().map(|seed| seed.fragment_id).collect();
+        let (mut new_zones, mut merged_null_rows) = self.without_fragments(&reindexed);
 
         for seed in seeds {
             let (mut zones, seed_null_bitmap) = ZoneMapSeedWriter::deserialize_seed(
@@ -894,27 +926,27 @@ impl ZoneMapIndex {
                 &seed.bytes,
                 self.rows_per_zone,
             )?;
+            // Zone positions are implied by `rows_per_zone`, so a seed is only
+            // usable when its zones tile the data file exactly.
+            if !seed_zones_cover_file(&zones, self.rows_per_zone, seed.num_rows) {
+                return Ok(None);
+            }
             new_zones.append(&mut zones);
 
-            if !any_missing_bitmap {
-                match seed_null_bitmap {
-                    Some(bitmap) => {
-                        let frag_id = u32::try_from(seed.fragment_id).map_err(|_| {
-                            Error::invalid_input(format!(
-                                "fragment_id {} exceeds u32::MAX",
-                                seed.fragment_id
-                            ))
-                        })?;
-                        merged_null_rows
-                            .as_mut()
-                            .unwrap()
-                            .insert_bitmap(frag_id, bitmap);
-                    }
-                    None => {
-                        any_missing_bitmap = true;
-                        merged_null_rows = None;
-                    }
-                }
+            if let Some(merged) = merged_null_rows.as_mut() {
+                // Exact null tracking cannot be extended from a seed without
+                // null positions; scanning keeps the index exact instead of
+                // silently degrading it.
+                let Some(bitmap) = seed_null_bitmap else {
+                    return Ok(None);
+                };
+                let frag_id = u32::try_from(seed.fragment_id).map_err(|_| {
+                    Error::invalid_input(format!(
+                        "fragment_id {} exceeds u32::MAX",
+                        seed.fragment_id
+                    ))
+                })?;
+                merged.insert_bitmap(frag_id, bitmap);
             }
         }
         new_zones.sort_by_key(|z| (z.bound.fragment_id, z.bound.start));
@@ -938,6 +970,20 @@ impl ZoneMapIndex {
             files,
         }))
     }
+}
+
+/// True when `zones` are laid out as the seed writer lays them out: every zone
+/// but the last holds exactly `rows_per_zone` rows, the last holds between one
+/// and `rows_per_zone` rows, and together they cover `num_rows`.
+fn seed_zones_cover_file(zones: &[ZoneMapStatistics], rows_per_zone: u64, num_rows: u64) -> bool {
+    let Some((last, full)) = zones.split_last() else {
+        return num_rows == 0;
+    };
+    let last_len = last.bound.length as u64;
+    full.iter().all(|z| z.bound.length as u64 == rows_per_zone)
+        && last_len > 0
+        && last_len <= rows_per_zone
+        && full.len() as u64 * rows_per_zone + last_len == num_rows
 }
 
 fn remap_zone(
@@ -1300,6 +1346,10 @@ impl ZoneMapIndexBuilder {
 struct ZoneMapProcessor {
     data_type: DataType,
     statistics: StatisticsAccumulator,
+    /// Nulls counted with Arrow's logical semantics. `StatisticsAccumulator`
+    /// counts the physical validity buffer, which is zero for `NullArray` and
+    /// misses dictionary keys that point at a null value.
+    null_count: u64,
 }
 
 impl ZoneMapProcessor {
@@ -1308,6 +1358,7 @@ impl ZoneMapProcessor {
         Ok(Self {
             data_type,
             statistics,
+            null_count: 0,
         })
     }
 
@@ -1361,12 +1412,13 @@ impl ZoneProcessor for ZoneMapProcessor {
 
     fn process_chunk(&mut self, array: &ArrayRef) -> Result<()> {
         self.statistics.update(array)?;
+        self.null_count += array.logical_null_count() as u64;
         Ok(())
     }
 
     fn finish_zone(&mut self, bound: ZoneBound) -> Result<Self::ZoneStatistics> {
         let statistics = self.statistics.statistics();
-        let null_count = Self::stat_count_to_u32("null_count", statistics.null_count)?;
+        let null_count = Self::stat_count_to_u32("null_count", self.null_count)?;
 
         // For nested types, only null_count is meaningful; store null min/max.
         if self.data_type.is_nested() {
@@ -1398,6 +1450,7 @@ impl ZoneProcessor for ZoneMapProcessor {
 
     fn reset(&mut self) -> Result<()> {
         self.statistics.reset();
+        self.null_count = 0;
         Ok(())
     }
 }
@@ -1616,6 +1669,7 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
     async fn create_seed_writer(
         &self,
         field_path: &str,
+        field_id: i32,
         data_type: &DataType,
         index_details: &prost_types::Any,
     ) -> Result<Option<Box<dyn crate::scalar::seed::IndexSeedWriter>>> {
@@ -1626,11 +1680,10 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
         if !details.as_ref().and_then(|d| d.use_seeds).unwrap_or(false) {
             return Ok(None);
         }
-        Ok(Some(Box::new(ZoneMapSeedWriter::new(
-            field_path,
-            rows_per_zone,
-            data_type.clone(),
-        )?)))
+        Ok(Some(Box::new(
+            ZoneMapSeedWriter::new(field_path, rows_per_zone, data_type.clone())?
+                .with_field_id(field_id),
+        )))
     }
 
     async fn update_from_seeds(
@@ -1652,8 +1705,9 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
         for seed in &seeds {
             let rpz_in_seed = seed
                 .metadata_value
-                .split_once(':')
-                .and_then(|(_, rpz)| rpz.parse::<u64>().ok());
+                .split(crate::scalar::seed::SEED_META_VALUE_SEPARATOR)
+                .nth(1)
+                .and_then(|rpz| rpz.parse::<u64>().ok());
             if rpz_in_seed != Some(rows_per_zone) {
                 return Ok(None);
             }
@@ -1682,6 +1736,9 @@ pub struct ZoneMapSeedWriter {
     next_zone_start: u64,
     /// Null row offsets within this fragment (sequential, 0-indexed).
     null_offsets: RoaringBitmap,
+    /// Field id of the seeded column, recorded in the metadata value so a
+    /// harvester can match the seed to its field after a rename.
+    field_id: Option<i32>,
 }
 
 impl ZoneMapSeedWriter {
@@ -1706,7 +1763,14 @@ impl ZoneMapSeedWriter {
             rows_in_current_zone: 0,
             next_zone_start: 0,
             null_offsets: RoaringBitmap::new(),
+            field_id: None,
         })
+    }
+
+    /// Record the field id of the seeded column in the seed metadata value.
+    pub fn with_field_id(mut self, field_id: i32) -> Self {
+        self.field_id = Some(field_id);
+        self
     }
 
     fn seed_batch_from_zones(
@@ -1857,11 +1921,8 @@ impl ZoneMapSeedWriter {
     /// contiguous null region instead of one per null row, so all-null and
     /// clustered-null data cost almost nothing to track. `base_offset` is the
     /// fragment-local offset of the chunk's first row.
-    fn record_null_runs(&mut self, chunk: &ArrayRef, base_offset: u32) {
-        let len = chunk.len() as u32;
-        let Some(nulls) = chunk.nulls() else {
-            return;
-        };
+    fn record_null_runs(&mut self, nulls: &NullBuffer, base_offset: u32) {
+        let len = nulls.len() as u32;
         // The validity buffer marks valid rows; the gaps between its set runs
         // are the null runs.
         let mut cursor = 0u32;
@@ -1894,9 +1955,13 @@ impl IndexSeedWriter for ZoneMapSeedWriter {
             let chunk = values.slice(offset, chunk_len);
             self.processor.process_chunk(&chunk)?;
 
-            if chunk.null_count() > 0 {
+            // Logical nulls, so a `NullArray` and dictionary keys that point
+            // at a null value are counted and positioned like any other null.
+            if let Some(nulls) = chunk.logical_nulls()
+                && nulls.null_count() > 0
+            {
                 let base_offset = (self.next_zone_start + self.rows_in_current_zone) as u32;
-                self.record_null_runs(&chunk, base_offset);
+                self.record_null_runs(&nulls, base_offset);
             }
 
             self.rows_in_current_zone += chunk_len as u64;
@@ -1998,7 +2063,10 @@ impl IndexSeedWriter for ZoneMapSeedWriter {
     }
 
     fn schema_metadata_value(&self, buf_index: u32) -> String {
-        format!("{}:{}", buf_index, self.rows_per_zone)
+        match self.field_id {
+            Some(field_id) => format!("{}:{}:{}", buf_index, self.rows_per_zone, field_id),
+            None => format!("{}:{}", buf_index, self.rows_per_zone),
+        }
     }
 }
 
@@ -4200,12 +4268,114 @@ mod tests {
             let (_, bitmap) = ZoneMapSeedWriter::deserialize_seed(0, &bytes, 1000).unwrap();
             assert_eq!(bitmap, Some(expected.clone()));
         }
+    }
 
-        // No validity buffer means no nulls: the run scan records nothing.
-        let valid: ArrayRef = Arc::new(Int32Array::from_iter_values(0..10));
-        let mut writer = ZoneMapSeedWriter::new("c", 64, DataType::Int32).unwrap();
-        writer.record_null_runs(&valid, 0);
-        assert!(writer.null_offsets.is_empty());
+    #[test]
+    fn test_seed_zones_cover_file() {
+        use super::seed_zones_cover_file;
+
+        fn zone(length: usize) -> ZoneMapStatistics {
+            ZoneMapStatistics {
+                min: ScalarValue::Int32(None),
+                max: ScalarValue::Int32(None),
+                null_count: 0,
+                nan_count: 0,
+                bound: ZoneBound {
+                    fragment_id: 0,
+                    start: 0,
+                    length,
+                },
+            }
+        }
+        assert!(seed_zones_cover_file(&[], 4, 0));
+        assert!(!seed_zones_cover_file(&[], 4, 1));
+        assert!(seed_zones_cover_file(&[zone(4)], 4, 4));
+        assert!(seed_zones_cover_file(&[zone(4), zone(4), zone(2)], 4, 10));
+        // A short zone before the last one shifts every later zone, even
+        // when the total still matches the file.
+        assert!(!seed_zones_cover_file(&[zone(4), zone(2), zone(4)], 4, 10));
+        assert!(!seed_zones_cover_file(&[zone(4), zone(0)], 4, 4));
+        assert!(!seed_zones_cover_file(&[zone(4), zone(5)], 4, 9));
+        assert!(!seed_zones_cover_file(&[zone(4), zone(2)], 4, 7));
+    }
+
+    #[test]
+    fn test_seed_metadata_value_records_field_id() {
+        use super::ZoneMapSeedWriter;
+        use crate::scalar::seed::{IndexSeedWriter, seed_buffer_index, seed_field_id};
+
+        let plain = ZoneMapSeedWriter::new("c", 8, DataType::Int32).unwrap();
+        assert_eq!(plain.schema_metadata_value(3), "3:8");
+        assert_eq!(seed_buffer_index("3:8"), Some(3));
+        assert_eq!(seed_field_id("3:8"), None);
+
+        let tagged = ZoneMapSeedWriter::new("c", 8, DataType::Int32)
+            .unwrap()
+            .with_field_id(42);
+        assert_eq!(tagged.schema_metadata_value(3), "3:8:42");
+        assert_eq!(seed_buffer_index("3:8:42"), Some(3));
+        assert_eq!(seed_field_id("3:8:42"), Some(42));
+    }
+
+    /// Seeds count and position nulls with Arrow's logical semantics: a
+    /// `NullArray` has no validity buffer and dictionary keys may point at a
+    /// null value, yet every such row is a null.
+    #[test]
+    fn test_zone_map_seed_writer_logical_nulls() {
+        use super::ZoneMapSeedWriter;
+        use crate::scalar::seed::IndexSeedWriter;
+        use arrow_array::types::Int8Type;
+        use arrow_array::{Array, ArrayRef, DictionaryArray, Int8Array, NullArray, StringArray};
+
+        fn seed(chunks: &[ArrayRef], rows_per_zone: u64) -> (Vec<u32>, RoaringBitmap) {
+            let mut writer =
+                ZoneMapSeedWriter::new("c", rows_per_zone, chunks[0].data_type().clone()).unwrap();
+            for chunk in chunks {
+                writer.observe_batch(chunk).unwrap();
+            }
+            let bytes = writer.finish().unwrap().unwrap();
+            let (zones, bitmap) =
+                ZoneMapSeedWriter::deserialize_seed(0, &bytes, rows_per_zone).unwrap();
+            (
+                zones.iter().map(|z| z.null_count).collect(),
+                bitmap.unwrap(),
+            )
+        }
+
+        let all_null: ArrayRef = Arc::new(NullArray::new(5));
+        assert_eq!(
+            all_null.null_count(),
+            0,
+            "physical count ignores NullArray rows"
+        );
+        let (counts, bitmap) = seed(&[all_null], 4);
+        assert_eq!(counts, vec![4, 1]);
+        assert_eq!(bitmap, (0..5).collect());
+
+        let values: ArrayRef = Arc::new(StringArray::from(vec![None, Some("hello")]));
+        let keys = Int8Array::from(vec![Some(0), Some(1), None, Some(0), Some(1)]);
+        let dictionary: ArrayRef =
+            Arc::new(DictionaryArray::<Int8Type>::try_new(keys, values).unwrap());
+        assert_eq!(
+            dictionary.null_count(),
+            1,
+            "physical count misses keys that point at a null value"
+        );
+        let expected: RoaringBitmap = [0u32, 2, 3].into_iter().collect();
+        let (counts, bitmap) = seed(std::slice::from_ref(&dictionary), 4);
+        assert_eq!(counts, vec![3, 0]);
+        assert_eq!(bitmap, expected);
+        // The same rows observed as slices that cut through zone boundaries.
+        let (counts, bitmap) = seed(
+            &[
+                dictionary.slice(0, 1),
+                dictionary.slice(1, 2),
+                dictionary.slice(3, 2),
+            ],
+            2,
+        );
+        assert_eq!(counts, vec![1, 2, 0]);
+        assert_eq!(bitmap, expected);
     }
 
     #[tokio::test]
@@ -4448,6 +4618,7 @@ mod tests {
         let seed = FragmentSeed {
             fragment_id: 1,
             bytes: seed_bytes,
+            num_rows: seed_values.len() as u64,
             metadata_value: format!("0:{}", rows_per_zone),
         };
 
@@ -4464,9 +4635,10 @@ mod tests {
             .unwrap()
             .expect("update must produce a result");
 
-        let updated_index = ZoneMapIndex::load(dest_store, None, &LanceCache::no_cache(), true)
-            .await
-            .unwrap();
+        let updated_index =
+            ZoneMapIndex::load(dest_store.clone(), None, &LanceCache::no_cache(), true)
+                .await
+                .unwrap();
 
         // The updated index must have a null bitmap covering both fragments.
         let null_rows = updated_index
@@ -4490,6 +4662,50 @@ mod tests {
             .await
             .unwrap();
         assert!(result.is_exact(), "IS NULL after seed update must be exact");
+
+        // A seed whose zones do not tile its data file is rejected: the merge
+        // must scan instead of placing zones at the wrong rows.
+        let mut writer = ZoneMapSeedWriter::new("value", rows_per_zone, DataType::Int32).unwrap();
+        writer.observe_batch(&seed_values).unwrap();
+        let bytes = writer.finish().unwrap().unwrap();
+        let wrong_rows = FragmentSeed {
+            fragment_id: 2,
+            bytes: bytes.clone(),
+            num_rows: seed_values.len() as u64 + 1,
+            metadata_value: format!("0:{}", rows_per_zone),
+        };
+        assert!(
+            index
+                .try_update_with_seeds(&[wrong_rows], dest_store.as_ref())
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // A seed without null positions cannot extend exact null tracking;
+        // the merge scans rather than degrading the index.
+        let (zones, _) = ZoneMapSeedWriter::deserialize_seed(2, &bytes, rows_per_zone).unwrap();
+        let batch = ZoneMapSeedWriter::seed_batch_from_zones(&zones, &DataType::Int32).unwrap();
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut ipc =
+                arrow_ipc::writer::FileWriter::try_new(&mut buf, batch.schema_ref()).unwrap();
+            ipc.write(&batch).unwrap();
+            ipc.finish().unwrap();
+        }
+        let no_positions = FragmentSeed {
+            fragment_id: 2,
+            bytes: bytes::Bytes::from(buf.into_inner()),
+            num_rows: seed_values.len() as u64,
+            metadata_value: format!("0:{}", rows_per_zone),
+        };
+        assert!(
+            index
+                .try_update_with_seeds(&[no_positions], dest_store.as_ref())
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// A legacy index (null_rows = None) updated with a seed must still have
@@ -4572,6 +4788,7 @@ mod tests {
                 &[FragmentSeed {
                     fragment_id: 1,
                     bytes: seed_bytes,
+                    num_rows: seed_values.len() as u64,
                     metadata_value: format!("0:{}", rows_per_zone),
                 }],
                 dest_store.as_ref(),

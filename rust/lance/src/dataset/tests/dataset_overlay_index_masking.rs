@@ -89,7 +89,7 @@ async fn build_age_index(dataset: &mut Dataset) {
 /// Write an overlay file covering `fields` of `fragment_id` with `coverage` and the given
 /// per-field value columns, then commit it as a `DataOverlay` transaction. `name` makes
 /// the overlay file unique.
-async fn commit_overlay(
+pub(super) async fn commit_overlay(
     dataset: Dataset,
     name: &str,
     fragment_id: u64,

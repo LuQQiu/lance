@@ -557,6 +557,27 @@ pub struct Fragment {
 }
 
 impl Fragment {
+    /// The data file that currently serves `field_id`, if exactly one does.
+    ///
+    /// A file serves a field when the field id is listed at a position whose
+    /// column index is live; tombstoned positions and legacy files that lost
+    /// the column never match. A field served by several files is reported as
+    /// unserved, so callers that read per-file metadata (such as write seeds)
+    /// cannot pick a stale file.
+    pub fn data_file_serving_field(&self, field_id: i32) -> Option<&DataFile> {
+        let mut serving = self.files.iter().filter(|file| {
+            file.fields.iter().enumerate().any(|(pos, id)| {
+                *id == field_id
+                    && file
+                        .column_indices
+                        .get(pos)
+                        .is_none_or(|column_index| *column_index >= 0)
+            })
+        });
+        let first = serving.next()?;
+        serving.next().is_none().then_some(first)
+    }
+
     pub fn new(id: u64) -> Self {
         Self {
             id,
@@ -918,6 +939,60 @@ mod tests {
     use lance_file::format::{MAJOR_VERSION, MINOR_VERSION};
     use object_store::path::Path;
     use roaring::RoaringBitmap;
+
+    fn serving_test_file(path: &str, fields: &[i32], column_indices: &[i32]) -> DataFile {
+        DataFile::new(
+            path,
+            fields.to_vec(),
+            column_indices.to_vec(),
+            ConcreteFileVersion::V2_0,
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn test_data_file_serving_field() {
+        let mut fragment = Fragment::new(0);
+        // Field 1 lives in the first file, field 2 was rewritten: tombstoned
+        // in the first file, served by the second.
+        fragment.files.push(serving_test_file(
+            "a.lance",
+            &[1, TOMBSTONE_FIELD_ID],
+            &[0, 1],
+        ));
+        fragment
+            .files
+            .push(serving_test_file("b.lance", &[2], &[0]));
+        assert_eq!(
+            fragment.data_file_serving_field(1).map(|f| f.path.as_str()),
+            Some("a.lance")
+        );
+        assert_eq!(
+            fragment.data_file_serving_field(2).map(|f| f.path.as_str()),
+            Some("b.lance")
+        );
+        assert!(fragment.data_file_serving_field(3).is_none());
+
+        // A negative column index means the column is not stored in the file.
+        fragment
+            .files
+            .push(serving_test_file("c.lance", &[3], &[-1]));
+        assert!(fragment.data_file_serving_field(3).is_none());
+
+        // Legacy files carry no column indices and serve every listed field.
+        fragment.files.push(serving_test_file("d.lance", &[4], &[]));
+        assert_eq!(
+            fragment.data_file_serving_field(4).map(|f| f.path.as_str()),
+            Some("d.lance")
+        );
+
+        // Two live files for one field are ambiguous.
+        fragment
+            .files
+            .push(serving_test_file("e.lance", &[1], &[0]));
+        assert!(fragment.data_file_serving_field(1).is_none());
+    }
     use serde_json::{Value, json};
 
     #[test]

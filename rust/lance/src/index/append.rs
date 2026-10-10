@@ -5,6 +5,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use futures::{FutureExt, TryStreamExt};
+use lance_core::utils::tracing::{
+    INDEX_SEEDS_FALLBACK_EVENT, INDEX_SEEDS_HARVESTED_EVENT, SEED_FALLBACK_SEED_MISSING,
+    SEED_FALLBACK_SEED_REJECTED, TRACE_DATASET_EVENTS,
+};
 use lance_core::{Error, Result};
 use lance_file::reader::FileReaderOptions;
 use lance_index::{
@@ -17,7 +21,7 @@ use lance_index::{
         CreatedIndex, OldIndexDataFilter, ScalarIndex, index_files_to_table,
         inverted::InvertedIndex,
         lance_format::LanceIndexStore,
-        seed::{FragmentSeed, SEED_META_KEY_PREFIX},
+        seed::{FragmentSeed, SEED_META_KEY_PREFIX, seed_buffer_index, seed_field_id},
         table_files_to_index,
     },
 };
@@ -336,20 +340,45 @@ pub async fn build_per_segment_filters(
     Ok((effective_union, filters))
 }
 
+/// Whether a seed stored under `column_name` in a data file describes
+/// `field_id`, not a column that happened to carry the same name when the
+/// file was written. Seeds that record a field id say so directly; older
+/// seeds are trusted only when the file's own schema maps the column name to
+/// the field.
+fn seed_describes_field(
+    meta_value: &str,
+    file_schema: &lance_core::datatypes::Schema,
+    column_name: &str,
+    field_id: i32,
+) -> bool {
+    match seed_field_id(meta_value) {
+        Some(seed_field) => seed_field == field_id,
+        None => file_schema.field(column_name).map(|field| field.id) == Some(field_id),
+    }
+}
+
 /// Attempt to read seed buffers for `column_name` from `fragments`' data files.
 ///
-/// Returns `Some(vec)` only if every fragment has a seed entry; returns `None`
-/// if any fragment is missing a seed or its data file cannot be opened.
+/// Returns `Some(vec)` only if every fragment has a seed that provably
+/// describes the current data of the field: the seed is read from the data
+/// file that serves the field, it names that field (or, for seeds written
+/// before field ids were recorded, the file's own schema maps the column name
+/// to that field), the field has no overlay, and the file's row count matches
+/// the fragment. Returns `None` otherwise, so the caller scans instead.
 /// Index-type-specific validation (e.g. `rows_per_zone` checks) is left to the
 /// caller via [`FragmentSeed::metadata_value`].
 async fn try_harvest_seeds(
     dataset: &Dataset,
     fragments: &[Fragment],
     column_name: &str,
+    field_path: &str,
 ) -> Result<Option<Vec<FragmentSeed>>> {
     if fragments.is_empty() {
         return Ok(Some(Vec::new()));
     }
+    let Some(field_id) = dataset.schema().field(field_path).map(|field| field.id) else {
+        return Ok(None);
+    };
 
     let meta_key = format!("{}{}", SEED_META_KEY_PREFIX, column_name);
     let mut seeds = Vec::with_capacity(fragments.len());
@@ -360,7 +389,16 @@ async fn try_harvest_seeds(
     );
 
     for fragment in fragments {
-        let Some(data_file) = fragment.files.first() else {
+        // An overlay changes the values readers see without touching the data
+        // file, so the file's seed no longer describes the field.
+        if fragment
+            .overlays
+            .iter()
+            .any(|overlay| overlay.data_file.fields.contains(&field_id))
+        {
+            return Ok(None);
+        }
+        let Some(data_file) = fragment.data_file_serving_field(field_id) else {
             return Ok(None);
         };
 
@@ -396,13 +434,25 @@ async fn try_harvest_seeds(
             return Ok(None);
         };
 
-        // The buf_index is always the portion before the first ':'.
-        let Some(buf_index_str) = meta_value.split(':').next() else {
+        if !seed_describes_field(
+            &meta_value,
+            &reader.metadata().file_schema,
+            column_name,
+            field_id,
+        ) {
+            return Ok(None);
+        }
+        let Some(buf_index) = seed_buffer_index(&meta_value) else {
             return Ok(None);
         };
-        let Ok(buf_index) = buf_index_str.parse::<u32>() else {
+
+        let num_rows = reader.metadata().num_rows;
+        if fragment
+            .physical_rows
+            .is_some_and(|rows| rows as u64 != num_rows)
+        {
             return Ok(None);
-        };
+        }
 
         let Ok(bytes) = reader.read_global_buffer(buf_index).await else {
             return Ok(None);
@@ -411,6 +461,7 @@ async fn try_harvest_seeds(
         seeds.push(FragmentSeed {
             fragment_id: fragment.id,
             bytes,
+            num_rows,
             metadata_value: meta_value,
         });
     }
@@ -667,14 +718,30 @@ async fn merge_scalar_indices<'a>(
         let plugin = details.get_plugin()?;
         // Only open data files looking for seeds when the plugin confirms this
         // index type and configuration can actually produce them.
+        let index_name = old_indices[0].name.as_str();
         let maybe_created = if plugin.might_use_seeds(&index_details) {
-            if let Some(seeds) = try_harvest_seeds(dataset.as_ref(), unindexed, column_name).await?
-            {
-                plugin
-                    .update_from_seeds(seeds, reference_index.clone(), &index_details, &new_store)
-                    .await?
-            } else {
-                None
+            match try_harvest_seeds(dataset.as_ref(), unindexed, column_name, field_path).await? {
+                Some(seeds) => {
+                    let num_seeds = seeds.len();
+                    let created = plugin
+                        .update_from_seeds(
+                            seeds,
+                            reference_index.clone(),
+                            &index_details,
+                            &new_store,
+                        )
+                        .await?;
+                    if created.is_some() {
+                        tracing::debug!(target: TRACE_DATASET_EVENTS, event=INDEX_SEEDS_HARVESTED_EVENT, index=index_name, column=column_name, fragments=num_seeds);
+                    } else {
+                        tracing::debug!(target: TRACE_DATASET_EVENTS, event=INDEX_SEEDS_FALLBACK_EVENT, index=index_name, column=column_name, reason=SEED_FALLBACK_SEED_REJECTED);
+                    }
+                    created
+                }
+                None => {
+                    tracing::debug!(target: TRACE_DATASET_EVENTS, event=INDEX_SEEDS_FALLBACK_EVENT, index=index_name, column=column_name, reason=SEED_FALLBACK_SEED_MISSING);
+                    None
+                }
             }
         } else {
             None
@@ -1701,6 +1768,33 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
 
 #[cfg(test)]
 mod tests {
+    /// A data file written when `a` was field 0 and `c` was field 1 keeps a
+    /// seed named `lance.seed.a` that describes field 0. After `a` is renamed
+    /// to `b` and `c` to `a`, the index on field 1 is harvested under the
+    /// name `a`: the seed must be refused unless it names field 1 itself.
+    #[test]
+    fn test_seed_describes_field_after_rename() {
+        use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+        use lance_core::datatypes::Schema;
+
+        let mut file_schema = Schema::try_from(&ArrowSchema::new(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("c", DataType::Int32, true),
+        ]))
+        .unwrap();
+        file_schema.set_field_id(None);
+        assert_eq!(file_schema.field("a").unwrap().id, 0);
+        assert_eq!(file_schema.field("c").unwrap().id, 1);
+
+        // Seeds without a field id are matched through the file's schema.
+        assert!(super::seed_describes_field("0:4", &file_schema, "a", 0));
+        assert!(!super::seed_describes_field("0:4", &file_schema, "a", 1));
+        assert!(!super::seed_describes_field("0:4", &file_schema, "b", 0));
+        // Seeds with a field id are matched on it alone.
+        assert!(super::seed_describes_field("0:4:1", &file_schema, "a", 1));
+        assert!(!super::seed_describes_field("0:4:0", &file_schema, "a", 1));
+    }
+
     use super::*;
 
     use crate::index::DatasetIndexExt;

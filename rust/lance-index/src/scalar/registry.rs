@@ -330,6 +330,7 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
     async fn create_seed_writer(
         &self,
         _field_path: &str,
+        _field_id: i32,
         _data_type: &DataType,
         _index_details: &prost_types::Any,
     ) -> Result<Option<Box<dyn super::seed::IndexSeedWriter>>> {

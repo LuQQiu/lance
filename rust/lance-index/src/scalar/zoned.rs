@@ -156,11 +156,15 @@ where
                 self.processor
                     .process_chunk(&values.slice(batch_offset, take))?;
 
-                // Record exact row addresses for null values in this chunk.
+                // Record exact row addresses for null values in this chunk,
+                // with logical null semantics so `NullArray` rows and
+                // dictionary keys that point at a null value are included.
                 let chunk = values.slice(batch_offset, take);
-                if chunk.null_count() > 0 {
+                if let Some(nulls) = chunk.logical_nulls()
+                    && nulls.null_count() > 0
+                {
                     for i in 0..take {
-                        if values.is_null(batch_offset + i) {
+                        if nulls.is_null(i) {
                             null_rows.insert(row_addr_col.value(batch_offset + i));
                         }
                     }
