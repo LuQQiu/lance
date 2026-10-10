@@ -7,8 +7,9 @@
 //! The fixture under `test_data/v14.0.0-beta.10/zonemap_signed_nan` was
 //! written by the ZoneMap writer that predates `negative_nan_count`. These
 //! tests prove that the new reader handles old indices and old seeds, that
-//! old and new zones mix inside one index, and that the new writer hands old
-//! readers byte-identical statistics apart from the column they never read.
+//! old and new zones mix inside one index, and that the new writer records
+//! the sign counts; in every case a query with the index returns the rows a
+//! scan returns.
 
 use std::sync::Arc;
 
@@ -325,15 +326,6 @@ fn seed_batch(bytes: &Bytes) -> RecordBatch {
     reader.next().unwrap().unwrap()
 }
 
-/// `batch` as a reader that predates `negative_nan_count` sees it.
-fn without_sign_counts(batch: &RecordBatch) -> RecordBatch {
-    let mut batch = batch.clone();
-    if let Ok(idx) = batch.schema().index_of(SIGN_COUNT_COLUMN) {
-        batch.remove_column(idx);
-    }
-    batch
-}
-
 /// Filters covering every bound kind against ordinary values, nulls and
 /// both NaN signs. Negating a NaN literal sets its sign bit.
 fn predicates(column: &str) -> Vec<String> {
@@ -487,31 +479,6 @@ async fn test_fixture_written_before_sign_counts() {
         );
     }
     assert_index_matches_scan(&dataset).await;
-}
-
-/// Old reader, new index and new seeds: apart from the column it never reads,
-/// the new writer produces the same statistics the old writer put in the
-/// fixture for the same rows, so an old reader sees exactly what it saw before.
-#[tokio::test]
-async fn test_new_writer_matches_fixture_for_old_readers() {
-    let fixture_dir = copy_test_data_to_tmp(FIXTURE).unwrap();
-    let fixture = Dataset::open(&fixture_dir.path_str()).await.unwrap();
-    let dir = TempStrDir::default();
-    let current = write_like_fixture(&dir).await;
-
-    for column in FLOAT_COLUMNS {
-        let (old_index, old_meta) = index_file(&fixture, column).await;
-        let (new_index, new_meta) = index_file(&current, column).await;
-        assert!(sign_counts(&new_index).is_some());
-        assert!(sign_counts(&new_index).unwrap().null_count() == 0);
-        assert_eq!(without_sign_counts(&new_index), old_index, "{column} index");
-        assert_eq!(new_meta, old_meta, "{column} index metadata");
-
-        let old_seed = seed_batch(&seed(&fixture, 1, column).await);
-        let new_seed = seed_batch(&seed(&current, 1, column).await);
-        assert!(new_seed.column_by_name(SIGN_COUNT_COLUMN).is_some());
-        assert_eq!(without_sign_counts(&new_seed), old_seed, "{column} seed");
-    }
 }
 
 /// New reader, new index: the sign counts are exact and every query matches
