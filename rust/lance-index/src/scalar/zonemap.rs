@@ -1860,9 +1860,6 @@ impl ZoneMapSeedWriter {
     fn record_null_runs(&mut self, chunk: &ArrayRef, base_offset: u32) {
         let len = chunk.len() as u32;
         let Some(nulls) = chunk.nulls() else {
-            // Nulls without a validity buffer: every row is null.
-            self.null_offsets
-                .insert_range(base_offset..base_offset + len);
             return;
         };
         // The validity buffer marks valid rows; the gaps between its set runs
@@ -4203,6 +4200,12 @@ mod tests {
             let (_, bitmap) = ZoneMapSeedWriter::deserialize_seed(0, &bytes, 1000).unwrap();
             assert_eq!(bitmap, Some(expected.clone()));
         }
+
+        // No validity buffer means no nulls: the run scan records nothing.
+        let valid: ArrayRef = Arc::new(Int32Array::from_iter_values(0..10));
+        let mut writer = ZoneMapSeedWriter::new("c", 64, DataType::Int32).unwrap();
+        writer.record_null_runs(&valid, 0);
+        assert!(writer.null_offsets.is_empty());
     }
 
     #[tokio::test]
