@@ -394,6 +394,23 @@ impl FragmentColumnStatsIndex {
         Ok(excluded)
     }
 
+    /// Bench-only: the commit-prep merge: existing bucket records + a new
+    /// batch, sorted by fragment id with last-writer-wins dedup (the scrub).
+    #[doc(hidden)]
+    pub fn merge_for_bench(
+        existing: &FragmentColumnStatsIndex,
+        batch: &FragmentColumnStatsIndex,
+    ) -> FragmentColumnStatsIndex {
+        let mut records = existing.records.clone();
+        records.extend(batch.records.iter().cloned());
+        records.sort_by_key(|r| r.bound.fragment_id);
+        records.dedup_by_key(|r| r.bound.fragment_id);
+        FragmentColumnStatsIndex {
+            records,
+            data_type: existing.data_type.clone(),
+        }
+    }
+
     pub fn num_fragments(&self) -> usize {
         self.records.len()
     }

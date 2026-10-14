@@ -661,6 +661,80 @@ fn trunc_tier() {
     }
 }
 
+fn tier_w() {
+    use lance_index::scalar::fragstats::{
+        FragmentColumnStatsIndex, PackedFragmentStats, synthetic_for_bench,
+    };
+    use std::io::{Read, Write};
+
+    println!("\n== Tier W: inline bucket CoW mechanism cost (per touched bucket, per column) ==\n");
+    println!(
+        "| bucket span N | batch B | buckets/batch | read ms cold/hot | merge+scrub ms | write+sync ms | hot total ms | bucket bytes |"
+    );
+    println!("|---|---|---|---|---|---|---|---|");
+
+    let dir = std::env::temp_dir().join(format!("fragstats_tier_w_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    for n in [16_384u32, 65_536, 262_144] {
+        let object = synthetic_for_bench(n, 1_000_000, "i64");
+        let packed = PackedFragmentStats::try_from_index(&object).unwrap();
+        let bucket_bytes = packed.resident_bytes();
+        let payload = vec![7u8; bucket_bytes];
+        let bucket_path = dir.join(format!("bucket_{n}.bin"));
+        {
+            let mut f = std::fs::File::create(&bucket_path).unwrap();
+            f.write_all(&payload).unwrap();
+            f.sync_all().unwrap();
+        }
+
+        for b in [1_000u32, 100_000] {
+            let buckets_touched = b.div_ceil(n).max(1);
+            let cold_path = dir.join(format!("bucket_{n}_{b}_cold.bin"));
+            std::fs::copy(&bucket_path, &cold_path).unwrap();
+            let t = Instant::now();
+            let mut buf = Vec::with_capacity(bucket_bytes);
+            std::fs::File::open(&cold_path)
+                .unwrap()
+                .read_to_end(&mut buf)
+                .unwrap();
+            let cold_read_ms = t.elapsed().as_secs_f64() * 1000.0;
+            let t = Instant::now();
+            let mut buf2 = Vec::with_capacity(bucket_bytes);
+            std::fs::File::open(&cold_path)
+                .unwrap()
+                .read_to_end(&mut buf2)
+                .unwrap();
+            let hot_read_ms = t.elapsed().as_secs_f64() * 1000.0;
+            std::hint::black_box(&buf2);
+
+            let batch = synthetic_for_bench(b.min(n), 1_000_000, "i64");
+            let t = Instant::now();
+            let merged = FragmentColumnStatsIndex::merge_for_bench(&object, &batch);
+            let merge_ms = t.elapsed().as_secs_f64() * 1000.0;
+            std::hint::black_box(merged.num_fragments());
+
+            let out_path = dir.join(format!("bucket_{n}_{b}_new.bin"));
+            let t = Instant::now();
+            {
+                let mut f = std::fs::File::create(&out_path).unwrap();
+                f.write_all(&buf).unwrap();
+                f.sync_all().unwrap();
+            }
+            let write_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+            println!(
+                "| {n} | {b} | {buckets_touched} | {cold_read_ms:.1} / {hot_read_ms:.1} | {merge_ms:.1} | {write_ms:.1} | {:.1} | {bucket_bytes} |",
+                hot_read_ms + merge_ms + write_ms
+            );
+        }
+    }
+    println!(
+        "\nFile production: one replaced bucket file per touched bucket per commit per enabled column;\nreplaced files stay referenced by retained snapshots until cleanup (measure retained growth e2e)."
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[tokio::main]
 async fn main() {
     let rows = env_usize("ROWS", 1_000_000);
@@ -683,5 +757,8 @@ async fn main() {
     }
     if tier == "trunc" {
         trunc_tier();
+    }
+    if tier == "w" {
+        tier_w();
     }
 }
