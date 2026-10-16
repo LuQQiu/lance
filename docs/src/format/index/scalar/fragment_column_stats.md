@@ -1,14 +1,13 @@
 # Fragment Column Statistics Index
 
-This index stores one column summary per fragment. Readers can load these small
-summaries independently of zone-level statistics and use a filter to select
-candidate fragments before planning or executing scans and index searches.
+The fragment column statistics index stores min/max and null/NaN counts for a
+column in each summarized fragment, aggregated from available
+[zone write seeds](https://github.com/lance-format/lance/blob/main/docs/src/format/index/scalar/zone_write_seeds.md).
 
-It does not store row addresses or identify matching rows. A retained fragment
-still needs predicate evaluation. A reader may exclude a fragment only when its
-statistics prove no live row can match; missing, stale, or unsupported
-statistics always retain it, and an inexact candidate set must never be
-complemented to implement `NOT`.
+Fragment statistics and ZoneMap serve different levels. The smaller fragment
+statistics index supports query planning and narrows the fragments or index
+segments to search. ZoneMap stores more detailed per-zone information for finer
+pruning when reading specific fragments.
 
 ## Index metadata and storage
 
@@ -17,12 +16,12 @@ Each logical index covers one field, identified by `IndexMetadata.fields`.
 This proposal defines `IndexMetadata.index_version = 0`.
 
 Each segment has its own UUID and a `fragment_stats.lance` file in its index
-directory. A logical index may have multiple segments, each summarizing a
-different set of fragments. The manifest's `fragment_bitmap` identifies the
-fragments with usable summaries for that snapshot; it is not row-index coverage.
+directory. A logical index can have one or many segments, each summarizing a
+different set of fragments.
 
-The bitmap must be a subset of the fragments that hold records in the segment's
-file: claiming a fragment without a record would let a reader interpret "covered
+The manifest's `fragment_bitmap` identifies fragments with usable summaries.
+It must be a subset of the fragments that hold records in the segment's file:
+claiming a fragment without a record would let a reader interpret "covered
 but no candidate ranges" as "no matching rows" and silently drop results.
 Records outside the bitmap are ignored.
 
@@ -32,10 +31,6 @@ the commit must remove the fragment from the affected coverage bitmaps. A
 relevant column overlay newer than the segment's `dataset_version` also makes
 the summary unusable. Deletion-vector-only changes retain summaries, because
 the remaining rows are a subset of the summarized physical rows.
-
-Records are ordered by `fragment_id`, one record per fragment. Active segments
-of the same logical index must not claim overlapping fragments.
-
 ## File schema
 
 `value_type` below is the indexed column's Arrow type.
@@ -54,17 +49,7 @@ pa.schema([
 
 - `min` and `max` bound non-null, non-NaN values using Arrow Rust ordering.
   Bounds may be wider than the exact extrema, but must not exclude any such
-  value. Infinities are ordinary values; negative zero sorts before positive zero.
-  Widening includes deliberate truncation of long values: a writer may store a
-  shortened `min` (a prefix of the exact minimum) and a shortened `max` that is
-  strictly greater than every value the exact maximum bounds. Shortened bounds
-  must be valid values of the column's type: strings truncate on character
-  boundaries, and the upper bound is a valid successor (for example, the final
-  character replaced by its next code point, dropping trailing characters that
-  have none). The raw byte recipe (increment the final byte, dropping trailing
-  0xFF bytes) applies to binary values, not strings. When no valid shortened
-  upper bound exists, keep the exact bound or store a null bound. Truncation
-  lengths are an implementation choice.
+  value.
 - Null bounds mean that value bounds are unavailable, not that the fragment is
   empty. Types without supported bounds may still have exact counts.
 - `row_count` is the number of physical rows summarized, including deleted rows.
@@ -83,6 +68,3 @@ statistics, any unknown contributing sign split keeps the aggregate unknown.
 Readers must allow either NaN sign when the split is unknown and retain any
 fragment whose NaNs could match; missing sign information does not invalidate
 the whole record.
-
-This index has no zone offsets, zone lengths, or null-row bitmap. Counts describe
-the summarized physical data, not the number of live rows after deletions.
