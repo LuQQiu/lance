@@ -48,6 +48,7 @@ pa.schema([
     pa.field("row_count", pa.uint64(), nullable=False),
     pa.field("null_count", pa.uint64(), nullable=False),
     pa.field("nan_count", pa.uint64(), nullable=False),
+    pa.field("negative_nan_count", pa.uint64(), nullable=True),
 ])
 ```
 
@@ -70,6 +71,18 @@ pa.schema([
 - `null_count` counts nulls exactly in those physical rows.
 - `nan_count` counts all NaNs exactly; zero for non-floating types. NaNs do not
   appear in bounds: an extremum that is NaN is stored as a null bound.
+- `negative_nan_count` counts NaNs with the sign bit set. A null value means the
+  sign split is unknown, not zero. When known, it must not exceed `nan_count`;
+  the positive count is `nan_count - negative_nan_count`. Non-floating types
+  and records with `nan_count = 0` write zero.
+
+Version 1 zone write seeds provide exact sign counts, as defined in
+[Zone Write Seeds](https://github.com/lance-format/lance/pull/9564). Legacy seeds with nonzero `nan_count`
+but no sign information produce a null `negative_nan_count`. When combining
+statistics, any unknown contributing sign split keeps the aggregate unknown.
+Readers must allow either NaN sign when the split is unknown and retain any
+fragment whose NaNs could match; missing sign information does not invalidate
+the whole record.
 
 This index has no zone offsets, zone lengths, or null-row bitmap. Counts describe
 the summarized physical data, not the number of live rows after deletions.
