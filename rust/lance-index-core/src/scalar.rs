@@ -622,8 +622,6 @@ impl SearchOptions {
     }
 }
 
-/// A trait for a scalar index, a structure that can determine row ids that satisfy scalar queries
-#[async_trait]
 /// Planning-time whole-fragment exclusion proofs.
 ///
 /// An index advertising this capability can prove, from its stored summaries,
@@ -643,6 +641,8 @@ pub trait FragmentPruner: Send + Sync {
     fn excluded_fragments(&self, query: &dyn AnyQuery) -> Result<roaring::RoaringBitmap>;
 }
 
+/// A trait for a scalar index, a structure that can determine row ids that satisfy scalar queries
+#[async_trait]
 pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
     /// The fragment-pruning capability, when this index provides one.
     ///
