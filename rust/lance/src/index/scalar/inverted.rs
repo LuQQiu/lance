@@ -3,6 +3,9 @@
 
 #![allow(clippy::redundant_pub_crate)]
 
+#[cfg(test)]
+mod fts_finalize_bench;
+
 use std::{collections::BTreeMap, sync::Arc};
 
 use arrow_array::cast::AsArray;
