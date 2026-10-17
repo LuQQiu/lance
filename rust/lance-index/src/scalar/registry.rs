@@ -332,6 +332,14 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
     /// When false the caller can skip opening data files to look for seeds
     /// entirely, avoiding I/O for index types or configurations that never
     /// write seeds.
+    /// True when indices of this type may expose the
+    /// [`FragmentPruner`](crate::scalar::FragmentPruner) capability (cheap,
+    /// no I/O). Planning uses this to decide which index segments are worth
+    /// opening for fragment pruning.
+    fn supports_fragment_pruning(&self, _index_details: &prost_types::Any) -> bool {
+        false
+    }
+
     fn might_use_seeds(&self, _index_details: &prost_types::Any) -> bool {
         false
     }

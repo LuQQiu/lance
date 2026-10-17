@@ -20,6 +20,36 @@
 use crate::format::IndexMetadata;
 use crate::transaction::TaggedRewriteAssembly;
 use std::sync::Arc;
+use uuid::Uuid;
+
+/// Index-segment replacements derived by a registered maintenance hook for
+/// one commit attempt (see the `lance` crate's commit index maintenance).
+///
+/// Best-effort by contract: the manifest build validates the update against
+/// what the attempt actually commits and drops it with a warning on any
+/// mismatch; it never fails a data commit. Hooks are re-invoked per attempt,
+/// so values never carry across retries.
+#[derive(Debug, Clone, Default)]
+pub struct DerivedIndexUpdate {
+    /// Segments this update supersedes; they leave the index list when the
+    /// update applies.
+    pub replaced_uuids: Vec<Uuid>,
+    /// Replacement segments. Each must have a fresh UUID and claim, via its
+    /// fragment bitmap, only fragments this commit creates or coverage the
+    /// replaced segments already claimed.
+    pub new_segments: Vec<IndexMetadata>,
+}
+
+impl DerivedIndexUpdate {
+    pub fn is_empty(&self) -> bool {
+        self.replaced_uuids.is_empty() && self.new_segments.is_empty()
+    }
+
+    pub fn merge(&mut self, other: Self) {
+        self.replaced_uuids.extend(other.replaced_uuids);
+        self.new_segments.extend(other.new_segments);
+    }
+}
 
 /// What the commit path settled about the fragment reuse entry for one
 /// attempt. In-memory only, like the rewrite intent it carries.
@@ -55,6 +85,7 @@ pub struct PreparedIndices {
     original: Vec<IndexMetadata>,
     prepared: Vec<IndexMetadata>,
     frag_reuse: FragReuseUpdate,
+    derived: DerivedIndexUpdate,
 }
 
 impl PreparedIndices {
@@ -69,7 +100,14 @@ impl PreparedIndices {
             original,
             prepared,
             frag_reuse,
+            derived: DerivedIndexUpdate::default(),
         }
+    }
+
+    /// Attach index-segment replacements derived for this attempt.
+    pub fn with_derived_update(mut self, derived: DerivedIndexUpdate) -> Self {
+        self.derived = derived;
+        self
     }
 
     /// The version of the manifest the lists were prepared against; `None`
@@ -94,7 +132,14 @@ impl PreparedIndices {
         &self.frag_reuse
     }
 
-    pub(crate) fn into_parts(self) -> (Vec<IndexMetadata>, Vec<IndexMetadata>, FragReuseUpdate) {
-        (self.original, self.prepared, self.frag_reuse)
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        Vec<IndexMetadata>,
+        Vec<IndexMetadata>,
+        FragReuseUpdate,
+        DerivedIndexUpdate,
+    ) {
+        (self.original, self.prepared, self.frag_reuse, self.derived)
     }
 }

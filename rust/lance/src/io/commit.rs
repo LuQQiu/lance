@@ -1503,13 +1503,54 @@ async fn prepare_attempt(
     } else {
         None
     };
-    transaction.prepare_indices(
+    let prepared = transaction.prepare_indices(
         Some(dataset.manifest.as_ref()),
         indices.as_ref().clone(),
         build_config,
         ledger,
         frag_reuse,
-    )
+    )?;
+
+    // Commit-time derived-index maintenance: registered hooks derive index
+    // segment replacements for this attempt's new fragments. Best effort: a
+    // hook failure costs index coverage, never the data commit, and the
+    // manifest build validates whatever is attached here.
+    let hooks = crate::index::maintenance::commit_index_maintenance_hooks();
+    if hooks.is_empty() {
+        return Ok(prepared);
+    }
+    let new_fragments: &[lance_table::format::Fragment] = match &transaction.operation {
+        Operation::Append { fragments, .. } => fragments,
+        Operation::Update { new_fragments, .. } => new_fragments,
+        _ => &[],
+    };
+    if new_fragments.is_empty() {
+        return Ok(prepared);
+    }
+    let new_fragments_with_ids: Vec<(u64, lance_table::format::Fragment)> =
+        lance_table::transaction::Transaction::prospective_fragment_ids(
+            dataset.manifest.max_fragment_id(),
+            new_fragments.iter(),
+        )
+        .into_iter()
+        .map(|(id, fragment)| (id, fragment.clone()))
+        .collect();
+    let mut derived = lance_table::transaction::DerivedIndexUpdate::default();
+    for hook in hooks {
+        if !hook.applies_to(&transaction.operation) {
+            continue;
+        }
+        match hook
+            .derive(dataset, transaction, &new_fragments_with_ids)
+            .await
+        {
+            Ok(update) => derived.merge(update),
+            Err(err) => {
+                log::warn!("commit index maintenance hook failed; skipping: {err}");
+            }
+        }
+    }
+    Ok(prepared.with_derived_update(derived))
 }
 
 async fn load_and_sort_new_transactions(

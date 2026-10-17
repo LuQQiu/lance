@@ -1183,6 +1183,15 @@ pub struct Scanner {
     /// to handle this better in the future as well)
     use_scalar_index: bool,
 
+    /// If true (default), consult indices advertising the fragment-pruning
+    /// capability to exclude whole fragments at planning time. Fragments
+    /// without usable index records are never excluded.
+    use_index_fragment_pruning: bool,
+
+    /// Fragments excluded by index fragment pruning, resolved once per plan
+    /// in `create_plan_impl` and read by every consumer.
+    index_pruned_cache: std::sync::OnceLock<RoaringBitmap>,
+
     /// Whether to use statistics to optimize the scan (default: true)
     ///
     /// This is used for debugging or benchmarking purposes.
@@ -1458,6 +1467,8 @@ impl Scanner {
             index_segments: None,
             fast_search: false,
             use_scalar_index: true,
+            use_index_fragment_pruning: true,
+            index_pruned_cache: std::sync::OnceLock::new(),
             include_deleted_rows: false,
             scan_stats_callback: None,
             strict_batch_size: false,
@@ -1704,6 +1715,7 @@ impl Scanner {
     ///
     pub fn filter(&mut self, filter: &str) -> Result<&mut Self> {
         self.filter.expr_filter = Some(ExprFilter::Sql(filter.to_string()));
+        self.index_pruned_cache = std::sync::OnceLock::new();
         Ok(self)
     }
 
@@ -1770,11 +1782,13 @@ impl Scanner {
     /// must be a scalar expression whose return type is boolean.
     pub fn filter_substrait(&mut self, filter: &[u8]) -> Result<&mut Self> {
         self.filter.expr_filter = Some(ExprFilter::Substrait(filter.to_vec()));
+        self.index_pruned_cache = std::sync::OnceLock::new();
         Ok(self)
     }
 
     pub fn filter_expr(&mut self, filter: Expr) -> &mut Self {
         self.filter.expr_filter = Some(ExprFilter::Datafusion(filter));
+        self.index_pruned_cache = std::sync::OnceLock::new();
         self
     }
 
@@ -1930,6 +1944,24 @@ impl Scanner {
     pub fn use_scalar_index(&mut self, use_scalar_index: bool) -> &mut Self {
         self.use_scalar_index = use_scalar_index;
         self
+    }
+
+    /// Set whether to use index-held fragment pruning at planning time
+    /// (default: true).
+    ///
+    /// Disable to compare plans with and without pruning.
+    pub fn use_index_fragment_pruning(&mut self, use_index_fragment_pruning: bool) -> &mut Self {
+        self.use_index_fragment_pruning = use_index_fragment_pruning;
+        self.index_pruned_cache = std::sync::OnceLock::new();
+        self
+    }
+
+    /// Fragments excluded by index fragment pruning for the current plan,
+    /// resolved once in `create_plan_impl`. `None` when nothing is excludable.
+    fn index_pruned(&self) -> Option<&RoaringBitmap> {
+        self.index_pruned_cache
+            .get()
+            .filter(|bitmap| !bitmap.is_empty())
     }
 
     /// Set whether to use strict batch size.
@@ -3294,6 +3326,23 @@ impl Scanner {
             .create_filter_plan(use_scalar_index, query_filter, fts_document_granularity)
             .await?;
 
+        // Resolve the index-pruned fragment scope once per plan. Subtractive
+        // and conservative: fragments without valid index records can never
+        // appear in the excluded set.
+        if self.use_index_fragment_pruning
+            && let Some(full_expr) = filter_plan.expr_filter_plan.full_expr.as_ref()
+        {
+            let excluded = crate::dataset::fragment_pruning::index_pruned_fragments(
+                self.dataset.as_ref(),
+                full_expr,
+            )
+            .await?;
+            // Deterministic in (dataset, filter): every setter that changes
+            // either resets the cell, so a kept first value is always the
+            // value this plan would compute.
+            let _ = self.index_pruned_cache.set(excluded);
+        }
+
         let mut use_limit_node = true;
         // Source: either a (K|A)NN search, full text search, or a (full|indexed) scan
         let mut plan: Arc<dyn ExecutionPlan> = match (
@@ -3658,6 +3707,23 @@ impl Scanner {
 
         if let Some(fragments) = fragments {
             read_options = read_options.with_fragments(fragments);
+        }
+
+        // Index-pruned fragment scope: planning-time exclusion of whole
+        // fragments from index-held summaries. Subtractive and conservative;
+        // the narrowed fragment list also feeds the scalar-index fragment
+        // scope below, so excluded fragments cost no index I/O either.
+        if let Some(excluded) = self.index_pruned() {
+            let base = read_options
+                .fragments
+                .clone()
+                .unwrap_or_else(|| self.dataset.fragments().clone());
+            let retained: Vec<Fragment> = base
+                .iter()
+                .filter(|fragment| !excluded.contains(fragment.id as u32))
+                .cloned()
+                .collect();
+            read_options = read_options.with_fragments(Arc::new(retained));
         }
 
         if let Some(scan_range) = scan_range {
@@ -6522,17 +6588,19 @@ impl Scanner {
     ) -> Result<Vec<Fragment>> {
         if let Some(target_fragments) = &self.fragments {
             let indexed_fragments = self.get_indexed_frags(index_segments);
-            Ok(target_fragments
-                .iter()
-                .filter(|fragment| !indexed_fragments.contains(fragment.id as u32))
-                .cloned()
-                .collect())
+            Ok(self.retain_target_fragments(
+                target_fragments
+                    .iter()
+                    .filter(|fragment| !indexed_fragments.contains(fragment.id as u32))
+                    .cloned()
+                    .collect(),
+            ))
         } else if self.index_segments.is_some() {
             // An explicit segment selection with no fragment restriction searches
             // exactly those segments; there is nothing to fall back for.
             Ok(Vec::new())
         } else {
-            self.dataset.unindexed_fragments(index_name).await
+            Ok(self.retain_target_fragments(self.dataset.unindexed_fragments(index_name).await?))
         }
     }
 
@@ -7599,38 +7667,45 @@ impl Scanner {
     }
 
     fn get_fragments_as_bitmap(&self) -> RoaringBitmap {
-        if let Some(fragments) = &self.fragments {
+        let mut bitmap = if let Some(fragments) = &self.fragments {
             RoaringBitmap::from_iter(fragments.iter().map(|f| f.id as u32))
         } else {
             self.dataset.fragment_bitmap.as_ref().clone()
+        };
+        if let Some(excluded) = self.index_pruned() {
+            bitmap -= excluded;
         }
+        bitmap
     }
 
     fn retain_relevant_index_segments(
         &self,
         index_segments: Vec<IndexMetadata>,
     ) -> Vec<IndexMetadata> {
-        if let Some(fragments) = &self.fragments {
-            let target_fragments = RoaringBitmap::from_iter(fragments.iter().map(|f| f.id as u32));
-            index_segments
-                .into_iter()
-                .filter(|idx| {
-                    idx.fragment_bitmap
-                        .as_ref()
-                        .is_some_and(|fragmap| !(fragmap & &target_fragments).is_empty())
-                })
-                .collect()
-        } else {
-            index_segments
+        if self.fragments.is_none() && self.index_pruned().is_none() {
+            return index_segments;
         }
+        let target_fragments = self.get_fragments_as_bitmap();
+        index_segments
+            .into_iter()
+            .filter(|idx| {
+                idx.fragment_bitmap
+                    .as_ref()
+                    .is_some_and(|fragmap| !(fragmap & &target_fragments).is_empty())
+            })
+            .collect()
     }
 
-    /// Retain only fragments that are in the user-specified fragment list.
-    /// If no fragment list is specified, returns the fragments unchanged.
+    /// Retain only fragments that are in the user-specified fragment list and
+    /// not excluded by index fragment pruning.
+    /// With no restrictions, returns the fragments unchanged.
     fn retain_target_fragments(&self, mut fragments: Vec<Fragment>) -> Vec<Fragment> {
         if let Some(target) = &self.fragments {
             let bitmap = RoaringBitmap::from_iter(target.iter().map(|f| f.id as u32));
             fragments.retain(|f| bitmap.contains(f.id as u32));
+        }
+        if let Some(excluded) = self.index_pruned() {
+            fragments.retain(|f| !excluded.contains(f.id as u32));
         }
         fragments
     }

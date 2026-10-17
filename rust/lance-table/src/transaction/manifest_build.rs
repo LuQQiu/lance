@@ -123,6 +123,30 @@ fn apply_range_segments(
 }
 
 impl Transaction {
+    /// The ids [`Self::fragments_with_ids`] will assign to `new_fragments`
+    /// in a build whose manifest currently tops out at `max_fragment_id`
+    /// (id 0 is the unassigned sentinel; any other id is kept). The two
+    /// functions implement the SAME rule; commit-time hooks use this one to
+    /// know the final ids before the build runs. A unit test pins agreement.
+    pub fn prospective_fragment_ids<'a>(
+        max_fragment_id: Option<u64>,
+        new_fragments: impl IntoIterator<Item = &'a Fragment>,
+    ) -> Vec<(u64, &'a Fragment)> {
+        let mut next = max_fragment_id.map(|id| id + 1).unwrap_or(0);
+        new_fragments
+            .into_iter()
+            .map(|f| {
+                if f.id == 0 {
+                    let id = next;
+                    next += 1;
+                    (id, f)
+                } else {
+                    (f.id, f)
+                }
+            })
+            .collect()
+    }
+
     pub(super) fn fragments_with_ids<'a, T>(
         new_fragments: T,
         fragment_id: &'a mut u64,
@@ -608,7 +632,8 @@ impl Transaction {
             prepared.frag_reuse_update(),
             config.migration_next_row_id,
         )?;
-        let (original_indices, prepared_indices, frag_reuse) = prepared.into_parts();
+        let (original_indices, prepared_indices, frag_reuse, derived_update) =
+            prepared.into_parts();
         if config.use_stable_row_ids
             && config.migration_next_row_id.is_none()
             && current_manifest
@@ -696,6 +721,9 @@ impl Transaction {
             .and_then(|m| m.max_fragment_id())
             .map(|id| id + 1)
             .unwrap_or(0);
+        // Everything at or past this id is a fragment THIS build creates;
+        // the derived-index splice below validates claims against the range.
+        let first_assignable_fragment_id = fragment_id;
         let mut final_fragments = Vec::new();
         let mut final_indices = prepared_indices;
 
@@ -1601,6 +1629,48 @@ impl Transaction {
             (None, Some(false)) => Some(ConcreteFileVersion::V2_0),
             (None, None) => None,
         };
+
+        // Derived-index maintenance: apply hook-produced segment replacements,
+        // validated against what this attempt actually commits. Best effort:
+        // any mismatch drops the whole update with a warning and the data
+        // commit proceeds (the affected fragments simply stay uncovered).
+        if !derived_update.is_empty() {
+            let replaced: HashSet<uuid::Uuid> =
+                derived_update.replaced_uuids.iter().copied().collect();
+            let mut allowed = RoaringBitmap::new();
+            for index in final_indices.iter() {
+                if replaced.contains(&index.uuid)
+                    && let Some(bitmap) = index.fragment_bitmap.as_ref()
+                {
+                    allowed |= bitmap;
+                }
+            }
+            if first_assignable_fragment_id <= u64::from(u32::MAX) {
+                let end = fragment_id.min(u64::from(u32::MAX) + 1);
+                if first_assignable_fragment_id < end {
+                    allowed
+                        .insert_range(first_assignable_fragment_id as u32..end as u32);
+                }
+            }
+            let existing_uuids: HashSet<uuid::Uuid> =
+                final_indices.iter().map(|index| index.uuid).collect();
+            let valid = derived_update.new_segments.iter().all(|segment| {
+                !existing_uuids.contains(&segment.uuid)
+                    && segment
+                        .fragment_bitmap
+                        .as_ref()
+                        .is_some_and(|bitmap| bitmap.is_subset(&allowed))
+            });
+            if valid {
+                final_indices.retain(|index| !replaced.contains(&index.uuid));
+                final_indices.extend(derived_update.new_segments);
+            } else {
+                log::warn!(
+                    "dropping derived index update: a new segment claims coverage \
+                     outside this commit's new fragments and the replaced segments"
+                );
+            }
+        }
 
         // Applied once the final index list is known, so it sees exactly the
         // indices this commit publishes rather than what any one operation arm

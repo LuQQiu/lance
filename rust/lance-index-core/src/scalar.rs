@@ -624,7 +624,34 @@ impl SearchOptions {
 
 /// A trait for a scalar index, a structure that can determine row ids that satisfy scalar queries
 #[async_trait]
+/// Planning-time whole-fragment exclusion proofs.
+///
+/// An index advertising this capability can prove, from its stored summaries,
+/// that certain fragments contain no row matching a query. The result is an
+/// inexact filter in the safe direction: a fragment may be retained
+/// needlessly, but a fragment in the excluded set provably has no match.
+/// The engine composes exclusions (intersecting them with each segment's
+/// committed coverage and subtracting staleness) and never complements them.
+pub trait FragmentPruner: Send + Sync {
+    /// Fragments for which this index holds a usable record.
+    fn covered_fragments(&self) -> roaring::RoaringBitmap;
+
+    /// Fragments provably containing no row matching `query`.
+    ///
+    /// Unsupported query shapes must return an empty bitmap or an error,
+    /// never a guess.
+    fn excluded_fragments(&self, query: &dyn AnyQuery) -> Result<roaring::RoaringBitmap>;
+}
+
 pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
+    /// The fragment-pruning capability, when this index provides one.
+    ///
+    /// Planning consults this to narrow fragment candidate sets; `None` (the
+    /// default) means the index only answers row queries through `search`.
+    fn as_fragment_pruner(&self) -> Option<&dyn FragmentPruner> {
+        None
+    }
+
     /// Search the scalar index
     ///
     /// Returns all row ids that satisfy the query, these row ids are not necessarily ordered

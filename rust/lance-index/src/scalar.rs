@@ -28,6 +28,7 @@ pub use lance_index_core::remapping::{
     BatchRowIdRemapper, LEGACY_TRAFFIC_ONLY, check_batch_remapping_entry,
 };
 pub use lance_index_core::scalar::{
+    FragmentPruner,
     AnyQuery, BuiltinIndexType, CreatedIndex, IndexFile, IndexReader, IndexStore, IndexWriter,
     LANCE_SCALAR_INDEX, OldIndexDataFilter, RowIdRemapper, ScalarIndex, ScalarIndexParams,
     SearchOptions, SearchResult, TrainingCriteria, TrainingOrdering, UpdateCriteria,
