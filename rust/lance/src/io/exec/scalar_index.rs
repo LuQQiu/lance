@@ -196,9 +196,31 @@ impl ScalarIndexExec {
     ///
     /// This does not restrict the result mask. The consumer remains responsible for applying
     /// the exact fragment scope, deletion mask, and any required data-level recheck.
-    pub(crate) fn with_fragment_scope(mut self, fragments: RoaringBitmap) -> Self {
+    ///
+    /// ```
+    /// # use lance::io::exec::scalar_index::ScalarIndexExec;
+    /// # fn scoped(exec: ScalarIndexExec) -> ScalarIndexExec {
+    /// exec.with_fragment_scope([1, 2].into_iter().collect())
+    /// # }
+    /// ```
+    pub fn with_fragment_scope(mut self, fragments: RoaringBitmap) -> Self {
         self.fragment_scope = Some(Arc::new(fragments));
         self
+    }
+
+    /// The fragment restriction used to select physical index segments.
+    ///
+    /// `None` means unrestricted; `Some` with an empty bitmap selects nothing.
+    /// Preserve this restriction when reconstructing or serializing the node.
+    ///
+    /// ```
+    /// # use lance::io::exec::scalar_index::ScalarIndexExec;
+    /// # fn inspect(exec: &ScalarIndexExec) {
+    /// let fragments = exec.fragment_scope();
+    /// # }
+    /// ```
+    pub fn fragment_scope(&self) -> Option<&RoaringBitmap> {
+        self.fragment_scope.as_deref()
     }
 
     pub fn dataset(&self) -> &Arc<Dataset> {
