@@ -283,9 +283,40 @@ pub(crate) async fn load_fts_training_data(
     }
 }
 
-// TODO: Allow users to register their own plugins
+/// Set once the process-global registry below has been built; external plugin
+/// registration after that point cannot take effect there.
+static SCALAR_INDEX_PLUGIN_REGISTRY_BUILT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub(crate) static SCALAR_INDEX_PLUGIN_REGISTRY: LazyLock<Arc<IndexPluginRegistry>> =
-    LazyLock::new(IndexPluginRegistry::with_default_plugins);
+    LazyLock::new(|| {
+        SCALAR_INDEX_PLUGIN_REGISTRY_BUILT.store(true, std::sync::atomic::Ordering::Release);
+        IndexPluginRegistry::with_default_plugins()
+    });
+
+/// Register an external scalar index plugin for this process.
+///
+/// Must run at startup: the dataset paths resolve plugins through a
+/// process-global registry built on first use, and this call fails once that
+/// registry exists. The plugin then participates everywhere a builtin does:
+/// creation by name (`ScalarIndexParams::new`), opening by the details type
+/// URL, write-time seed collection, and index maintenance.
+///
+/// Indices of external types must always store their details message in the
+/// manifest; nothing is inferred from index files for unknown types.
+pub fn register_scalar_index_plugin<
+    DetailsType: prost::Message + prost::Name,
+    PluginType: lance_index::scalar::registry::ScalarIndexPlugin + Default + 'static,
+>() -> Result<()> {
+    if SCALAR_INDEX_PLUGIN_REGISTRY_BUILT.load(std::sync::atomic::Ordering::Acquire) {
+        return Err(Error::invalid_input(
+            "scalar index plugins must be registered at startup, before the first dataset \
+             operation builds the plugin registry",
+        ));
+    }
+    lance_index::registry::register_external_scalar_index_plugin::<DetailsType, PluginType>();
+    Ok(())
+}
 
 pub struct IndexDetails(pub Arc<prost_types::Any>);
 

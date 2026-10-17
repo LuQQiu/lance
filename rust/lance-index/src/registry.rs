@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 use std::{
     collections::{HashMap, HashSet},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use lance_core::{Error, Result};
@@ -22,6 +22,36 @@ use crate::{
 /// Scalar detail package emitted by Lance 0.36 before the messages moved back
 /// to `lance.table` for forward compatibility.
 const V036_SCALAR_DETAILS_PACKAGE: &str = "lance.index.pb";
+
+/// Registrations contributed by external crates, applied to every registry
+/// built by [`IndexPluginRegistry::with_default_plugins`].
+static EXTERNAL_PLUGINS: Mutex<Vec<Box<dyn Fn(&mut IndexPluginRegistry) + Send + Sync>>> =
+    Mutex::new(Vec::new());
+
+/// Register a scalar index plugin provided by an external crate.
+///
+/// The plugin joins every registry subsequently built by
+/// [`IndexPluginRegistry::with_default_plugins`], which includes the
+/// process-global registry the dataset paths consult. Registration must
+/// therefore happen at process startup, before any dataset operation; hosts
+/// that need to enforce this can check whether the global registry was already
+/// built (see the `lance` crate's registration entry point).
+///
+/// The plugin name and the recognized details type derive from `DetailsType`
+/// exactly as in [`IndexPluginRegistry::add_plugin`]. An index created by an
+/// external plugin must always carry its details message in the manifest:
+/// unlike builtin types, nothing can be inferred from index files alone.
+pub fn register_external_scalar_index_plugin<
+    DetailsType: prost::Message + prost::Name,
+    PluginType: ScalarIndexPlugin + std::default::Default + 'static,
+>() {
+    EXTERNAL_PLUGINS
+        .lock()
+        .expect("external plugin registration lock poisoned")
+        .push(Box::new(|registry| {
+            registry.add_plugin::<DetailsType, PluginType>();
+        }));
+}
 
 /// Derive the scalar index plugin name from a details type URL.
 ///
@@ -123,6 +153,14 @@ impl IndexPluginRegistry {
         registry.add_details_type_alias::<pbold::NGramIndexDetails>(V036_SCALAR_DETAILS_PACKAGE);
         registry.add_details_type_alias::<pbold::ZoneMapIndexDetails>(V036_SCALAR_DETAILS_PACKAGE);
         registry.add_details_type_alias::<pbold::InvertedIndexDetails>(V036_SCALAR_DETAILS_PACKAGE);
+
+        for register in EXTERNAL_PLUGINS
+            .lock()
+            .expect("external plugin registration lock poisoned")
+            .iter()
+        {
+            register(&mut registry);
+        }
 
         let registry = Arc::new(registry);
         for plugin in registry.plugins.values() {

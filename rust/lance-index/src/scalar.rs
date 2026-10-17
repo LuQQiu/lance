@@ -51,6 +51,19 @@ pub mod seed;
 pub mod zoned;
 pub mod zonemap;
 
+/// Shared summary-statistics substrate: the per-zone statistics record, its
+/// accumulator, and the single pruning-semantics evaluation used by every
+/// summary-based index (builtin or external). Indexes that aggregate zone
+/// statistics into coarser summaries evaluate them through this module so the
+/// comparison semantics cannot drift between index types.
+pub mod summary {
+    pub use super::zoned::{ZoneBound, ZoneProcessor, ZoneTrainer};
+    pub use super::zonemap::{
+        ZoneMapProcessor, ZoneMapStatistics, evaluate_summary_against_query,
+        summary_scalar_is_nan,
+    };
+}
+
 pub use inverted::tokenizer::InvertedIndexParams;
 
 /// Convert a `Vec<`[`lance_index_core::scalar::IndexFile`]`>` to a
