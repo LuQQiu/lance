@@ -26,6 +26,7 @@ use lance_index::{
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
 use lance_select::{RowAddrTreeMap, RowSetOps};
+use lance_table::format::overlay::staleness::field_affects_index;
 use lance_table::format::{Fragment, IndexMetadata};
 use prost::Message;
 use roaring::RoaringBitmap;
@@ -384,34 +385,59 @@ pub async fn build_per_segment_filters(
     Ok((effective_union, filters))
 }
 
-/// Attempt to read seed buffers for `index` from `fragments`' data files.
-///
-/// Returns `Some(vec)` only if every fragment has a seed entry whose field
-/// identity can be verified; returns `None` if a seed is missing, its file
-/// cannot be opened, or its physical column mapping cannot be verified.
-/// Index-type-specific validation (e.g. `rows_per_zone` checks) is left to the
-/// caller via [`FragmentSeed::metadata_value`].
-async fn try_harvest_seeds(
-    dataset: &Dataset,
-    fragments: &[Fragment],
-    index: &IndexMetadata,
-) -> Result<Option<Vec<FragmentSeed>>> {
-    if fragments.is_empty() {
-        return Ok(Some(Vec::new()));
+/// Reads one column's write seeds from fragments' current data files.
+pub struct SeedHarvester<'a> {
+    dataset: &'a Dataset,
+    field: &'a lance_core::datatypes::Field,
+    schedulers: HashMap<Option<u32>, Arc<ScanScheduler>>,
+}
+
+impl<'a> SeedHarvester<'a> {
+    /// A harvester for the top-level field with `field_id`. `SeedCollector`
+    /// writes seeds only for top-level fields, and a nested leaf can share
+    /// its name with a different, seeded top-level column, so any other
+    /// field has no seeds to read.
+    pub fn for_field_id(dataset: &'a Dataset, field_id: i32) -> Option<Self> {
+        let field = dataset.schema().fields.iter().find(|f| f.id == field_id)?;
+        Some(Self {
+            dataset,
+            field,
+            schedulers: HashMap::new(),
+        })
     }
 
-    // SeedCollector writes seeds only for top-level keyed fields. A nested
-    // leaf can share its name with a different, seeded top-level column.
-    let Some(field_id) = index.keyed_field() else {
-        return Ok(None);
-    };
-    let Some(field) = dataset.schema().fields.iter().find(|f| f.id == field_id) else {
-        return Ok(None);
-    };
-    let mut seeds = Vec::with_capacity(fragments.len());
-    let mut schedulers = HashMap::new();
+    /// A harvester for the top-level column named `column`.
+    pub fn for_column(dataset: &'a Dataset, column: &str) -> Option<Self> {
+        let field = dataset.schema().fields.iter().find(|f| f.name == column)?;
+        Some(Self {
+            dataset,
+            field,
+            schedulers: HashMap::new(),
+        })
+    }
 
-    for fragment in fragments {
+    /// The seed `fragment`'s current data file stores for the column.
+    ///
+    /// `None` if the fragment has no seed entry, its file cannot be opened,
+    /// or the seed's field identity cannot be verified. Index-type-specific
+    /// validation (e.g. `rows_per_zone` checks) is left to the caller via
+    /// [`FragmentSeed::metadata_value`].
+    pub async fn harvest(&mut self, fragment: &Fragment) -> Result<Option<FragmentSeed>> {
+        let dataset = self.dataset;
+        let field = self.field;
+        // An overlay on the column (or a field it contains or is nested in)
+        // changes values the base file's seed never saw, so that seed is no
+        // bound on the fragment's current values.
+        let indexed = [field.id];
+        if fragment.overlays.iter().any(|overlay| {
+            overlay
+                .data_file
+                .fields
+                .iter()
+                .any(|field_id| field_affects_index(*field_id, &indexed, dataset.schema()))
+        }) {
+            return Ok(None);
+        }
         // A column replacement can retain an older file for other columns.
         // Its seed still describes the old values, even after the manifest
         // stops mapping this column to that file.
@@ -426,7 +452,7 @@ async fn try_harvest_seeds(
         let path = dataset
             .data_file_dir(data_file)?
             .join(data_file.path.as_str());
-        let scheduler = match schedulers.entry(data_file.base_id) {
+        let scheduler = match self.schedulers.entry(data_file.base_id) {
             Entry::Occupied(entry) => entry.into_mut(),
             Entry::Vacant(entry) => {
                 let store = dataset.object_store(data_file.base_id).await?;
@@ -501,13 +527,40 @@ async fn try_harvest_seeds(
             return Ok(None);
         };
 
-        seeds.push(FragmentSeed {
+        Ok(Some(FragmentSeed {
             fragment_id: fragment.id,
             bytes,
             metadata_value: meta_value,
-        });
+        }))
     }
+}
 
+/// Attempt to read seed buffers for `index` from `fragments`' data files.
+///
+/// Returns `Some(vec)` only if every fragment has a seed entry whose field
+/// identity can be verified; returns `None` if a seed is missing, its file
+/// cannot be opened, or its physical column mapping cannot be verified.
+async fn try_harvest_seeds(
+    dataset: &Dataset,
+    fragments: &[Fragment],
+    index: &IndexMetadata,
+) -> Result<Option<Vec<FragmentSeed>>> {
+    if fragments.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+    let Some(field_id) = index.keyed_field() else {
+        return Ok(None);
+    };
+    let Some(mut harvester) = SeedHarvester::for_field_id(dataset, field_id) else {
+        return Ok(None);
+    };
+    let mut seeds = Vec::with_capacity(fragments.len());
+    for fragment in fragments {
+        let Some(seed) = harvester.harvest(fragment).await? else {
+            return Ok(None);
+        };
+        seeds.push(seed);
+    }
     Ok(Some(seeds))
 }
 
@@ -821,7 +874,22 @@ async fn merge_scalar_indices<'a>(
         let plugin = details.get_plugin()?;
         // Only open data files looking for seeds when the plugin confirms this
         // index type and configuration can actually produce them.
-        let maybe_created = if plugin.might_use_seeds(&index_details) {
+        let maybe_created = if !plugin.might_use_seeds(&index_details) {
+            None
+        } else if index_type == IndexType::ZoneMap {
+            // Zone maps reuse the seeds of the fragments that have one and
+            // scan only the rest, in one segment write.
+            crate::index::scalar::zonemap::update_segment_with_seeds(
+                dataset.as_ref(),
+                &reference_index,
+                reference_idx,
+                field_path,
+                unindexed,
+                &update_criteria.data_criteria,
+                &new_store,
+            )
+            .await?
+        } else {
             if let Some(seeds) =
                 try_harvest_seeds(dataset.as_ref(), unindexed, reference_idx).await?
             {
@@ -831,8 +899,6 @@ async fn merge_scalar_indices<'a>(
             } else {
                 None
             }
-        } else {
-            None
         };
 
         let created_index = if let Some(created) = maybe_created {

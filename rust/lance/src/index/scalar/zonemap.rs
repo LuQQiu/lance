@@ -1,16 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
+use arrow_schema::DataType;
+use itertools::Itertools;
 use lance_index::metrics::NoOpMetricsCollector;
-use lance_index::scalar::index_files_to_table;
 use lance_index::scalar::lance_format::LanceIndexStore;
-use lance_index::scalar::zonemap::ZoneMapIndex;
-use lance_table::format::IndexMetadata;
+use lance_index::scalar::zonemap::{
+    HarvestedZoneSeed, ZoneMapIndex, ZoneMapIndexBuilderParams, ZoneMapSegmentBase,
+    build_zonemap_segment, reuse_zone_seeds,
+};
+use lance_index::scalar::{
+    CreatedIndex, IndexStore, ScalarIndex, TrainingCriteria, index_files_to_table,
+};
+use lance_table::format::{Fragment, IndexMetadata};
 use roaring::RoaringBitmap;
 use uuid::Uuid;
 
+use crate::index::append::SeedHarvester;
+use crate::index::scalar::load_training_data;
 use crate::{Dataset, Error, Result, dataset::index::LanceIndexStoreExt};
 
 /// Merge one caller-defined group of source ZoneMap segments into a single segment.
@@ -91,4 +101,173 @@ pub(in crate::index) async fn merge_segments(
         files: Some(index_files_to_table(created_index.files)),
         ..segments[0].clone()
     })
+}
+
+/// What a seed-aware segment build reused and scanned, recorded for tests.
+#[cfg(test)]
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SeedReuseReport {
+    pub reused_fragments: Vec<u64>,
+    pub reused_records: usize,
+    pub zones_from_seeds: usize,
+    pub scanned_fragments: Vec<u64>,
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    /// Collects one [`SeedReuseReport`] per seed-aware segment build.
+    pub static SEED_REUSE_REPORTS: std::sync::Mutex<Vec<SeedReuseReport>>;
+}
+
+/// The seeds `fragments` carry for the column, with the physical row count
+/// each seed must account for. Fragments without a verifiable seed, or
+/// without a known physical row count, are left out and get scanned.
+async fn harvest_zone_seeds(
+    mut harvester: SeedHarvester<'_>,
+    fragments: &[Fragment],
+) -> Result<Vec<HarvestedZoneSeed>> {
+    let mut seeds = Vec::new();
+    for fragment in fragments {
+        let Some(physical_rows) = fragment.physical_rows else {
+            continue;
+        };
+        if let Some(seed) = harvester.harvest(fragment).await? {
+            seeds.push(HarvestedZoneSeed {
+                seed,
+                physical_rows: physical_rows as u64,
+            });
+        }
+    }
+    Ok(seeds)
+}
+
+/// Fold the usable seeds into zones, scan the remaining fragments, and write
+/// one segment.
+#[allow(clippy::too_many_arguments)]
+async fn assemble_segment(
+    dataset: &Dataset,
+    column: &str,
+    base: ZoneMapSegmentBase<'_>,
+    data_type: &DataType,
+    fragments: &[Fragment],
+    seeds: Vec<HarvestedZoneSeed>,
+    criteria: &TrainingCriteria,
+    store: &dyn IndexStore,
+) -> Result<CreatedIndex> {
+    let reused = reuse_zone_seeds(
+        &seeds,
+        base.rows_per_zone(),
+        data_type,
+        base.keeps_null_positions(),
+    )?;
+    let reused_ids: HashSet<u64> = reused.reused_fragments.iter().copied().collect();
+    let to_scan: Vec<Fragment> = fragments
+        .iter()
+        .filter(|fragment| !reused_ids.contains(&fragment.id))
+        .cloned()
+        .collect();
+    log::info!(
+        "zone map segment for {column}: {} fragments from {} seed records, {} fragments scanned",
+        reused.reused_fragments.len(),
+        reused.reused_records,
+        to_scan.len()
+    );
+    #[cfg(test)]
+    let _ = SEED_REUSE_REPORTS.try_with(|reports| {
+        reports.lock().unwrap().push(SeedReuseReport {
+            reused_fragments: reused.reused_fragments.clone(),
+            reused_records: reused.reused_records,
+            zones_from_seeds: reused.num_zones(),
+            scanned_fragments: to_scan.iter().map(|fragment| fragment.id).collect(),
+        })
+    });
+    let scan = if to_scan.is_empty() {
+        None
+    } else {
+        Some(load_training_data(dataset, column, criteria, Some(to_scan), true, None).await?)
+    };
+    let refreshed: Vec<u64> = fragments.iter().map(|fragment| fragment.id).collect();
+    build_zonemap_segment(base, data_type, reused, scan, &refreshed, store).await
+}
+
+/// Train a new ZoneMap segment over `fragment_ids` (all fragments when
+/// `None`), reusing the write seeds those fragments already carry and
+/// scanning only the rest.
+pub(in crate::index) async fn build_segment_with_seeds(
+    dataset: &Dataset,
+    column: &str,
+    params: ZoneMapIndexBuilderParams,
+    data_type: &DataType,
+    fragment_ids: Option<Vec<u32>>,
+    criteria: &TrainingCriteria,
+    store: &dyn IndexStore,
+) -> Result<CreatedIndex> {
+    let fragments: Vec<Fragment> = match fragment_ids {
+        Some(ids) => {
+            let ids: Vec<u32> = ids.into_iter().sorted().dedup().collect();
+            ids.iter()
+                .zip(dataset.get_frags_from_ordered_ids(&ids))
+                .map(|(id, fragment)| {
+                    fragment.map(|f| f.metadata().clone()).ok_or_else(|| {
+                        Error::invalid_input_source(format!("No fragment with id {}", id).into())
+                    })
+                })
+                .collect::<Result<_>>()?
+        }
+        None => dataset.fragments().as_ref().clone(),
+    };
+    let seeds = match SeedHarvester::for_column(dataset, column) {
+        Some(harvester) => harvest_zone_seeds(harvester, &fragments).await?,
+        None => Vec::new(),
+    };
+    assemble_segment(
+        dataset,
+        column,
+        ZoneMapSegmentBase::New(params),
+        data_type,
+        &fragments,
+        seeds,
+        criteria,
+        store,
+    )
+    .await
+}
+
+/// Append `unindexed` fragments to the ZoneMap segment `reference_index`,
+/// reusing their write seeds where usable. `None` when the reference is not
+/// a ZoneMap segment or its index is not keyed on a top-level field, in which
+/// case the generic update path applies.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::index) async fn update_segment_with_seeds(
+    dataset: &Dataset,
+    reference_index: &Arc<dyn ScalarIndex>,
+    reference: &IndexMetadata,
+    column: &str,
+    unindexed: &[Fragment],
+    criteria: &TrainingCriteria,
+    store: &dyn IndexStore,
+) -> Result<Option<CreatedIndex>> {
+    let Some(zone_map) = reference_index.as_any().downcast_ref::<ZoneMapIndex>() else {
+        return Ok(None);
+    };
+    let Some(harvester) = reference
+        .keyed_field()
+        .and_then(|field_id| SeedHarvester::for_field_id(dataset, field_id))
+    else {
+        return Ok(None);
+    };
+    let seeds = harvest_zone_seeds(harvester, unindexed).await?;
+    let data_type = zone_map.value_type().clone();
+    assemble_segment(
+        dataset,
+        column,
+        ZoneMapSegmentBase::Update(zone_map),
+        &data_type,
+        unindexed,
+        seeds,
+        criteria,
+        store,
+    )
+    .await
+    .map(Some)
 }

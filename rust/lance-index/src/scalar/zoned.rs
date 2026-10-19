@@ -62,6 +62,10 @@ pub trait ZoneProcessor {
 pub struct ZoneTrainer<P> {
     processor: P,
     zone_capacity: u64,
+    /// Whether to record the address of every null row. Off for indexes that
+    /// keep only per-zone counts, so the scan does not build a bitmap it will
+    /// discard.
+    track_null_rows: bool,
 }
 
 impl<P> ZoneTrainer<P>
@@ -78,7 +82,15 @@ where
         Ok(Self {
             processor,
             zone_capacity,
+            track_null_rows: true,
         })
+    }
+
+    /// Enable or disable per-row null address tracking. When disabled the
+    /// bitmap returned by [`Self::train`] is empty.
+    pub fn with_null_tracking(mut self, track: bool) -> Self {
+        self.track_null_rows = track;
+        self
     }
 
     /// Consume the `_rowaddr`-annotated stream, split it into zones, and let the
@@ -158,7 +170,7 @@ where
 
                 // Record exact row addresses for null values in this chunk.
                 let chunk = values.slice(batch_offset, take);
-                if chunk.null_count() > 0 {
+                if self.track_null_rows && chunk.null_count() > 0 {
                     for i in 0..take {
                         if values.is_null(batch_offset + i) {
                             null_rows.insert(row_addr_col.value(batch_offset + i));
