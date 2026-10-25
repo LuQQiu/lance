@@ -497,6 +497,124 @@ async fn index_segment_metadata_survives_remap_but_not_merge() {
     assert_eq!(dataset.manifest().max_clustering_id, 1);
 }
 
+/// The explicit remap route (`remap_column_index`) builds a new segment entry
+/// for the same content: the nonzero reference and the map survive the new UUID.
+#[tokio::test]
+async fn explicit_remap_keeps_reference_and_metadata() {
+    let dir = TempStrDir::default();
+    let mut dataset = write_dataset(&dir).await;
+    dataset
+        .create_index(
+            &["i"],
+            IndexType::BTree,
+            Some("idx".into()),
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    let mut dataset = commit_edited_manifest(&dataset, |manifest, indices| {
+        manifest.clustering = vec![definition(1)];
+        manifest.max_clustering_id = 1;
+        let segment = indices.iter_mut().find(|idx| idx.name == "idx").unwrap();
+        segment.clustering_id = Some(1);
+        segment.metadata = object_metadata("3");
+    })
+    .await;
+    let before = named_segments(&dataset, "idx").await[0].clone();
+
+    // Deferred remap leaves the segment addressing the old fragments; the
+    // explicit remap then re-addresses it under a new UUID.
+    compact_files(
+        &mut dataset,
+        CompactionOptions {
+            target_rows_per_fragment: 1_000,
+            defer_index_remap: true,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(named_segments(&dataset, "idx").await[0].uuid, before.uuid);
+    crate::dataset::optimize::remapping::remap_column_index(
+        &mut dataset,
+        &["i"],
+        Some("idx".into()),
+    )
+    .await
+    .unwrap();
+    let after = named_segments(&dataset, "idx").await;
+    assert_eq!(after.len(), 1);
+    assert_ne!(after[0].uuid, before.uuid);
+    assert_eq!(after[0].clustering_id, Some(1));
+    assert_eq!(after[0].metadata, object_metadata("3"));
+}
+
+/// A table whose ONLY clustering feature is a map on one index segment keeps
+/// its writer fence through the clone and branch paths, which publish the
+/// manifest without `build_manifest`.
+#[tokio::test]
+async fn index_only_metadata_keeps_its_writer_fence_through_clone_and_branch() {
+    let dir = TempStrDir::default();
+    let mut dataset = write_dataset(&dir).await;
+    dataset
+        .create_index(
+            &["i"],
+            IndexType::BTree,
+            Some("idx".into()),
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    let mut dataset = commit_edited_manifest(&dataset, |_, indices| {
+        let segment = indices.iter_mut().find(|idx| idx.name == "idx").unwrap();
+        segment.metadata = object_metadata("3");
+    })
+    .await;
+    assert!(dataset.manifest().clustering.is_empty());
+    assert_eq!(dataset.manifest().max_clustering_id, 0);
+    assert!(dataset.fragments().iter().all(|f| f.metadata.is_empty()));
+    assert_ne!(
+        dataset.manifest().writer_feature_flags & FLAG_OBJECT_METADATA,
+        0
+    );
+    let version = dataset.version().version;
+
+    let clone_dir = TempStrDir::default();
+    let clone = dataset
+        .shallow_clone(&clone_dir, version, None)
+        .await
+        .unwrap();
+    assert_ne!(
+        clone.manifest().writer_feature_flags & FLAG_OBJECT_METADATA,
+        0
+    );
+    assert_eq!(
+        clone.manifest().reader_feature_flags & FLAG_OBJECT_METADATA,
+        0
+    );
+    assert_eq!(
+        named_segments(&clone, "idx").await[0].metadata,
+        object_metadata("3")
+    );
+
+    let branch = dataset.create_branch("b", version, None).await.unwrap();
+    assert_ne!(
+        branch.manifest().writer_feature_flags & FLAG_OBJECT_METADATA,
+        0
+    );
+    assert_eq!(
+        branch.manifest().reader_feature_flags & FLAG_OBJECT_METADATA,
+        0
+    );
+    assert_eq!(
+        named_segments(&branch, "idx").await[0].metadata,
+        object_metadata("3")
+    );
+}
+
 #[tokio::test]
 async fn metadata_only_on_an_index_segment_sets_the_writer_flag() {
     let dir = TempStrDir::default();
