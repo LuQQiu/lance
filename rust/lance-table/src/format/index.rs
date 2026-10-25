@@ -105,6 +105,17 @@ pub struct IndexMetadata {
     /// This is None if the file sizes are unknown. This happens for indices created
     /// before this field was added.
     pub files: Option<Vec<IndexFile>>,
+
+    /// The clustering definition this segment was built under, by
+    /// `Manifest::clustering` id. Changes to the same segment keep it; a
+    /// segment built from this one does not inherit it.
+    pub clustering_id: Option<u32>,
+
+    /// Arbitrary metadata attached to this segment, like
+    /// `Manifest::table_metadata`. Changes to the same segment preserve every
+    /// entry, including keys this build does not understand; new segments
+    /// carry only what their creator sets.
+    pub metadata: HashMap<String, String>,
 }
 
 impl IndexMetadata {
@@ -419,6 +430,8 @@ impl TryFrom<pb::IndexMetadata> for IndexMetadata {
             }),
             base_id: proto.base_id,
             files,
+            clustering_id: proto.clustering_id,
+            metadata: proto.metadata,
         };
 
         // This is the single boundary between manifest bytes and
@@ -481,8 +494,8 @@ impl From<&IndexMetadata> for pb::IndexMetadata {
                 .as_ref()
                 .map(|details| details.as_ref().clone()),
             index_version: Some(idx.index_version),
-            clustering_id: None,
-            metadata: Default::default(),
+            clustering_id: idx.clustering_id,
+            metadata: idx.metadata.clone(),
             created_at: idx.created_at.map(|dt| dt.timestamp_millis() as u64),
             base_id: idx.base_id,
             files,
@@ -587,6 +600,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         let proto = pb::IndexMetadata::from(&metadata);
@@ -628,6 +643,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let with = |details: Arc<prost_types::Any>| IndexMetadata {
             index_details: Some(details),
@@ -675,6 +692,8 @@ mod tests {
                     size_bytes: 1024,
                     file_metadata_size_bytes: NonZero::new(256),
                 }]),
+                clustering_id: None,
+                metadata: Default::default(),
             },
             IndexMetadata {
                 uuid: Uuid::new_v4(),
@@ -688,6 +707,8 @@ mod tests {
                 created_at: None,
                 base_id: Some(7),
                 files: None,
+                clustering_id: None,
+                metadata: Default::default(),
             },
         ];
 
@@ -741,6 +762,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         let proto = pb::IndexMetadata::from(&original);
@@ -812,6 +835,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         }
     }
 

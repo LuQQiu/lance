@@ -875,6 +875,11 @@ impl Transaction {
                             // fields it rewrote, since the fresh base values
                             // supersede them.
                             updated.overlays = f.overlays.clone();
+                            // The post-image describes the same fragment, so its
+                            // clustering reference and generic metadata are the
+                            // current fragment's, whatever the staged copy carried.
+                            updated.clustering_id = f.clustering_id;
+                            updated.metadata = f.metadata.clone();
                             // A concurrent Project may have pruned files from the
                             // current fragment after this post-image was staged.
                             // Spilled lineage fields are absent from the schema,
@@ -1298,6 +1303,13 @@ impl Transaction {
                 // row ids plus fresh version metadata.
                 for (fragment, is_new) in merged_fragments.iter_mut().zip(is_new.iter()) {
                     if !*is_new {
+                        // A merged existing fragment is the same fragment with
+                        // more columns: it keeps the current clustering reference
+                        // and generic metadata, whatever the staged copy carried.
+                        if let Some(prev) = prev_by_id.get(&fragment.id) {
+                            fragment.clustering_id = prev.clustering_id;
+                            fragment.metadata = prev.metadata.clone();
+                        }
                         continue;
                     }
                     // Caller-supplied row ids are never checked against live
@@ -4076,6 +4088,8 @@ mod tests {
             physical_rows: Some(5),
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         let manifest = make_stable_row_id_manifest(vec![fragment.clone()]);
@@ -4134,6 +4148,8 @@ mod tests {
             physical_rows: Some(5),
             last_updated_at_version_meta: Some(version_meta.clone()),
             created_at_version_meta: Some(version_meta),
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         let manifest = make_stable_row_id_manifest(vec![fragment.clone()]);
@@ -4191,6 +4207,8 @@ mod tests {
             physical_rows: Some(5),
             last_updated_at_version_meta: Some(version_meta.clone()),
             created_at_version_meta: Some(version_meta),
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         let manifest = make_stable_row_id_manifest(vec![fragment.clone()]);
@@ -4248,6 +4266,8 @@ mod tests {
             physical_rows: Some(5),
             last_updated_at_version_meta: Some(version_meta.clone()),
             created_at_version_meta: Some(version_meta),
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         let manifest = make_stable_row_id_manifest(vec![fragment.clone()]);
@@ -4298,6 +4318,8 @@ mod tests {
                 physical_rows: Some(5),
                 last_updated_at_version_meta: None,
                 created_at_version_meta: None,
+                clustering_id: None,
+                metadata: Default::default(),
             }
         };
 
@@ -4498,6 +4520,8 @@ mod tests {
             physical_rows: Some(5),
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         let mut manifest = Manifest::new(
@@ -4573,6 +4597,8 @@ mod tests {
             physical_rows: Some(5),
             last_updated_at_version_meta: Some(meta_v1.clone()),
             created_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         let mut manifest = Manifest::new(
@@ -4593,6 +4619,8 @@ mod tests {
             physical_rows: Some(5),
             last_updated_at_version_meta: Some(meta_v1),
             created_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         let tx = Transaction::new(
@@ -4643,6 +4671,8 @@ mod tests {
             physical_rows: Some(row_ids.len()),
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
         }
     }
 
@@ -4658,6 +4688,8 @@ mod tests {
             physical_rows: Some(physical_rows),
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
         }
     }
 
@@ -4909,6 +4941,8 @@ mod tests {
             physical_rows: Some(5),
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         let manifest = Manifest::new(
@@ -4978,6 +5012,8 @@ mod tests {
             physical_rows: Some(3),
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         let mut manifest = Manifest::new(
@@ -5001,6 +5037,8 @@ mod tests {
             physical_rows: Some(4),
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         let tx = Transaction::new(
@@ -5130,6 +5168,8 @@ mod tests {
             physical_rows: Some(4),
             last_updated_at_version_meta: Some(version_meta.clone()),
             created_at_version_meta: Some(version_meta),
+            clustering_id: None,
+            metadata: Default::default(),
         };
         // Stable-row-id migrations can leave old fragments without explicit
         // lineage metadata; scans expose those rows as version 1.
@@ -5143,6 +5183,8 @@ mod tests {
             physical_rows: Some(2),
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let manifest = make_stable_row_id_manifest(vec![fragment, untracked_fragment]);
         let txn = Transaction::new(
@@ -5776,6 +5818,8 @@ mod tests {
                 created_at: None,
                 base_id: None,
                 files: None,
+                clustering_id: None,
+                metadata: Default::default(),
             }
         }
 
@@ -6366,5 +6410,136 @@ mod tests {
             apply(&mut second, &read, &[0, 1], &read).unwrap();
             assert_eq!(coverage_for(&first, "idx"), coverage_for(&second, "idx"));
         }
+    }
+
+    /// Object metadata on fragment 0 of `sample_manifest`: a clustering
+    /// reference plus one entry this build understands and one it does not.
+    fn manifest_with_object_metadata() -> (Manifest, HashMap<String, String>) {
+        let mut manifest = sample_manifest();
+        let metadata = HashMap::from([
+            ("org.example.cluster.bucket".to_string(), "3".to_string()),
+            ("org.example.unknown".to_string(), "opaque".to_string()),
+        ]);
+        let fragment = &mut Arc::make_mut(&mut manifest.fragments)[0];
+        fragment.clustering_id = Some(2);
+        fragment.metadata = metadata.clone();
+        fragment.physical_rows = Some(10);
+        (manifest, metadata)
+    }
+
+    /// Every operation that changes fragment 0 in place keeps its clustering
+    /// reference and generic metadata, even when the staged post-image (built
+    /// by a caller that knows nothing about either) carries neither.
+    #[rstest]
+    #[case::delete("delete")]
+    #[case::update_rewrite_columns("update")]
+    #[case::merge("merge")]
+    #[case::data_replacement("data_replacement")]
+    #[case::data_overlay("data_overlay")]
+    fn same_object_operations_preserve_fragment_object_metadata(#[case] kind: &str) {
+        let (manifest, metadata) = manifest_with_object_metadata();
+        let staged = Fragment::new(0).with_file(
+            "b.lance",
+            vec![0],
+            vec![0],
+            ConcreteFileVersion::V2_0,
+            None,
+        );
+        let operation = match kind {
+            "delete" => {
+                let mut deleted = staged;
+                deleted.deletion_file = Some(DeletionFile {
+                    read_version: manifest.version,
+                    id: 7,
+                    file_type: DeletionFileType::Array,
+                    num_deleted_rows: Some(1),
+                    base_id: None,
+                });
+                Operation::Delete {
+                    updated_fragments: vec![deleted],
+                    deleted_fragment_ids: vec![],
+                    predicate: "id = 1".to_string(),
+                }
+            }
+            "update" => Operation::Update {
+                removed_fragment_ids: vec![],
+                updated_fragments: vec![staged],
+                new_fragments: vec![],
+                fields_modified: vec![0],
+                compacted_sstables: vec![],
+                fields_for_preserving_frag_bitmap: vec![],
+                update_mode: Some(UpdateMode::RewriteColumns),
+                inserted_rows_filter: None,
+                updated_fragment_offsets: None,
+            },
+            "merge" => Operation::Merge {
+                fragments: vec![staged],
+                schema: manifest.schema.clone(),
+                preserves_nullability: true,
+            },
+            "data_replacement" => Operation::DataReplacement {
+                replacements: vec![DataReplacementGroup(
+                    0,
+                    DataFile::new(
+                        "b.lance",
+                        vec![0],
+                        vec![0],
+                        ConcreteFileVersion::V2_0,
+                        None,
+                        None,
+                    ),
+                )],
+            },
+            "data_overlay" => Operation::DataOverlay {
+                groups: vec![DataOverlayGroup {
+                    fragment_id: 0,
+                    overlays: vec![overlay_with_field(0, 0)],
+                }],
+            },
+            _ => unreachable!(),
+        };
+        let transaction = Transaction::new(manifest.version, operation, None);
+        let (result, _) = transaction
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
+            .unwrap();
+        let fragment = result
+            .fragments
+            .iter()
+            .find(|fragment| fragment.id == 0)
+            .expect("fragment 0 survives a same-object operation");
+        assert_eq!(fragment.clustering_id, Some(2), "{kind}");
+        assert_eq!(fragment.metadata, metadata, "{kind}");
+    }
+
+    /// Fragments written by a rewrite are new objects: they carry exactly
+    /// what their writer set, never the inputs' metadata.
+    #[test]
+    fn rewrite_outputs_carry_only_writer_object_metadata() {
+        let (manifest, _) = manifest_with_object_metadata();
+        let mut stamped = Fragment::new(11);
+        stamped.clustering_id = Some(2);
+        stamped.metadata =
+            HashMap::from([("org.example.cluster.bucket".to_string(), "5".to_string())]);
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::Rewrite {
+                groups: vec![RewriteGroup {
+                    old_fragments: manifest.fragments.as_ref().clone(),
+                    new_fragments: vec![Fragment::new(10), stamped.clone()],
+                }],
+                rewritten_indices: vec![],
+                frag_reuse_index: None,
+            },
+            None,
+        );
+        let (result, _) = transaction
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
+            .unwrap();
+        let by_id = |id: u64| result.fragments.iter().find(|f| f.id == id).unwrap();
+        assert!(result.fragments.iter().all(|f| f.id != 0));
+        assert_eq!(by_id(10).clustering_id, None);
+        assert!(by_id(10).metadata.is_empty());
+        assert_eq!(by_id(11).clustering_id, Some(2));
+        assert_eq!(by_id(11).metadata, stamped.metadata);
     }
 }

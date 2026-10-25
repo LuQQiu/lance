@@ -960,6 +960,8 @@ impl FromPyObject<'_, '_> for PyLance<Fragment> {
             // fragments back (a manual Delete/Update/Merge commit). Sorting
             // newest-last is deferred to the manifest reload after commit.
             overlays: extract_vec::<DataOverlayFile>(&ob.getattr("overlays")?)?,
+            clustering_id: None,
+            metadata: Default::default(),
         }))
     }
 }

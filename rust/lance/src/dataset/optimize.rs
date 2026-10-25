@@ -4088,6 +4088,8 @@ mod tests {
             physical_rows: Some(0),
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let single_bin = CandidateBin {
             fragments: vec![fragment.clone()],
@@ -4135,6 +4137,8 @@ mod tests {
                     physical_rows: Some(0),
                     last_updated_at_version_meta: None,
                     created_at_version_meta: None,
+                    clustering_id: None,
+                    metadata: Default::default(),
                 },
                 3,
             )

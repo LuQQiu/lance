@@ -5218,23 +5218,27 @@ mod tests {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::V2_0)] version: LanceFileVersion,
         #[values(true, false)] enable_stable_row_ids: bool,
     ) {
-        MergeInsertTestBuilder::new()
-            .with_version(version)
-            .with_stable_row_ids(enable_stable_row_ids)
-            .with_test_keys(&[4, 5, 6])
-            .with_expected_left_keys(&[])
-            .with_expected_right_keys(&[4, 5, 6, 7, 8, 9])
-            .with_expected_stats(&[3, 3, 3])
-            .with_job_builder(|ds| {
-                MergeInsertBuilder::try_new(ds, vec!["key".to_string()])
-                    .unwrap()
-                    .when_matched(WhenMatched::UpdateAll)
-                    .when_not_matched_by_source(WhenNotMatchedBySource::Delete)
-                    .try_build()
-                    .unwrap()
-            })
-            .run_test()
-            .await;
+        // Boxed: the builder holds several `Fragment`s, which puts the
+        // future over the `large_futures` threshold.
+        Box::pin(
+            MergeInsertTestBuilder::new()
+                .with_version(version)
+                .with_stable_row_ids(enable_stable_row_ids)
+                .with_test_keys(&[4, 5, 6])
+                .with_expected_left_keys(&[])
+                .with_expected_right_keys(&[4, 5, 6, 7, 8, 9])
+                .with_expected_stats(&[3, 3, 3])
+                .with_job_builder(|ds| {
+                    MergeInsertBuilder::try_new(ds, vec!["key".to_string()])
+                        .unwrap()
+                        .when_matched(WhenMatched::UpdateAll)
+                        .when_not_matched_by_source(WhenNotMatchedBySource::Delete)
+                        .try_build()
+                        .unwrap()
+                })
+                .run_test(),
+        )
+        .await;
     }
 
     #[rstest::rstest]
@@ -5243,22 +5247,26 @@ mod tests {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::V2_0)] version: LanceFileVersion,
         #[values(true, false)] enable_stable_row_ids: bool,
     ) {
-        MergeInsertTestBuilder::new()
-            .with_version(version)
-            .with_stable_row_ids(enable_stable_row_ids)
-            .with_test_keys(&[4, 5, 6])
-            .with_expected_left_keys(&[1, 2, 3])
-            .with_expected_right_keys(&[4, 5, 6, 7, 8, 9])
-            .with_expected_stats(&[3, 3, 0])
-            .with_job_builder(|ds| {
-                MergeInsertBuilder::try_new(ds, vec!["key".to_string()])
-                    .unwrap()
-                    .when_matched(WhenMatched::UpdateAll)
-                    .try_build()
-                    .unwrap()
-            })
-            .run_test()
-            .await;
+        // Boxed: the builder holds several `Fragment`s, which puts the
+        // future over the `large_futures` threshold.
+        Box::pin(
+            MergeInsertTestBuilder::new()
+                .with_version(version)
+                .with_stable_row_ids(enable_stable_row_ids)
+                .with_test_keys(&[4, 5, 6])
+                .with_expected_left_keys(&[1, 2, 3])
+                .with_expected_right_keys(&[4, 5, 6, 7, 8, 9])
+                .with_expected_stats(&[3, 3, 0])
+                .with_job_builder(|ds| {
+                    MergeInsertBuilder::try_new(ds, vec!["key".to_string()])
+                        .unwrap()
+                        .when_matched(WhenMatched::UpdateAll)
+                        .try_build()
+                        .unwrap()
+                })
+                .run_test(),
+        )
+        .await;
     }
 
     #[rstest::rstest]
@@ -5267,25 +5275,30 @@ mod tests {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::V2_0)] version: LanceFileVersion,
         #[values(true, false)] enable_stable_row_ids: bool,
     ) {
-        MergeInsertTestBuilder::new()
-            .with_version(version)
-            .with_stable_row_ids(enable_stable_row_ids)
-            .with_test_keys(&[6])
-            .with_expected_left_keys(&[1, 2, 3, 4, 5])
-            .with_expected_right_keys(&[6, 7, 8, 9])
-            .with_expected_stats(&[3, 1, 0])
-            .with_job_builder(|ds| {
-                let keys = vec!["key".to_string()];
-                MergeInsertBuilder::try_new(ds.clone(), keys)
-                    .unwrap()
-                    .when_matched(
-                        WhenMatched::update_if(&ds, "source.filterme != target.filterme").unwrap(),
-                    )
-                    .try_build()
-                    .unwrap()
-            })
-            .run_test()
-            .await;
+        // Boxed: the builder holds several `Fragment`s, which puts the
+        // future over the `large_futures` threshold.
+        Box::pin(
+            MergeInsertTestBuilder::new()
+                .with_version(version)
+                .with_stable_row_ids(enable_stable_row_ids)
+                .with_test_keys(&[6])
+                .with_expected_left_keys(&[1, 2, 3, 4, 5])
+                .with_expected_right_keys(&[6, 7, 8, 9])
+                .with_expected_stats(&[3, 1, 0])
+                .with_job_builder(|ds| {
+                    let keys = vec!["key".to_string()];
+                    MergeInsertBuilder::try_new(ds.clone(), keys)
+                        .unwrap()
+                        .when_matched(
+                            WhenMatched::update_if(&ds, "source.filterme != target.filterme")
+                                .unwrap(),
+                        )
+                        .try_build()
+                        .unwrap()
+                })
+                .run_test(),
+        )
+        .await;
     }
 
     #[rstest::rstest]
@@ -5294,24 +5307,28 @@ mod tests {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::V2_0)] version: LanceFileVersion,
         #[values(true, false)] enable_stable_row_ids: bool,
     ) {
-        MergeInsertTestBuilder::new()
-            .with_version(version)
-            .with_stable_row_ids(enable_stable_row_ids)
-            .with_test_keys(&[4, 5, 6])
-            .with_expected_left_keys(&[1, 2, 3])
-            .with_expected_right_keys(&[4, 5, 6])
-            .with_expected_stats(&[0, 3, 0])
-            .with_job_builder(|ds| {
-                let keys = vec!["key".to_string()];
-                MergeInsertBuilder::try_new(ds, keys)
-                    .unwrap()
-                    .when_matched(WhenMatched::UpdateAll)
-                    .when_not_matched(WhenNotMatched::DoNothing)
-                    .try_build()
-                    .unwrap()
-            })
-            .run_test()
-            .await;
+        // Boxed: the builder holds several `Fragment`s, which puts the
+        // future over the `large_futures` threshold.
+        Box::pin(
+            MergeInsertTestBuilder::new()
+                .with_version(version)
+                .with_stable_row_ids(enable_stable_row_ids)
+                .with_test_keys(&[4, 5, 6])
+                .with_expected_left_keys(&[1, 2, 3])
+                .with_expected_right_keys(&[4, 5, 6])
+                .with_expected_stats(&[0, 3, 0])
+                .with_job_builder(|ds| {
+                    let keys = vec!["key".to_string()];
+                    MergeInsertBuilder::try_new(ds, keys)
+                        .unwrap()
+                        .when_matched(WhenMatched::UpdateAll)
+                        .when_not_matched(WhenNotMatched::DoNothing)
+                        .try_build()
+                        .unwrap()
+                })
+                .run_test(),
+        )
+        .await;
     }
 
     #[rstest::rstest]
@@ -5320,25 +5337,29 @@ mod tests {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::V2_0)] version: LanceFileVersion,
         #[values(true, false)] enable_stable_row_ids: bool,
     ) {
-        MergeInsertTestBuilder::new()
-            .with_version(version)
-            .with_stable_row_ids(enable_stable_row_ids)
-            .with_test_keys(&[1, 4, 5, 6])
-            .with_expected_left_keys(&[1])
-            .with_expected_right_keys(&[4, 5, 6, 7, 8, 9])
-            .with_expected_stats(&[3, 3, 2])
-            .with_job_builder(|ds| {
-                let keys = vec!["key".to_string()];
-                let condition = create_delete_condition();
-                MergeInsertBuilder::try_new(ds, keys)
-                    .unwrap()
-                    .when_matched(WhenMatched::UpdateAll)
-                    .when_not_matched_by_source(WhenNotMatchedBySource::DeleteIf(condition))
-                    .try_build()
-                    .unwrap()
-            })
-            .run_test()
-            .await;
+        // Boxed: the builder holds several `Fragment`s, which puts the
+        // future over the `large_futures` threshold.
+        Box::pin(
+            MergeInsertTestBuilder::new()
+                .with_version(version)
+                .with_stable_row_ids(enable_stable_row_ids)
+                .with_test_keys(&[1, 4, 5, 6])
+                .with_expected_left_keys(&[1])
+                .with_expected_right_keys(&[4, 5, 6, 7, 8, 9])
+                .with_expected_stats(&[3, 3, 2])
+                .with_job_builder(|ds| {
+                    let keys = vec!["key".to_string()];
+                    let condition = create_delete_condition();
+                    MergeInsertBuilder::try_new(ds, keys)
+                        .unwrap()
+                        .when_matched(WhenMatched::UpdateAll)
+                        .when_not_matched_by_source(WhenNotMatchedBySource::DeleteIf(condition))
+                        .try_build()
+                        .unwrap()
+                })
+                .run_test(),
+        )
+        .await;
     }
 
     #[rstest::rstest]

@@ -1601,6 +1601,8 @@ async fn mixed_v2_snapshot_supports_scan_filter_and_take() {
         physical_rows: Some(second.num_rows()),
         last_updated_at_version_meta: None,
         created_at_version_meta: None,
+        clustering_id: None,
+        metadata: Default::default(),
     });
     manifest.reader_feature_flags |= feature_flags::FLAG_MIXED_DATA_FILE_VERSIONS;
     manifest.writer_feature_flags |= feature_flags::FLAG_MIXED_DATA_FILE_VERSIONS;
