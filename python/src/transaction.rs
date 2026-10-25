@@ -100,6 +100,17 @@ impl FromPyObject<'_, '_> for PyLance<IndexMetadata> {
             Err(_) => Vec::new(),
         };
 
+        // Tolerate objects predating these attributes; absent means no
+        // clustering reference and no generic metadata.
+        let clustering_id: Option<u32> = match ob.getattr("clustering_id") {
+            Ok(value) => value.extract::<Option<u32>>()?,
+            Err(_) => None,
+        };
+        let metadata: HashMap<String, String> = match ob.getattr("metadata") {
+            Ok(value) => value.extract()?,
+            Err(_) => HashMap::new(),
+        };
+
         Ok(Self(IndexMetadata {
             uuid: Uuid::parse_str(&uuid).map_err(|e| PyValueError::new_err(e.to_string()))?,
             name,
@@ -112,8 +123,8 @@ impl FromPyObject<'_, '_> for PyLance<IndexMetadata> {
             created_at,
             base_id,
             files,
-            clustering_id: None,
-            metadata: Default::default(),
+            clustering_id,
+            metadata,
         }))
     }
 }
@@ -164,6 +175,8 @@ impl<'py> IntoPyObject<'py> for PyLance<&IndexMetadata> {
             files,
             index_details,
             covering_fields.clone(),
+            self.0.clustering_id,
+            self.0.metadata.clone(),
         ))
     }
 }
