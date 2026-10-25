@@ -12,7 +12,7 @@
 
 use crate::feature_flags::{
     FLAG_COVERED_INDEX_METADATA, FLAG_FRAGMENT_REUSE_INDEX, FLAG_MANAGED_BLOBS,
-    FLAG_NON_REUSABLE_FIELD_IDS, FLAG_STABLE_ROW_IDS, apply_feature_flags,
+    FLAG_NON_REUSABLE_FIELD_IDS, FLAG_OBJECT_METADATA, FLAG_STABLE_ROW_IDS, apply_feature_flags,
     ensure_can_read_manifest, ensure_can_write_manifest, inherit_sticky_feature_flags,
     managed_blobs_enabled, validate_non_reusable_field_id_flags,
 };
@@ -21,6 +21,7 @@ use crate::format::{
     DataFile, DataStorageFormat, Fragment, IndexMetadata, Manifest, ManifestBuildConfig, RowIdMeta,
     overlay::DataOverlayFile,
 };
+use crate::format::{merge_clustering_definitions, validate_clustering};
 use crate::io::{
     commit::CommitHandler,
     manifest::{read_manifest, read_manifest_indexes},
@@ -204,6 +205,18 @@ impl Transaction {
         }
         // Row ids are a high-water mark like fragment ids: rewinding hands old ids to new rows.
         manifest.next_row_id = manifest.next_row_id.max(current_manifest.next_row_id);
+        // So are clustering ids: rewinding would hand an old id to a new definition
+        // while objects on other versions still mean the old one by it. The
+        // restored objects reference the historical definitions; the current ones
+        // are kept too, so every id this lineage has handed out stays defined.
+        manifest.max_clustering_id = manifest
+            .max_clustering_id
+            .max(current_manifest.max_clustering_id);
+        merge_clustering_definitions(&mut manifest.clustering, &current_manifest.clustering)
+            .map_err(|error| {
+                Error::invalid_input(format!("Cannot restore version {version}: {error}"))
+            })?;
+        validate_clustering(&manifest, &indices)?;
         // Turning stable row ids off would revert `_rowid` to row addresses, whose
         // namespace overlaps the ids this table has already handed out.
         if current_manifest.uses_stable_row_ids() && !manifest.uses_stable_row_ids() {
@@ -2056,6 +2069,17 @@ impl Transaction {
             manifest.reader_feature_flags |= FLAG_MANAGED_BLOBS;
             manifest.writer_feature_flags |= FLAG_MANAGED_BLOBS;
         }
+
+        // Writer-only, like the other clustering bits `apply_feature_flags` derives
+        // from the manifest: the index section is not visible there, so a segment
+        // that carries a clustering reference or generic metadata sets it here.
+        if final_indices
+            .iter()
+            .any(|index| index.clustering_id.is_some() || !index.metadata.is_empty())
+        {
+            manifest.writer_feature_flags |= FLAG_OBJECT_METADATA;
+        }
+        validate_clustering(&manifest, &final_indices)?;
 
         validate_non_reusable_field_id_flags(&manifest)?;
         Ok((manifest, final_indices))
@@ -6221,6 +6245,13 @@ mod tests {
             ("org.example.cluster.bucket".to_string(), "3".to_string()),
             ("org.example.unknown".to_string(), "opaque".to_string()),
         ]);
+        manifest.clustering = vec![crate::format::ClusteringDefinition {
+            id: 2,
+            columns: vec![0],
+            provider: "org.example.cluster".into(),
+            version: 1,
+        }];
+        manifest.max_clustering_id = 2;
         let fragment = &mut Arc::make_mut(&mut manifest.fragments)[0];
         fragment.clustering_id = Some(2);
         fragment.metadata = metadata.clone();
@@ -6342,5 +6373,65 @@ mod tests {
         assert!(by_id(10).metadata.is_empty());
         assert_eq!(by_id(11).clustering_id, Some(2));
         assert_eq!(by_id(11).metadata, stamped.metadata);
+    }
+
+    #[test]
+    fn rejects_fragment_referencing_an_undefined_clustering_definition() {
+        let manifest = sample_manifest();
+        let mut appended = Fragment::new(0);
+        appended.clustering_id = Some(9);
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::Append {
+                fragments: vec![appended],
+            },
+            None,
+        );
+        let error = transaction
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("references clustering definition 9"),
+            "{error}"
+        );
+    }
+
+    /// Metadata only on an index segment, with no definition and no fragment
+    /// metadata, still fences old writers: the bit comes from the index section.
+    #[test]
+    fn index_segment_metadata_alone_sets_the_writer_flag() {
+        let manifest = sample_manifest();
+        let mut segment = sample_index_metadata("idx");
+        segment
+            .metadata
+            .insert("org.example.unknown".into(), "opaque".into());
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![segment],
+                removed_indices: vec![],
+            },
+            None,
+        );
+        let (result, indices) = transaction
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
+            .unwrap();
+        assert_ne!(result.writer_feature_flags & FLAG_OBJECT_METADATA, 0);
+        assert_eq!(result.reader_feature_flags & FLAG_OBJECT_METADATA, 0);
+        assert_eq!(indices[0].metadata["org.example.unknown"], "opaque");
+
+        // Nothing clustering-related: the bit is not inherited from anywhere.
+        let (plain, _) = Transaction::new(
+            manifest.version,
+            Operation::Append {
+                fragments: vec![Fragment::new(0)],
+            },
+            None,
+        )
+        .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
+        .unwrap();
+        assert_eq!(plain.writer_feature_flags & FLAG_OBJECT_METADATA, 0);
     }
 }
