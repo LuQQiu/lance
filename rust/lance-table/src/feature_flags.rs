@@ -274,6 +274,28 @@ pub fn apply_feature_flags(
     Ok(())
 }
 
+/// Set the writer-only object-metadata bit for an index section that carries a
+/// clustering reference or generic metadata on any segment.
+///
+/// `apply_feature_flags` derives the bit from what the manifest itself holds
+/// (definitions, the allocation high-water mark, fragment references and maps),
+/// but a `Manifest` only points at its index section. Every path that publishes
+/// a manifest together with its indices calls this after `apply_feature_flags`:
+/// `build_manifest` for ordinary commits, and `write_manifest_file` for the
+/// clone and restore paths that bypass it. Readers may ignore the metadata, so
+/// the reader word is untouched.
+pub fn apply_index_object_metadata_flag(
+    manifest: &mut Manifest,
+    indices: &[crate::format::IndexMetadata],
+) {
+    if indices
+        .iter()
+        .any(|index| index.clustering_id.is_some() || !index.metadata.is_empty())
+    {
+        manifest.writer_feature_flags |= FLAG_OBJECT_METADATA;
+    }
+}
+
 /// Carry sticky capabilities from the manifest a new one is derived from.
 ///
 /// [`apply_feature_flags`] carries these bits across its own reset, but it only

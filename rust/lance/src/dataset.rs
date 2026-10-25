@@ -152,8 +152,8 @@ use lance_core::box_error;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_namespace::models::{DeclareTableRequest, DescribeTableRequest};
 use lance_table::feature_flags::{
-    apply_feature_flags, ensure_can_read_manifest, ensure_can_write_manifest,
-    validate_non_reusable_field_id_flags, validate_paired_feature_flags,
+    apply_feature_flags, apply_index_object_metadata_flag, ensure_can_read_manifest,
+    ensure_can_write_manifest, validate_non_reusable_field_id_flags, validate_paired_feature_flags,
 };
 use lance_table::io::deletion::{DELETIONS_DIR, relative_deletion_file_path};
 use lance_table::rowids::{RowIdSequence, write_row_ids};
@@ -4472,6 +4472,10 @@ pub(crate) async fn write_manifest_file(
             manifest,
             indices.as_deref().unwrap_or_default(),
         );
+        // Here as well as in `build_manifest`: the clone and restore paths reach
+        // this write with their index section but without a build, and a clone
+        // starts from a masked writer word.
+        apply_index_object_metadata_flag(manifest, indices.as_deref().unwrap_or_default());
     }
     // After the flag reset, so it judges the flags being published. Here rather
     // than in `build_manifest`, which restore and clone bypass.

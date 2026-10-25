@@ -12,9 +12,9 @@
 
 use crate::feature_flags::{
     FLAG_COVERED_INDEX_METADATA, FLAG_FRAGMENT_REUSE_INDEX, FLAG_MANAGED_BLOBS,
-    FLAG_NON_REUSABLE_FIELD_IDS, FLAG_OBJECT_METADATA, FLAG_STABLE_ROW_IDS, apply_feature_flags,
-    ensure_can_read_manifest, ensure_can_write_manifest, inherit_sticky_feature_flags,
-    managed_blobs_enabled, validate_non_reusable_field_id_flags,
+    FLAG_NON_REUSABLE_FIELD_IDS, FLAG_STABLE_ROW_IDS, apply_feature_flags,
+    apply_index_object_metadata_flag, ensure_can_read_manifest, ensure_can_write_manifest,
+    inherit_sticky_feature_flags, managed_blobs_enabled, validate_non_reusable_field_id_flags,
 };
 use crate::format::overlay::{OverlayCoverage, TOMBSTONE_FIELD_ID};
 use crate::format::{
@@ -2070,15 +2070,7 @@ impl Transaction {
             manifest.writer_feature_flags |= FLAG_MANAGED_BLOBS;
         }
 
-        // Writer-only, like the other clustering bits `apply_feature_flags` derives
-        // from the manifest: the index section is not visible there, so a segment
-        // that carries a clustering reference or generic metadata sets it here.
-        if final_indices
-            .iter()
-            .any(|index| index.clustering_id.is_some() || !index.metadata.is_empty())
-        {
-            manifest.writer_feature_flags |= FLAG_OBJECT_METADATA;
-        }
+        apply_index_object_metadata_flag(&mut manifest, &final_indices);
         validate_clustering(&manifest, &final_indices)?;
 
         validate_non_reusable_field_id_flags(&manifest)?;
@@ -2125,6 +2117,7 @@ impl Transaction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::feature_flags::FLAG_OBJECT_METADATA;
     use crate::format::overlay::OverlayCoverage;
     use crate::format::pb;
     use crate::format::{
