@@ -2201,6 +2201,8 @@ pub async fn initialize_vector_index(
         created_at: Some(chrono::Utc::now()),
         base_id: None,
         files: Some(summary.files),
+        clustering_id: None,
+        metadata: Default::default(),
     };
 
     let transaction = Transaction::new(

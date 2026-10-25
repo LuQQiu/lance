@@ -106,6 +106,8 @@ impl FromPyObject<'_, '_> for PyLance<IndexMetadata> {
             created_at,
             base_id,
             files,
+            clustering_id: None,
+            metadata: Default::default(),
         }))
     }
 }

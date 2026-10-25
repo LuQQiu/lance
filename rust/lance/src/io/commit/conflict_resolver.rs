@@ -2861,12 +2861,12 @@ impl<'a> TransactionRebase<'a> {
                         new_entry,
                         current_entry,
                     } => {
-                        *new_indices = vec![new_entry];
-                        *removed_indices = vec![current_entry];
+                        *new_indices = vec![*new_entry];
+                        *removed_indices = vec![*current_entry];
                     }
                     TaggedTrimOutcome::Delete { current_entry } => {
                         new_indices.clear();
-                        *removed_indices = vec![current_entry];
+                        *removed_indices = vec![*current_entry];
                     }
                 }
                 return Ok(self.transaction);
@@ -3450,6 +3450,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let operation = Operation::Rewrite {
             groups: vec![],
@@ -4146,6 +4148,8 @@ mod tests {
             created_at: None, // Test index, not setting timestamp
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let fragment0 = Fragment::new(0);
         let fragment1 = Fragment::new(1);
@@ -5383,6 +5387,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let mut rebase = TransactionRebase {
             transaction: Transaction::new(
@@ -5494,6 +5500,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let column_index = IndexMetadata {
             uuid: uuid::Uuid::new_v4(),
@@ -5587,6 +5595,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let index1 = IndexMetadata {
             uuid: uuid::Uuid::new_v4(),
@@ -5662,6 +5672,8 @@ mod tests {
                         created_at: None,
                         base_id: None,
                         files: None,
+                        clustering_id: None,
+                        metadata: Default::default(),
                     }],
                     removed_indices: vec![],
                 },
@@ -5710,6 +5722,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let drop_operation = Operation::CreateIndex {
             new_indices: vec![],
@@ -5775,6 +5789,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let drop_operation = Operation::CreateIndex {
             new_indices: vec![],
@@ -5819,6 +5835,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let replaced = index(Uuid::new_v4());
         let concurrently_removed = index(Uuid::new_v4());
@@ -5872,6 +5890,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let frag_reuse_index = IndexMetadata {
             uuid: Uuid::new_v4(),
@@ -5885,6 +5905,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let rewrite = Transaction::new(
             1,
@@ -5955,6 +5977,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let frag_reuse_index = IndexMetadata {
             uuid: Uuid::new_v4(),
@@ -5968,6 +5992,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         // The rewrite's own `old_fragments` are what the SRID inference reads:
@@ -6676,6 +6702,8 @@ mod tests {
                         created_at: None,
                         base_id: None,
                         files: None,
+                        clustering_id: None,
+                        metadata: Default::default(),
                     }],
                     removed_indices: vec![],
                 },
@@ -9232,6 +9260,8 @@ mod tests {
                 created_at: None,
                 base_id: None,
                 files: None,
+                clustering_id: None,
+                metadata: Default::default(),
             };
             let ours = Transaction::new(
                 1,

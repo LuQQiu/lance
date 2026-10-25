@@ -1120,6 +1120,8 @@ pub(crate) async fn build_index_metadata_from_segments(
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         }
         .validate_covering_fields()?;
         if segment.fields() != expected_fields.as_slice()
@@ -1157,6 +1159,8 @@ pub(crate) async fn build_index_metadata_from_segments(
         .await?;
 
     let new_indices = futures::stream::iter(segments.into_iter().map(|segment| async move {
+        let clustering_id = segment.clustering_id();
+        let metadata = segment.metadata().clone();
         let (
             uuid,
             fragment_bitmap,
@@ -1180,6 +1184,8 @@ pub(crate) async fn build_index_metadata_from_segments(
                 created_at: Some(chrono::Utc::now()),
                 base_id: None,
                 files: None,
+                clustering_id,
+                metadata: metadata.clone(),
             };
             crate::index::scalar::inverted::finalize_segment_files_if_needed(dataset, &metadata)
                 .await?;
@@ -1201,6 +1207,8 @@ pub(crate) async fn build_index_metadata_from_segments(
             created_at: Some(chrono::Utc::now()),
             base_id: None,
             files: Some(files),
+            clustering_id,
+            metadata,
         })
     }))
     .buffered(dataset.object_store.io_parallelism())
@@ -5294,6 +5302,8 @@ mod tests {
                 path: INDEX_FILE_NAME.to_string(),
                 size_bytes: payload.len() as u64,
             }]),
+            clustering_id: None,
+            metadata: Default::default(),
         }
     }
 
@@ -5872,6 +5882,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         // The shape every merge_segments impl builds: keyed field only, carried
@@ -9452,6 +9464,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         let desc = IndexDescriptionImpl::try_new(vec![metadata], &dataset)
@@ -9493,6 +9507,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         let desc = IndexDescriptionImpl::try_new(vec![metadata], &dataset)
@@ -12454,6 +12470,8 @@ mod tests {
             created_at: Some(chrono::Utc::now()),
             base_id: None,
             files: seg0.files.clone(),
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         let err = dataset

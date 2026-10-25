@@ -369,6 +369,8 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
             created_at: curr_index_meta.created_at,
             base_id: curr_index_meta.base_id,
             files: curr_index_meta.files.clone(),
+            clustering_id: curr_index_meta.clustering_id,
+            metadata: curr_index_meta.metadata.clone(),
         },
         RemapResult::Remapped(remapped_index) => IndexMetadata {
             uuid: remapped_index.new_id,
@@ -382,6 +384,8 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
             created_at: curr_index_meta.created_at,
             base_id: None,
             files: remapped_index.files,
+            clustering_id: curr_index_meta.clustering_id,
+            metadata: curr_index_meta.metadata.clone(),
         },
     };
 
@@ -1072,6 +1076,8 @@ async fn remap_index_tagged(dataset: &mut Dataset, index_id: &Uuid) -> Result<()
             // this dataset's own index directory.)
             base_id: curr_index_meta.base_id,
             files: curr_index_meta.files.clone(),
+            clustering_id: curr_index_meta.clustering_id,
+            metadata: curr_index_meta.metadata.clone(),
         },
         RemapResult::Remapped(remapped_index) => IndexMetadata {
             uuid: remapped_index.new_id,
@@ -1085,6 +1091,8 @@ async fn remap_index_tagged(dataset: &mut Dataset, index_id: &Uuid) -> Result<()
             created_at: curr_index_meta.created_at,
             base_id: None,
             files: remapped_index.files,
+            clustering_id: curr_index_meta.clustering_id,
+            metadata: curr_index_meta.metadata.clone(),
         },
     };
 
