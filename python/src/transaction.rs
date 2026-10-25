@@ -16,7 +16,7 @@ use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
 use lance_table::format::{BasePath, DataFile, Fragment, IndexFile, IndexMetadata};
 use lance_table::system_index::mem_wal::CompactedSsTable;
 use pyo3::exceptions::PyValueError;
-use pyo3::types::PyList;
+use pyo3::types::{PyDict, PyList};
 use pyo3::{Bound, FromPyObject, PyAny, PyResult, Python};
 use pyo3::{intern, prelude::*};
 use roaring::RoaringBitmap;
@@ -163,21 +163,27 @@ impl<'py> IntoPyObject<'py> for PyLance<&IndexMetadata> {
         let cls = namespace
             .getattr("Index")
             .expect("Failed to get Index class");
-        cls.call1((
-            uuid,
-            name.clone(),
-            fields.clone(),
-            dataset_version,
-            fragment_ids,
-            index_version,
-            created_at,
-            base_id,
-            files,
-            index_details,
-            covering_fields.clone(),
-            self.0.clustering_id,
-            self.0.metadata.clone(),
-        ))
+        // PyO3 accepts at most twelve positional arguments in one tuple; the
+        // two trailing dataclass fields go by keyword.
+        let kwargs = PyDict::new(py);
+        kwargs.set_item(intern!(py, "clustering_id"), self.0.clustering_id)?;
+        kwargs.set_item(intern!(py, "metadata"), self.0.metadata.clone())?;
+        cls.call(
+            (
+                uuid,
+                name.clone(),
+                fields.clone(),
+                dataset_version,
+                fragment_ids,
+                index_version,
+                created_at,
+                base_id,
+                files,
+                index_details,
+                covering_fields.clone(),
+            ),
+            Some(&kwargs),
+        )
     }
 }
 
