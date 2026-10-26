@@ -190,6 +190,8 @@ class FragmentMetadata:
                 if self.last_updated_at_version_meta is not None
                 else None
             ),
+            clustering_id=self.clustering_id,
+            metadata=dict(self.metadata),
         )
 
     @staticmethod
@@ -239,6 +241,9 @@ class FragmentMetadata:
             created_at_version_meta=created_at_version_meta,
             last_updated_at_version_meta=last_updated_at_version_meta,
             overlays=overlays,
+            # Absent in JSON written before these fields existed.
+            clustering_id=json_data.get("clustering_id"),
+            metadata=dict(json_data.get("metadata") or {}),
         )
 
 
