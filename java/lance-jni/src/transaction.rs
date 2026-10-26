@@ -740,10 +740,17 @@ impl FromJObjectWithEnv<IndexMetadata> for JObject<'_> {
             created_at,
             base_id,
             files,
-            // The Java index class has no fields for the clustering reference
-            // and generic metadata yet, in either direction.
-            clustering_id: None,
-            metadata: Default::default(),
+            clustering_id: env
+                .get_optional_u64_from_method(self, "clusteringId")?
+                .map(|id| {
+                    u32::try_from(id).map_err(|_| {
+                        Error::input_error(format!(
+                            "index.clusteringId {id} is outside the unsigned 32-bit range"
+                        ))
+                    })
+                })
+                .transpose()?,
+            metadata: crate::fragment::extract_metadata_map(env, self, "metadata")?,
         })
     }
 }
