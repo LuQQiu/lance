@@ -740,6 +740,10 @@ impl FromJObjectWithEnv<IndexMetadata> for JObject<'_> {
             created_at,
             base_id,
             files,
+            // The Java index class has no fields for the clustering reference
+            // and generic metadata yet, in either direction.
+            clustering_id: None,
+            metadata: Default::default(),
         })
     }
 }

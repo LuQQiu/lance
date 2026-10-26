@@ -1021,6 +1021,10 @@ impl FromJObjectWithEnv<Fragment> for JObject<'_> {
             // Overlays are not exposed to Java yet, and the reverse conversion
             // does not export them, so this round-trip is overlay-free.
             overlays: vec![],
+            // Likewise for the clustering reference and generic metadata: the
+            // Java class has no fields for them yet, in either direction.
+            clustering_id: None,
+            metadata: Default::default(),
         })
     }
 }
