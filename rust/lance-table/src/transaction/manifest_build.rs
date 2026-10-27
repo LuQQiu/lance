@@ -16,15 +16,21 @@ use crate::feature_flags::{
     apply_index_object_metadata_flag, ensure_can_read_manifest, ensure_can_write_manifest,
     inherit_sticky_feature_flags, managed_blobs_enabled, validate_non_reusable_field_id_flags,
 };
+use crate::format::clustering::{ChangedReferences, validate_clustering_of};
+
+// The clustering object visits the last `build_manifest` performed, so a test
+// can assert on the real commit path rather than on the accumulator alone.
+#[cfg(test)]
+thread_local! {
+    static LAST_CLUSTERING_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 use crate::format::overlay::staleness::field_affects_index;
 use crate::format::overlay::{OverlayCoverage, TOMBSTONE_FIELD_ID};
 use crate::format::{
     DataFile, DataStorageFormat, Fragment, IndexMetadata, Manifest, ManifestBuildConfig, RowIdMeta,
     overlay::DataOverlayFile,
 };
-use crate::format::{
-    apply_complete_clustering_definitions, merge_clustering_definitions, validate_clustering,
-};
+use crate::format::{apply_complete_clustering_definitions, merge_clustering_definitions};
 use crate::io::{
     commit::CommitHandler,
     manifest::{read_manifest, read_manifest_indexes},
@@ -178,6 +184,14 @@ impl Transaction {
         tx_path: &str,
         current_manifest: &Manifest,
     ) -> Result<(Manifest, Vec<IndexMetadata>)> {
+        // Restore dispatches separately from the prepared build path, and it
+        // has no use for a definitions list: ignoring one silently would lose
+        // the caller's input.
+        if config.clustering_definitions.is_some() {
+            return Err(Error::invalid_input(
+                "a complete clustering definitions list can only be committed with UpdateConfig",
+            ));
+        }
         let location = commit_handler
             .resolve_version_location(base_path, version, &object_store.inner)
             .await?;
@@ -219,7 +233,10 @@ impl Transaction {
             .map_err(|error| {
                 Error::invalid_input(format!("Cannot restore version {version}: {error}"))
             })?;
-        validate_clustering(&manifest, &indices)?;
+        // A restore republishes objects that already existed, so their labels
+        // are not new writes: an old label may outlive its definition and must
+        // not make the restore fail. The definition set itself is still merged
+        // and checked above.
         // Turning stable row ids off would revert `_rowid` to row addresses, whose
         // namespace overlaps the ids this table has already handed out.
         if current_manifest.uses_stable_row_ids() && !manifest.uses_stable_row_ids() {
@@ -611,13 +628,6 @@ impl Transaction {
         config: &ManifestBuildConfig,
         read_version_state: Option<ReadVersionState<'_>>,
     ) -> Result<(Manifest, Vec<IndexMetadata>)> {
-        if config.clustering_definitions.is_some()
-            && !matches!(self.operation, Operation::UpdateConfig { .. })
-        {
-            return Err(Error::invalid_input(
-                "a complete clustering definitions list can only be committed with UpdateConfig",
-            ));
-        }
         let prepared = self.prepare_indices(
             current_manifest,
             current_indices,
@@ -647,6 +657,17 @@ impl Transaction {
         config: &ManifestBuildConfig,
         read_version_state: Option<ReadVersionState<'_>>,
     ) -> Result<(Manifest, Vec<IndexMetadata>)> {
+        // The production commit loop calls this path directly, so the only
+        // operation that applies a definitions list has to be enforced here
+        // rather than in the convenience wrapper: anything else would ignore
+        // the caller's list and report success.
+        if config.clustering_definitions.is_some()
+            && !matches!(self.operation, Operation::UpdateConfig { .. })
+        {
+            return Err(Error::invalid_input(
+                "a complete clustering definitions list can only be committed with UpdateConfig",
+            ));
+        }
         if prepared.manifest_version() != current_manifest.map(|manifest| manifest.version) {
             return Err(Error::invalid_input(format!(
                 "the index list was prepared against manifest version {:?} but the manifest \
@@ -755,6 +776,11 @@ impl Transaction {
             .unwrap_or(0);
         let mut final_fragments = Vec::new();
         let mut final_indices = prepared_indices;
+        // Only the labels this operation introduces or changes; fragments and
+        // segments carried over from the current manifest are already valid,
+        // so metadata-only commits contribute nothing and do no per-object
+        // clustering work.
+        let mut changed_clustering_references = ChangedReferences::default();
 
         // Release builds refuse to publish a stable-row-id dataset with a fragment
         // reuse index, and no index needs it.
@@ -832,6 +858,9 @@ impl Transaction {
                         fragment.last_updated_at_version_meta = version_meta.clone();
                         fragment.created_at_version_meta = version_meta;
                     }
+                }
+                for fragment in &new_fragments {
+                    changed_clustering_references.fragment(fragment);
                 }
                 final_fragments.extend(new_fragments);
             }
@@ -1070,6 +1099,9 @@ impl Transaction {
                 // Identify fragments that were updated or newly created in this update
                 let mut target_ids: HashSet<u64> = HashSet::new();
                 target_ids.extend(new_fragments.iter().map(|f| f.id));
+                for fragment in &new_fragments {
+                    changed_clustering_references.fragment(fragment);
+                }
                 final_fragments.extend(new_fragments);
                 Self::retain_relevant_indices(&mut final_indices, &schema, &final_fragments);
 
@@ -1101,6 +1133,9 @@ impl Transaction {
                         fragment.created_at_version_meta = version_meta;
                     }
                 }
+                for fragment in &new_fragments {
+                    changed_clustering_references.fragment(fragment);
+                }
                 final_fragments.extend(new_fragments);
                 final_indices = Vec::new();
             }
@@ -1117,6 +1152,7 @@ impl Transaction {
                     &mut fragment_id,
                     current_version,
                     next_row_id.as_ref(),
+                    &mut changed_clustering_references,
                 )?;
 
                 // Groups covered by the stable-partition transitions
@@ -1237,6 +1273,7 @@ impl Transaction {
                             )));
                         }
                         final_indices.retain(|idx| idx.name != assembly.entry.name);
+                        changed_clustering_references.index_segment(&assembly.entry);
                         final_indices.push(assembly.entry.clone());
                     }
                     // v0 snapshot: splice verbatim, byte-identical to the
@@ -1244,6 +1281,7 @@ impl Transaction {
                     // rejected tagged snapshots.
                     (Some(entry), None) => {
                         final_indices.retain(|idx| idx.name != entry.name);
+                        changed_clustering_references.index_segment(entry);
                         final_indices.push(entry.clone());
                     }
                     (None, None) => {}
@@ -1269,6 +1307,9 @@ impl Transaction {
                 });
                 for new_index in new_indices {
                     new_index.validate_covering_fields()?;
+                }
+                for segment in new_indices.iter() {
+                    changed_clustering_references.index_segment(segment);
                 }
                 final_indices.extend(new_indices.clone());
 
@@ -1370,6 +1411,14 @@ impl Transaction {
                 }
                 let remaining_field_ids = schema.field_ids().into_iter().collect::<HashSet<_>>();
                 Self::retain_relevant_overlays(&mut merged_fragments, &remaining_field_ids);
+                // Only the genuinely new fragments are this commit's writes; a
+                // merged existing fragment is the same object with more columns
+                // and keeps the label it already had.
+                for (fragment, is_new) in merged_fragments.iter().zip(is_new.iter()) {
+                    if *is_new {
+                        changed_clustering_references.fragment(fragment);
+                    }
+                }
                 final_fragments.extend(merged_fragments);
 
                 // A Merge can rewrite a column's data file in place; the field stays
@@ -1597,6 +1646,7 @@ impl Transaction {
                     superseded.extend(newer);
                     new_frag.overlays = superseded;
 
+                    changed_clustering_references.fragment(&new_frag);
                     final_fragments.push(new_frag);
                 }
 
@@ -1709,6 +1759,7 @@ impl Transaction {
                                 overlay
                             }));
                     }
+                    changed_clustering_references.fragment(&fragment);
                     final_fragments.push(fragment);
                 }
             }
@@ -1944,9 +1995,18 @@ impl Transaction {
                 field_metadata_updates,
             } => {
                 if let Some(desired) = &config.clustering_definitions {
+                    // The definitions the writer planned against: the read
+                    // snapshot when the commit path supplied one, else the
+                    // landing base, which on a first attempt IS the read
+                    // manifest because nothing can have intervened yet.
+                    let read_definitions = read_version_state
+                        .map(|state| state.manifest.clustering.as_slice())
+                        .or_else(|| current_manifest.map(|m| m.clustering.as_slice()))
+                        .unwrap_or(&[]);
                     apply_complete_clustering_definitions(
                         &mut manifest,
                         desired,
+                        read_definitions,
                         current_manifest.map(|m| m.version + 1).unwrap_or(1),
                     )?;
                 }
@@ -2139,7 +2199,9 @@ impl Transaction {
         }
 
         apply_index_object_metadata_flag(&mut manifest, &final_indices);
-        validate_clustering(&manifest, &final_indices)?;
+        #[cfg(test)]
+        LAST_CLUSTERING_VISITS.with(|cell| cell.set(changed_clustering_references.visits()));
+        validate_clustering_of(&manifest, &changed_clustering_references)?;
 
         validate_non_reusable_field_id_flags(&manifest)?;
         Ok((manifest, final_indices))
@@ -3635,6 +3697,74 @@ mod tests {
             DataStorageFormat::new(ConcreteFileVersion::V2_0),
             HashMap::new(),
         )
+    }
+
+    /// The real commit path must do clustering work proportional to what the
+    /// operation changed, not to the table. An UpdateConfig over 10 untouched
+    /// fragments and over 10_000 must cost the same: zero. This asserts on
+    /// `build_manifest` itself, not on the accumulator in isolation, because
+    /// an earlier attempt filtered a full scan and a counter downstream of
+    /// the traversal reported one visit while walking both snapshots.
+    #[test]
+    fn a_metadata_only_commit_does_no_per_object_clustering_work() {
+        let mut observed = Vec::new();
+        for fragment_count in [10u64, 10_000] {
+            let current = sample_manifest_with_fragments(0..fragment_count);
+            let transaction = Transaction::new(
+                current.version,
+                Operation::UpdateConfig {
+                    config_updates: None,
+                    table_metadata_updates: None,
+                    schema_metadata_updates: None,
+                    field_metadata_updates: HashMap::new(),
+                },
+                None,
+            );
+            transaction
+                .build_manifest(
+                    Some(&current),
+                    Vec::new(),
+                    "test.txn",
+                    &default_build_config(),
+                )
+                .unwrap();
+            observed.push(LAST_CLUSTERING_VISITS.with(|cell| cell.get()));
+        }
+        assert_eq!(
+            observed,
+            vec![0, 0],
+            "a metadata-only commit must not visit objects for clustering"
+        );
+    }
+
+    /// An Append reports exactly its own fragments, whatever the table holds.
+    #[test]
+    fn an_append_reports_only_the_fragments_it_adds() {
+        let mut observed = Vec::new();
+        for fragment_count in [10u64, 10_000] {
+            let current = sample_manifest_with_fragments(0..fragment_count);
+            let transaction = Transaction::new(
+                current.version,
+                Operation::Append {
+                    fragments: vec![Fragment::new(fragment_count + 1)],
+                },
+                None,
+            );
+            transaction
+                .build_manifest(
+                    Some(&current),
+                    Vec::new(),
+                    "test.txn",
+                    &default_build_config(),
+                )
+                .unwrap();
+            observed.push(LAST_CLUSTERING_VISITS.with(|cell| cell.get()));
+        }
+        assert_eq!(
+            observed,
+            vec![1, 1],
+            "append must cost one visit per appended fragment, regardless of table size"
+        );
     }
 
     #[rstest]
@@ -6699,6 +6829,133 @@ mod tests {
         assert!(by_id(10).metadata.is_empty());
         assert_eq!(by_id(11).clustering_id, Some(2));
         assert_eq!(by_id(11).metadata, stamped.metadata);
+    }
+
+    /// Definitions attached to anything but UpdateConfig must be refused, not
+    /// silently ignored. The production commit loop calls the prepared path
+    /// directly, so the check has to live where that path sees it.
+    #[test]
+    fn the_prepared_path_refuses_definitions_on_an_unsupported_operation() {
+        let manifest = sample_manifest();
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::Append {
+                fragments: vec![Fragment::new(0)],
+            },
+            None,
+        );
+        let mut config = default_build_config();
+        config.clustering_definitions = Some(vec![]);
+        let prepared = transaction
+            .prepare_indices(
+                Some(&manifest),
+                Vec::new(),
+                &config,
+                None,
+                FragReuseUpdate::None,
+            )
+            .unwrap();
+        let error = transaction
+            .build_manifest_prepared(Some(&manifest), prepared, "txn", &config, None)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("UpdateConfig"),
+            "definitions on an Append must be refused: {error}"
+        );
+    }
+
+    /// Rewrite work must track its outputs, not the table. Holding the group
+    /// fixed while growing the untouched input set must not change the count.
+    #[test]
+    fn rewrite_clustering_work_tracks_outputs_not_table_size() {
+        let mut observed = Vec::new();
+        for untouched in [4u64, 2_000] {
+            let current = sample_manifest_with_fragments(0..untouched);
+            let transaction = Transaction::new(
+                current.version,
+                Operation::Rewrite {
+                    groups: vec![RewriteGroup {
+                        old_fragments: vec![Fragment::new(0)],
+                        new_fragments: vec![Fragment::new(untouched + 1)],
+                    }],
+                    rewritten_indices: vec![],
+                    frag_reuse_index: None,
+                },
+                None,
+            );
+            transaction
+                .build_manifest(Some(&current), vec![], "txn", &default_build_config())
+                .unwrap();
+            observed.push(LAST_CLUSTERING_VISITS.with(|cell| cell.get()));
+        }
+        assert_eq!(
+            observed,
+            vec![1, 1],
+            "rewrite must cost one visit per output fragment, whatever the table holds"
+        );
+    }
+
+    /// The non-contiguous path appends its outputs instead of splicing them;
+    /// it must report them just the same.
+    #[test]
+    fn rejects_a_noncontiguous_rewrite_output_with_an_undefined_definition() {
+        let current = sample_manifest_with_fragments(0..4);
+        let mut dangling = Fragment::new(99);
+        dangling.clustering_id = Some(7);
+        let transaction = Transaction::new(
+            current.version,
+            Operation::Rewrite {
+                groups: vec![RewriteGroup {
+                    // Non-adjacent old fragments force the appended path.
+                    old_fragments: vec![Fragment::new(0), Fragment::new(2)],
+                    new_fragments: vec![dangling],
+                }],
+                rewritten_indices: vec![],
+                frag_reuse_index: None,
+            },
+            None,
+        );
+        let error = transaction
+            .build_manifest(Some(&current), vec![], "txn", &default_build_config())
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("which the manifest does not define"),
+            "{error}"
+        );
+    }
+
+    /// A Rewrite output carrying an undefined label must be refused. The
+    /// accumulator only sees what the builder reports, so an operation that
+    /// introduces fragments without reporting them would silently lose this
+    /// rejection.
+    #[test]
+    fn rejects_rewrite_output_referencing_an_undefined_clustering_definition() {
+        let (manifest, _) = manifest_with_object_metadata();
+        let mut dangling = Fragment::new(11);
+        dangling.clustering_id = Some(9);
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::Rewrite {
+                groups: vec![RewriteGroup {
+                    old_fragments: manifest.fragments.as_ref().clone(),
+                    new_fragments: vec![Fragment::new(10), dangling],
+                }],
+                rewritten_indices: vec![],
+                frag_reuse_index: None,
+            },
+            None,
+        );
+        let error = transaction
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("which the manifest does not define"),
+            "{error}"
+        );
     }
 
     #[test]
