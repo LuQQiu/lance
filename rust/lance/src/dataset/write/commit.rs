@@ -8,6 +8,7 @@ use std::time::Duration;
 use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_select::RowAddrTreeMap;
+use lance_table::format::ClusteringDefinition;
 use lance_table::{
     format::{DataStorageFormat, is_detached_version},
     io::commit::{CommitConfig, CommitHandler, ManifestNamingScheme},
@@ -58,6 +59,9 @@ pub struct CommitBuilder<'a> {
     /// Set only by `Dataset::deep_clone`, after it has copied the source files.
     deep_clone_files_copied: bool,
     keep_field_ids: bool,
+    /// The complete desired clustering definitions list for an `UpdateConfig`
+    /// commit; see [`ManifestBuildConfig::clustering_definitions`].
+    clustering_definitions: Option<Vec<ClusteringDefinition>>,
 }
 
 /// Default timeout applied to [`CommitBuilder::execute`] when none is set.
@@ -85,6 +89,7 @@ impl<'a> CommitBuilder<'a> {
             activate_non_reusable_field_ids: false,
             deep_clone_files_copied: false,
             keep_field_ids: false,
+            clustering_definitions: None,
         }
     }
 
@@ -154,6 +159,20 @@ impl<'a> CommitBuilder<'a> {
     /// `Uri` destination resolves one from the uri.
     pub fn with_commit_handler(mut self, commit_handler: Arc<dyn CommitHandler>) -> Self {
         self.commit_handler = Some(commit_handler);
+        self
+    }
+
+    /// Commit, together with an `UpdateConfig` transaction, the COMPLETE list of
+    /// clustering definitions the next manifest must hold: every definition the
+    /// read manifest had, unchanged, plus the new ones continuing
+    /// `max_clustering_id` in order. Applied against the manifest the commit
+    /// lands on, so a list built from a stale snapshot is a non-retryable
+    /// commit conflict (reload, rebuild the list, resubmit); a list that adds
+    /// nothing is a no-op. The transaction file stays a plain `UpdateConfig`;
+    /// the manifest is the durable record of the definitions. Any other
+    /// operation refuses this input.
+    pub fn with_clustering_definitions(mut self, definitions: Vec<ClusteringDefinition>) -> Self {
+        self.clustering_definitions = Some(definitions);
         self
     }
 
@@ -463,6 +482,7 @@ impl<'a> CommitBuilder<'a> {
             storage_format: self.storage_format.map(DataStorageFormat::new),
             migration_next_row_id: self.migration_next_row_id,
             activate_non_reusable_field_ids: self.activate_non_reusable_field_ids,
+            clustering_definitions: self.clustering_definitions.clone(),
             ..Default::default()
         };
 

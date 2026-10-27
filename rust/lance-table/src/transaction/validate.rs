@@ -1991,7 +1991,6 @@ mod tests {
             table_metadata_updates: None,
             schema_metadata_updates: None,
             field_metadata_updates: HashMap::new(),
-            clustering_definitions: None,
         };
 
         let err = validate_non_reusable_field_id_transition(&manifest, &successor, &operation)
@@ -2017,7 +2016,6 @@ mod tests {
             table_metadata_updates: None,
             schema_metadata_updates: None,
             field_metadata_updates: HashMap::new(),
-            clustering_definitions: None,
         };
 
         let err = validate_non_reusable_field_id_transition(&manifest, &successor, &operation)

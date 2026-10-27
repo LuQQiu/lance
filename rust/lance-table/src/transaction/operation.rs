@@ -11,7 +11,7 @@
 
 use crate::format::key_existence::KeyExistenceFilter;
 use crate::format::overlay::DataOverlayFile;
-use crate::format::{BasePath, ClusteringDefinition, DataFile, Fragment, IndexFile, IndexMetadata};
+use crate::format::{BasePath, DataFile, Fragment, IndexFile, IndexMetadata};
 use crate::system_index::mem_wal::CompactedSsTable;
 use crate::transaction::UpdateMap;
 use lance_core::datatypes::Schema;
@@ -225,22 +225,6 @@ pub enum Operation {
         table_metadata_updates: Option<UpdateMap>,
         schema_metadata_updates: Option<UpdateMap>,
         field_metadata_updates: HashMap<i32, UpdateMap>,
-        /// The COMPLETE list of clustering definitions the writer wants the
-        /// next manifest to hold, built from the manifest it read: every
-        /// current definition unchanged (matched by id, content must be
-        /// identical, order is not significant) plus the new ones, whose ids
-        /// continue `max_clustering_id` in order. `None` leaves the
-        /// definitions alone.
-        ///
-        /// In-memory only, never serialized into the transaction file (the
-        /// same contract as `Rewrite::frag_reuse_index`): the manifest is the
-        /// durable record of the definitions, and other writers' conflict
-        /// decisions do not depend on this field. A rebased attempt is
-        /// re-checked against the manifest it lands on: a dropped or changed
-        /// current definition, or a new id that no longer continues the mark,
-        /// is a non-retryable commit conflict, so the writer reloads and
-        /// rebuilds the list; a list that adds nothing is a no-op.
-        clustering_definitions: Option<Vec<ClusteringDefinition>>,
     },
     /// Update SSTable compaction progress in the MemWAL index.
     ///

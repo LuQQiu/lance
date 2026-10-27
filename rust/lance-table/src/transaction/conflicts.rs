@@ -184,21 +184,18 @@ impl PartialEq for Operation {
                     table_metadata_updates: a_table_metadata,
                     schema_metadata_updates: a_schema,
                     field_metadata_updates: a_field,
-                    clustering_definitions: a_definitions,
                 },
                 Self::UpdateConfig {
                     config_updates: b_config,
                     table_metadata_updates: b_table_metadata,
                     schema_metadata_updates: b_schema,
                     field_metadata_updates: b_field,
-                    clustering_definitions: b_definitions,
                 },
             ) => {
                 a_config == b_config
                     && a_table_metadata == b_table_metadata
                     && a_schema == b_schema
                     && a_field == b_field
-                    && a_definitions == b_definitions
             }
             (
                 Self::DataReplacement { replacements: a },
@@ -1014,7 +1011,6 @@ mod tests {
             }),
             schema_metadata_updates: None,
             field_metadata_updates: HashMap::new(),
-            clustering_definitions: None,
         }
     }
 
@@ -1027,7 +1023,6 @@ mod tests {
                 replace,
             }),
             field_metadata_updates: HashMap::new(),
-            clustering_definitions: None,
         }
     }
 
@@ -1073,7 +1068,6 @@ mod tests {
                 table_metadata_updates: (!is_schema_metadata).then_some(update.clone()),
                 schema_metadata_updates: is_schema_metadata.then_some(update),
                 field_metadata_updates: HashMap::new(),
-                clustering_definitions: None,
             }
         };
         let left = metadata_update(vec![("key", Some("1"))], false);
@@ -1082,7 +1076,6 @@ mod tests {
             table_metadata_updates: None,
             schema_metadata_updates: None,
             field_metadata_updates: HashMap::new(),
-            clustering_definitions: None,
         };
 
         for (other, expected_conflict) in [

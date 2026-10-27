@@ -31,6 +31,7 @@ pub fn default_build_config() -> ManifestBuildConfig {
         disable_transaction_file: false,
         migration_next_row_id: None,
         activate_non_reusable_field_ids: false,
+        clustering_definitions: None,
         spilled_row_lineage: Default::default(),
     }
 }

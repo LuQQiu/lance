@@ -3535,7 +3535,6 @@ mod tests {
             table_metadata_updates: None,
             schema_metadata_updates,
             field_metadata_updates,
-            clustering_definitions: None,
         }
     }
 
@@ -3578,7 +3577,6 @@ mod tests {
                 table_metadata_updates: update_table_metadata.then_some(replacement),
                 schema_metadata_updates: None,
                 field_metadata_updates: HashMap::new(),
-                clustering_definitions: None,
             },
         );
 
@@ -3663,7 +3661,6 @@ mod tests {
                 } else {
                     HashMap::from_iter([(field_id, metadata_update)])
                 },
-                clustering_definitions: None,
             },
         );
 

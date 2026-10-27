@@ -350,7 +350,6 @@ impl TryFrom<pb::Transaction> for Transaction {
                         table_metadata_updates: None,
                         schema_metadata_updates,
                         field_metadata_updates,
-                        clustering_definitions: None,
                     }
                 } else {
                     // Use new-style fields directly (convert from protobuf)
@@ -371,7 +370,6 @@ impl TryFrom<pb::Transaction> for Transaction {
                                 (*field_id, UpdateMap::from(pb_update_map))
                             })
                             .collect(),
-                        clustering_definitions: None,
                     }
                 }
             }
@@ -657,8 +655,6 @@ impl TryFrom<&Transaction> for pb::Transaction {
                 table_metadata_updates,
                 schema_metadata_updates,
                 field_metadata_updates,
-                // in-memory input, not part of the durable record
-                clustering_definitions: _,
             } => pb::transaction::Operation::UpdateConfig(pb::transaction::UpdateConfig {
                 config_updates: config_updates
                     .as_ref()

@@ -611,6 +611,13 @@ impl Transaction {
         config: &ManifestBuildConfig,
         read_version_state: Option<ReadVersionState<'_>>,
     ) -> Result<(Manifest, Vec<IndexMetadata>)> {
+        if config.clustering_definitions.is_some()
+            && !matches!(self.operation, Operation::UpdateConfig { .. })
+        {
+            return Err(Error::invalid_input(
+                "a complete clustering definitions list can only be committed with UpdateConfig",
+            ));
+        }
         let prepared = self.prepare_indices(
             current_manifest,
             current_indices,
@@ -1935,9 +1942,8 @@ impl Transaction {
                 table_metadata_updates,
                 schema_metadata_updates,
                 field_metadata_updates,
-                clustering_definitions,
             } => {
-                if let Some(desired) = clustering_definitions {
+                if let Some(desired) = &config.clustering_definitions {
                     apply_complete_clustering_definitions(
                         &mut manifest,
                         desired,
@@ -2225,7 +2231,6 @@ mod tests {
                 table_metadata_updates: None,
                 schema_metadata_updates: None,
                 field_metadata_updates: HashMap::new(),
-                clustering_definitions: None,
             },
             _ => unreachable!(),
         }
@@ -3703,7 +3708,6 @@ mod tests {
                 table_metadata_updates: None,
                 schema_metadata_updates: None,
                 field_metadata_updates: HashMap::new(),
-                clustering_definitions: None,
             },
             None,
         );

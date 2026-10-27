@@ -108,6 +108,7 @@ async fn commit_edited_manifest(
             migration_next_row_id: None,
             activate_non_reusable_field_ids: false,
             tagged_frag_reuse_trim: false,
+            clustering_definitions: None,
         },
         dataset.manifest_location.naming_scheme,
         None,
@@ -654,7 +655,7 @@ async fn metadata_only_on_an_index_segment_sets_the_writer_flag() {
     );
 }
 
-// ---- complete-list submission through UpdateConfig (in-memory input) -----
+// ---- complete-list submission alongside UpdateConfig (commit-time input) ---
 
 const ACTIVE_KEY: &str = "org.example.cluster.active_id";
 
@@ -662,14 +663,14 @@ fn spec_key(id: u32) -> String {
     format!("{PROVIDER}.{id}.spec")
 }
 
-/// An `UpdateConfig` carrying the writer's complete desired definitions list
-/// and the provider's key upserts for the same version.
+/// A plain `UpdateConfig` with the provider's key upserts, plus the writer's
+/// complete desired definitions list to commit alongside it.
 fn submission(
     read_version: u64,
     desired: Vec<ClusteringDefinition>,
     metadata: Vec<(String, Option<String>)>,
-) -> Transaction {
-    Transaction::new(
+) -> (Vec<ClusteringDefinition>, Transaction) {
+    let transaction = Transaction::new(
         read_version,
         Operation::UpdateConfig {
             config_updates: None,
@@ -679,14 +680,18 @@ fn submission(
             }),
             schema_metadata_updates: None,
             field_metadata_updates: HashMap::new(),
-            clustering_definitions: Some(desired),
         },
         None,
-    )
+    );
+    (desired, transaction)
 }
 
-async fn commit(dataset: &Dataset, transaction: Transaction) -> crate::Result<Dataset> {
+async fn commit(
+    dataset: &Dataset,
+    (desired, transaction): (Vec<ClusteringDefinition>, Transaction),
+) -> crate::Result<Dataset> {
     CommitBuilder::new(Arc::new(dataset.clone()))
+        .with_clustering_definitions(desired)
         .execute(transaction)
         .await
 }
@@ -735,14 +740,12 @@ async fn complete_list_submission_commits_definitions_and_keys_in_one_version() 
         .unwrap()
         .unwrap();
     let Operation::UpdateConfig {
-        clustering_definitions,
         table_metadata_updates,
         ..
     } = recorded.operation
     else {
         panic!("not an UpdateConfig");
     };
-    assert_eq!(clustering_definitions, None);
     assert_eq!(table_metadata_updates.unwrap().update_entries.len(), 2);
 
     // the complete list grows: retained entries plus two new ones, in id order
@@ -958,13 +961,13 @@ async fn ambiguous_success_is_recognized_by_transaction_identity() {
     // reads the version back and recognizes its own transaction (by the
     // serialized record, which includes the uuid), so the caller sees success
     handler.fail_next(AmbiguousFailure::LandAndConflict);
-    let transaction = submission(
+    let submitted = submission(
         dataset.manifest().version,
         vec![definition(1)],
         vec![(ACTIVE_KEY.to_string(), Some("1".to_string()))],
     );
-    let uuid = transaction.uuid.clone();
-    let committed = commit(&dataset, transaction).await.unwrap();
+    let uuid = submitted.1.uuid.clone();
+    let committed = commit(&dataset, submitted).await.unwrap();
     assert_eq!(ids(&committed), vec![1]);
     assert_eq!(committed.manifest().table_metadata[ACTIVE_KEY], "1");
     let recorded = committed.read_transaction().await.unwrap().unwrap();

@@ -80,21 +80,18 @@ impl<'a> std::future::IntoFuture for UpdateMetadataBuilder<'a> {
                     table_metadata_updates: None,
                     schema_metadata_updates: None,
                     field_metadata_updates: HashMap::new(),
-                    clustering_definitions: None,
                 },
                 MetadataType::TableMetadata => Operation::UpdateConfig {
                     config_updates: None,
                     table_metadata_updates: Some(update_map),
                     schema_metadata_updates: None,
                     field_metadata_updates: HashMap::new(),
-                    clustering_definitions: None,
                 },
                 MetadataType::SchemaMetadata => Operation::UpdateConfig {
                     config_updates: None,
                     table_metadata_updates: None,
                     schema_metadata_updates: Some(update_map),
                     field_metadata_updates: HashMap::new(),
-                    clustering_definitions: None,
                 },
             };
 
@@ -170,7 +167,6 @@ impl<'a> std::future::IntoFuture for UpdateFieldMetadataBuilder<'a> {
                     table_metadata_updates: None,
                     schema_metadata_updates: None,
                     field_metadata_updates: self.field_metadata_updates,
-                    clustering_definitions: None,
                 },
             )
             .await?;

@@ -829,6 +829,19 @@ pub struct ManifestBuildConfig {
     pub migration_next_row_id: Option<u64>,
     /// Whether this commit atomically activates non-reusable field IDs.
     pub activate_non_reusable_field_ids: bool,
+    /// For an `UpdateConfig` commit only: the COMPLETE list of clustering
+    /// definitions the writer wants the next manifest to hold, built from the
+    /// manifest it read: every current definition unchanged (matched by id,
+    /// content identical, order not significant) plus the new ones, whose ids
+    /// continue `max_clustering_id` in order. `None` leaves the definitions
+    /// alone. This is a commit-time input, not part of the transaction: the
+    /// transaction file stays a plain `UpdateConfig` and the manifest is the
+    /// durable record of the definitions. Applied against the manifest the
+    /// commit actually lands on, so a list built from a stale snapshot (a
+    /// dropped or changed current definition, or a new id that no longer
+    /// continues the mark) is a non-retryable commit conflict: the writer
+    /// reloads and rebuilds the list. A list that adds nothing is a no-op.
+    pub clustering_definitions: Option<Vec<ClusteringDefinition>>,
     /// Row lineage sequences of the current manifest's fragments that live
     /// outside the manifest, read ahead of the build. An update that rewrites
     /// rows needs the existing row ids and created-at versions to carry each
