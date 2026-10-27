@@ -2779,6 +2779,8 @@ async fn merge_segments_with_row_filters(
         created_at: Some(chrono::Utc::now()),
         base_id: None,
         files: Some(files),
+        clustering_id: None,
+        metadata: Default::default(),
         ..merged_segment
     };
     Ok(merged_segment)

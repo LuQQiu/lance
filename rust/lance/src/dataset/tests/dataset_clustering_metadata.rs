@@ -14,10 +14,11 @@ use lance_core::Error;
 use lance_core::utils::tempfile::TempStrDir;
 use lance_index::IndexType;
 use lance_index::optimize::OptimizeOptions;
-use lance_index::scalar::ScalarIndexParams;
+use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
 use lance_table::feature_flags::FLAG_OBJECT_METADATA;
 use lance_table::format::{ClusteringDefinition, IndexMetadata, Manifest};
 use lance_table::io::manifest::read_manifest_indexes;
+use rstest::rstest;
 
 use crate::Dataset;
 use crate::dataset::optimize::{CompactionOptions, compact_files};
@@ -497,6 +498,67 @@ async fn index_segment_metadata_survives_remap_but_not_merge() {
     // The definition and mark remain even with nothing referencing them.
     assert_eq!(dataset.manifest().clustering, vec![definition(1)]);
     assert_eq!(dataset.manifest().max_clustering_id, 1);
+}
+
+/// Every merge builder creates a new segment, and none may carry an input's
+/// label forward. Both inputs are labelled so the result does not depend on
+/// which input a builder happens to start from.
+#[rstest]
+#[case::btree(IndexType::BTree)]
+#[case::bitmap(IndexType::Bitmap)]
+#[case::zonemap(IndexType::ZoneMap)]
+#[tokio::test]
+async fn merged_segments_do_not_inherit_either_input_label(#[case] index_type: IndexType) {
+    let dir = TempStrDir::default();
+    let mut dataset = write_dataset(&dir).await;
+    let params = match index_type {
+        IndexType::Bitmap => ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap),
+        IndexType::ZoneMap => ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap),
+        _ => ScalarIndexParams::default(),
+    };
+    dataset
+        .create_index(&["i"], index_type, Some("idx".into()), &params, true)
+        .await
+        .unwrap();
+    Dataset::write(
+        rows(100..150),
+        dataset.uri(),
+        Some(WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset.checkout_latest().await.unwrap();
+    dataset
+        .optimize_indices(&OptimizeOptions::append())
+        .await
+        .unwrap();
+    assert_eq!(named_segments(&dataset, "idx").await.len(), 2);
+
+    let mut dataset = commit_edited_manifest(&dataset, |manifest, indices| {
+        manifest.clustering = vec![definition(1)];
+        manifest.max_clustering_id = 1;
+        for (position, segment) in indices
+            .iter_mut()
+            .filter(|segment| segment.name == "idx")
+            .enumerate()
+        {
+            segment.clustering_id = Some(1);
+            segment.metadata = object_metadata(&position.to_string());
+        }
+    })
+    .await;
+
+    dataset
+        .optimize_indices(&OptimizeOptions::default().num_indices_to_merge(Some(2)))
+        .await
+        .unwrap();
+    let merged = named_segments(&dataset, "idx").await;
+    assert_eq!(merged.len(), 1, "{index_type:?}");
+    assert_eq!(merged[0].clustering_id, None, "{index_type:?}");
+    assert!(merged[0].metadata.is_empty(), "{index_type:?}");
 }
 
 /// The explicit remap route (`remap_column_index`) builds a new segment entry
