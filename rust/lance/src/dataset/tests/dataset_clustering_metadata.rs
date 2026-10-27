@@ -879,6 +879,89 @@ async fn complete_list_submission_commits_definitions_and_keys_in_one_version() 
     assert_eq!(dataset.manifest().table_metadata[&spec_key(1)], "{\"v\":1}");
 }
 
+/// The desired list is the target list: an omission the writer read is an
+/// intended removal, removal and allocation can land together, and the
+/// watermark never moves backwards so a freed id is spent.
+#[tokio::test]
+async fn complete_list_removes_omitted_definitions_and_keeps_the_mark() {
+    let dir = TempStrDir::default();
+    let dataset = write_dataset(&dir).await;
+    let dataset = commit(
+        &dataset,
+        submission(dataset.manifest().version, vec![definition(1)], vec![]),
+    )
+    .await
+    .unwrap();
+    let dataset = commit(
+        &dataset,
+        submission(
+            dataset.manifest().version,
+            vec![definition(1), definition(2)],
+            vec![],
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ids(&dataset), vec![1, 2]);
+    assert_eq!(dataset.manifest().max_clustering_id, 2);
+
+    // Removal only: definition 2 goes, the mark stays so its id is not reused.
+    let removed = commit(
+        &dataset,
+        submission(dataset.manifest().version, vec![definition(1)], vec![]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ids(&removed), vec![1], "definition 2 is removed");
+    assert_eq!(
+        removed.manifest().max_clustering_id,
+        2,
+        "a removal never releases the id"
+    );
+
+    // The freed id is spent: resubmitting 2 is at the mark, not above it.
+    let error = commit(
+        &removed,
+        submission(
+            removed.manifest().version,
+            vec![definition(1), definition(2)],
+            vec![],
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("does not continue"),
+        "a spent id is not a fresh allocation: {error}"
+    );
+
+    // Removal and allocation in one list: 3 continues the mark.
+    let mixed = commit(
+        &removed,
+        submission(
+            removed.manifest().version,
+            vec![definition(3)],
+            vec![("org.example.note".to_string(), Some("x".to_string()))],
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ids(&mixed), vec![3], "1 removed and 3 allocated");
+    assert_eq!(mixed.manifest().max_clustering_id, 3);
+    assert_eq!(
+        mixed.manifest().table_metadata["org.example.note"],
+        "x",
+        "the metadata patch publishes with the definitions"
+    );
+
+    // An empty target clears the set and still preserves the mark.
+    let cleared = commit(&mixed, submission(mixed.manifest().version, vec![], vec![]))
+        .await
+        .unwrap();
+    assert!(cleared.manifest().clustering.is_empty());
+    assert_eq!(cleared.manifest().max_clustering_id, 3);
+}
+
 #[tokio::test]
 async fn complete_list_keeps_current_definitions_by_identity() {
     let dir = TempStrDir::default();
@@ -911,12 +994,10 @@ async fn complete_list_keeps_current_definitions_by_identity() {
     };
     let cases: Vec<(Vec<ClusteringDefinition>, &str)> = vec![
         (vec![definition(1), changed], "immutable"),
-        (vec![definition(1)], "drops definition 2"),
         (
             vec![definition(1), definition(2), definition(4)],
             "does not continue",
         ),
-        (vec![definition(2), definition(3)], "drops definition 1"),
     ];
     for (desired, expected) in cases {
         let error = commit(&dataset, submission(version, desired, vec![]))
