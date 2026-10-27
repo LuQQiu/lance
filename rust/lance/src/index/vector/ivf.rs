@@ -2879,6 +2879,8 @@ async fn merge_segments_inner(
         created_at: Some(chrono::Utc::now()),
         base_id: None,
         files: Some(files),
+        clustering_id: None,
+        metadata: Default::default(),
         ..merged_segment
     };
     Ok(merged_segment)

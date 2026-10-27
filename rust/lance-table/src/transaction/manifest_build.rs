@@ -1308,8 +1308,21 @@ impl Transaction {
                 for new_index in new_indices {
                     new_index.validate_covering_fields()?;
                 }
+                // A remap replaces a segment with a new UUID that carries the
+                // old segment's label; that label is retained, not introduced.
+                // Only a label no removed segment of the same index carried is
+                // a new reference.
+                let carried_labels = removed_indices
+                    .iter()
+                    .filter_map(|old| old.clustering_id.map(|id| (old.name.as_str(), id)))
+                    .collect::<HashSet<_>>();
                 for segment in new_indices.iter() {
-                    changed_clustering_references.index_segment(segment);
+                    let carried = segment
+                        .clustering_id
+                        .is_some_and(|id| carried_labels.contains(&(segment.name.as_str(), id)));
+                    if !carried {
+                        changed_clustering_references.index_segment(segment);
+                    }
                 }
                 final_indices.extend(new_indices.clone());
 
@@ -1646,7 +1659,6 @@ impl Transaction {
                     superseded.extend(newer);
                     new_frag.overlays = superseded;
 
-                    changed_clustering_references.fragment(&new_frag);
                     final_fragments.push(new_frag);
                 }
 
@@ -1759,7 +1771,6 @@ impl Transaction {
                                 overlay
                             }));
                     }
-                    changed_clustering_references.fragment(&fragment);
                     final_fragments.push(fragment);
                 }
             }
@@ -6892,6 +6903,144 @@ mod tests {
             observed,
             vec![1, 1],
             "rewrite must cost one visit per output fragment, whatever the table holds"
+        );
+    }
+
+    /// An overlay attaches to fragments the table already holds. It introduces
+    /// no object, so it reports none, however many fragments the table has
+    /// and whatever labels they carry.
+    #[test]
+    fn data_overlay_does_no_per_object_clustering_work() {
+        let mut observed = Vec::new();
+        for untouched in [4u64, 2_000] {
+            let current = sample_manifest_with_fragments(0..untouched);
+            let transaction = Transaction::new(
+                current.version,
+                Operation::DataOverlay {
+                    groups: vec![DataOverlayGroup {
+                        fragment_id: 0,
+                        overlays: vec![overlay_with_field(1, 0)],
+                    }],
+                },
+                None,
+            );
+            transaction
+                .build_manifest(Some(&current), vec![], "txn", &default_build_config())
+                .unwrap();
+            observed.push(LAST_CLUSTERING_VISITS.with(|cell| cell.get()));
+        }
+        assert_eq!(
+            observed,
+            vec![0, 0],
+            "an overlay must not visit fragments for clustering"
+        );
+    }
+
+    /// A data replacement swaps files inside an existing fragment. The object
+    /// and its label are retained, so nothing is reported.
+    #[test]
+    fn data_replacement_does_no_per_object_clustering_work() {
+        let mut observed = Vec::new();
+        for untouched in [4u64, 2_000] {
+            let mut current = sample_manifest_with_fragments(0..untouched);
+            Arc::make_mut(&mut current.fragments)[0].files =
+                vec![DataFile::new_legacy_from_fields("f.lance", vec![0], None)];
+            let transaction = Transaction::new(
+                current.version,
+                Operation::DataReplacement {
+                    replacements: vec![DataReplacementGroup(
+                        0,
+                        DataFile::new_legacy_from_fields("f-new.lance", vec![0], None),
+                    )],
+                },
+                None,
+            );
+            transaction
+                .build_manifest(Some(&current), vec![], "txn", &default_build_config())
+                .unwrap();
+            observed.push(LAST_CLUSTERING_VISITS.with(|cell| cell.get()));
+        }
+        assert_eq!(
+            observed,
+            vec![0, 0],
+            "a replacement must not visit fragments for clustering"
+        );
+    }
+
+    /// Compaction remaps a labelled segment to a new UUID that carries the
+    /// same label. That label is retained, not introduced, so the builder does
+    /// not report it; a label no removed segment of that index carried is a
+    /// new reference and is still checked.
+    #[test]
+    fn create_index_reports_only_the_labels_it_introduces() {
+        let (manifest, _) = manifest_with_object_metadata();
+        let mut old = sample_index_metadata("idx");
+        old.clustering_id = Some(2);
+
+        let mut remapped = sample_index_metadata("idx");
+        remapped.clustering_id = Some(2);
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![remapped.clone()],
+                removed_indices: vec![old.clone()],
+            },
+            None,
+        );
+        let (_, indices) = transaction
+            .build_manifest(
+                Some(&manifest),
+                vec![old.clone()],
+                "txn",
+                &default_build_config(),
+            )
+            .unwrap();
+        assert_eq!(LAST_CLUSTERING_VISITS.with(|cell| cell.get()), 0);
+        assert_eq!(indices.len(), 1);
+        assert_eq!(indices[0].uuid, remapped.uuid);
+        assert_eq!(indices[0].clustering_id, Some(2));
+
+        // The same label on another index: nothing removed carried it.
+        let mut fresh = sample_index_metadata("other");
+        fresh.clustering_id = Some(2);
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![fresh],
+                removed_indices: vec![],
+            },
+            None,
+        );
+        transaction
+            .build_manifest(
+                Some(&manifest),
+                vec![old.clone()],
+                "txn",
+                &default_build_config(),
+            )
+            .unwrap();
+        assert_eq!(LAST_CLUSTERING_VISITS.with(|cell| cell.get()), 1);
+
+        // A replacement segment with a label the removed one did not carry
+        // is an introduced reference and must resolve.
+        let mut dangling = sample_index_metadata("idx");
+        dangling.clustering_id = Some(7);
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![dangling],
+                removed_indices: vec![old.clone()],
+            },
+            None,
+        );
+        let error = transaction
+            .build_manifest(Some(&manifest), vec![old], "txn", &default_build_config())
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("references clustering definition 7"),
+            "{error}"
         );
     }
 
