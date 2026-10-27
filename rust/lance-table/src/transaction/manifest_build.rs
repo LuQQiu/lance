@@ -21,7 +21,9 @@ use crate::format::{
     DataFile, DataStorageFormat, Fragment, IndexMetadata, Manifest, ManifestBuildConfig, RowIdMeta,
     overlay::DataOverlayFile,
 };
-use crate::format::{merge_clustering_definitions, validate_clustering};
+use crate::format::{
+    apply_complete_clustering_definitions, merge_clustering_definitions, validate_clustering,
+};
 use crate::io::{
     commit::CommitHandler,
     manifest::{read_manifest, read_manifest_indexes},
@@ -587,6 +589,13 @@ impl Transaction {
         config: &ManifestBuildConfig,
         read_version_state: Option<ReadVersionState<'_>>,
     ) -> Result<(Manifest, Vec<IndexMetadata>)> {
+        if config.clustering_definitions.is_some()
+            && !matches!(self.operation, Operation::UpdateConfig { .. })
+        {
+            return Err(Error::invalid_input(
+                "a complete clustering definitions list can only be committed with UpdateConfig",
+            ));
+        }
         let prepared = self.prepare_indices(
             current_manifest,
             current_indices,
@@ -1882,6 +1891,13 @@ impl Transaction {
                 schema_metadata_updates,
                 field_metadata_updates,
             } => {
+                if let Some(desired) = &config.clustering_definitions {
+                    apply_complete_clustering_definitions(
+                        &mut manifest,
+                        desired,
+                        current_manifest.map(|m| m.version + 1).unwrap_or(1),
+                    )?;
+                }
                 if let Some(config_updates) = config_updates {
                     let mut config = manifest.config.clone();
                     apply_update_map(&mut config, config_updates);

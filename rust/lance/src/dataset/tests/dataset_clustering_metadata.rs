@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, RecordBatchReader};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+use lance_core::Error;
 use lance_core::utils::tempfile::TempStrDir;
 use lance_index::IndexType;
 use lance_index::optimize::OptimizeOptions;
@@ -20,7 +21,7 @@ use lance_table::io::manifest::read_manifest_indexes;
 
 use crate::Dataset;
 use crate::dataset::optimize::{CompactionOptions, compact_files};
-use crate::dataset::transaction::Operation;
+use crate::dataset::transaction::{Operation, Transaction, UpdateMap, UpdateMapEntry};
 use crate::dataset::write::{CommitBuilder, InsertBuilder, WriteMode, WriteParams};
 use crate::dataset::{ManifestWriteConfig, NewColumnTransform, write_manifest_file};
 use crate::index::DatasetIndexExt;
@@ -107,6 +108,7 @@ async fn commit_edited_manifest(
             migration_next_row_id: None,
             activate_non_reusable_field_ids: false,
             tagged_frag_reuse_trim: false,
+            clustering_definitions: None,
         },
         dataset.manifest_location.naming_scheme,
         None,
@@ -651,4 +653,369 @@ async fn metadata_only_on_an_index_segment_sets_the_writer_flag() {
         named_segments(&dataset, "idx").await[0].metadata[UNKNOWN_KEY],
         "opaque"
     );
+}
+
+// ---- complete-list submission alongside UpdateConfig (commit-time input) ---
+
+const ACTIVE_KEY: &str = "org.example.cluster.active_id";
+
+fn spec_key(id: u32) -> String {
+    format!("{PROVIDER}.{id}.spec")
+}
+
+/// A plain `UpdateConfig` with the provider's key upserts, plus the writer's
+/// complete desired definitions list to commit alongside it.
+fn submission(
+    read_version: u64,
+    desired: Vec<ClusteringDefinition>,
+    metadata: Vec<(String, Option<String>)>,
+) -> (Vec<ClusteringDefinition>, Transaction) {
+    let transaction = Transaction::new(
+        read_version,
+        Operation::UpdateConfig {
+            config_updates: None,
+            table_metadata_updates: Some(UpdateMap {
+                update_entries: metadata.into_iter().map(UpdateMapEntry::from).collect(),
+                replace: false,
+            }),
+            schema_metadata_updates: None,
+            field_metadata_updates: HashMap::new(),
+        },
+        None,
+    );
+    (desired, transaction)
+}
+
+async fn commit(
+    dataset: &Dataset,
+    (desired, transaction): (Vec<ClusteringDefinition>, Transaction),
+) -> crate::Result<Dataset> {
+    CommitBuilder::new(Arc::new(dataset.clone()))
+        .with_clustering_definitions(desired)
+        .execute(transaction)
+        .await
+}
+
+fn ids(dataset: &Dataset) -> Vec<u32> {
+    dataset.manifest().clustering.iter().map(|d| d.id).collect()
+}
+
+#[tokio::test]
+async fn complete_list_submission_commits_definitions_and_keys_in_one_version() {
+    let dir = TempStrDir::default();
+    let dataset = write_dataset(&dir).await;
+    assert_eq!(dataset.manifest().max_clustering_id, 0);
+
+    let dataset = commit(
+        &dataset,
+        submission(
+            dataset.manifest().version,
+            vec![definition(1)],
+            vec![
+                (ACTIVE_KEY.to_string(), Some("1".to_string())),
+                (spec_key(1), Some("{\"v\":1}".to_string())),
+            ],
+        ),
+    )
+    .await
+    .unwrap();
+    let manifest = dataset.manifest();
+    assert_eq!(manifest.clustering, vec![definition(1)]);
+    assert_eq!(manifest.max_clustering_id, 1);
+    assert_eq!(manifest.table_metadata[ACTIVE_KEY], "1");
+    assert_eq!(manifest.table_metadata[&spec_key(1)], "{\"v\":1}");
+    assert_eq!(
+        manifest.writer_feature_flags & FLAG_OBJECT_METADATA,
+        FLAG_OBJECT_METADATA
+    );
+
+    // the durable record is a plain UpdateConfig: the key upserts are in the
+    // transaction file, the definitions only in the manifest (a fresh open
+    // reads the file instead of the committing session's cached transaction)
+    let recorded = Dataset::open(&dir)
+        .await
+        .unwrap()
+        .read_transaction()
+        .await
+        .unwrap()
+        .unwrap();
+    let Operation::UpdateConfig {
+        table_metadata_updates,
+        ..
+    } = recorded.operation
+    else {
+        panic!("not an UpdateConfig");
+    };
+    assert_eq!(table_metadata_updates.unwrap().update_entries.len(), 2);
+
+    // the complete list grows: retained entries plus two new ones, in id order
+    let dataset = commit(
+        &dataset,
+        submission(
+            dataset.manifest().version,
+            vec![
+                definition(1),
+                ClusteringDefinition {
+                    id: 2,
+                    columns: vec![0],
+                    provider: "org.example.other".into(),
+                    version: 3,
+                },
+                definition(3),
+            ],
+            vec![(ACTIVE_KEY.to_string(), Some("3".to_string()))],
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ids(&dataset), vec![1, 2, 3]);
+    assert_eq!(dataset.manifest().max_clustering_id, 3);
+    assert_eq!(dataset.manifest().table_metadata[ACTIVE_KEY], "3");
+    assert_eq!(dataset.manifest().table_metadata[&spec_key(1)], "{\"v\":1}");
+}
+
+#[tokio::test]
+async fn complete_list_keeps_current_definitions_by_identity() {
+    let dir = TempStrDir::default();
+    let dataset = write_dataset(&dir).await;
+    let dataset = commit(
+        &dataset,
+        submission(dataset.manifest().version, vec![definition(1)], vec![]),
+    )
+    .await
+    .unwrap();
+
+    // order is not significant: the retained entry may come after the new one
+    let dataset = commit(
+        &dataset,
+        submission(
+            dataset.manifest().version,
+            vec![definition(2), definition(1)],
+            vec![],
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ids(&dataset), vec![1, 2]);
+    let version = dataset.manifest().version;
+
+    let changed = ClusteringDefinition {
+        columns: vec![0],
+        provider: "org.example.other".into(),
+        ..definition(2)
+    };
+    let cases: Vec<(Vec<ClusteringDefinition>, &str)> = vec![
+        (vec![definition(1), changed], "immutable"),
+        (vec![definition(1)], "drops definition 2"),
+        (
+            vec![definition(1), definition(2), definition(4)],
+            "does not continue",
+        ),
+        (vec![definition(2), definition(3)], "drops definition 1"),
+    ];
+    for (desired, expected) in cases {
+        let error = commit(&dataset, submission(version, desired, vec![]))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::CommitConflict { .. }),
+            "{expected}: {error:?}"
+        );
+        assert!(error.to_string().contains(expected), "{expected}: {error}");
+    }
+    // malformed requests are plain input errors
+    let error = commit(
+        &dataset,
+        submission(
+            version,
+            vec![definition(1), definition(2), definition(3), definition(3)],
+            vec![],
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("more than once"), "{error}");
+    let error = commit(
+        &dataset,
+        submission(
+            version,
+            vec![
+                definition(1),
+                definition(2),
+                ClusteringDefinition {
+                    columns: vec![7],
+                    ..definition(3)
+                },
+            ],
+            vec![],
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("not in the schema"), "{error}");
+    let reopened = Dataset::open(&dir).await.unwrap();
+    assert_eq!(reopened.manifest().version, version, "nothing landed");
+    assert_eq!(reopened.manifest().max_clustering_id, 2);
+
+    // the identical list adds nothing: the commit is a no-op for definitions
+    let dataset = commit(
+        &dataset,
+        submission(
+            version,
+            vec![definition(1), definition(2)],
+            vec![("org.example.note".to_string(), Some("x".to_string()))],
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ids(&dataset), vec![1, 2]);
+    assert_eq!(dataset.manifest().max_clustering_id, 2);
+    assert_eq!(dataset.manifest().table_metadata["org.example.note"], "x");
+}
+
+#[tokio::test]
+async fn rebased_submission_is_rechecked_against_the_landing_manifest() {
+    let dir = TempStrDir::default();
+    let dataset = write_dataset(&dir).await;
+    let read_version = dataset.manifest().version;
+
+    // X allocates id 1 first
+    let after_x = commit(
+        &dataset,
+        submission(read_version, vec![definition(1)], vec![]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(after_x.manifest().max_clustering_id, 1);
+
+    // W built its list from the same stale snapshot and also wants id 1, with
+    // different content: Lance rebases the UpdateConfig (its record touches no
+    // common key), and the landing check refuses the stale id
+    let stale = ClusteringDefinition {
+        provider: "org.example.other".into(),
+        ..definition(1)
+    };
+    let error = commit(&dataset, submission(read_version, vec![stale], vec![]))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::CommitConflict { .. }), "{error:?}");
+    assert!(error.to_string().contains("immutable"), "{error}");
+
+    // the same configuration from the same stale snapshot is a no-op after
+    // the rebase: nothing is allocated twice
+    let dataset = commit(
+        &dataset,
+        submission(
+            read_version,
+            vec![definition(1)],
+            vec![(ACTIVE_KEY.to_string(), Some("1".to_string()))],
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ids(&dataset), vec![1]);
+    assert_eq!(dataset.manifest().max_clustering_id, 1);
+    assert_eq!(dataset.manifest().table_metadata[ACTIVE_KEY], "1");
+
+    // an ordinary append from the stale snapshot rebases over the allocation
+    // and keeps it
+    let appended = InsertBuilder::new(Arc::new(
+        after_x.checkout_version(read_version).await.unwrap(),
+    ))
+    .with_params(&WriteParams {
+        mode: WriteMode::Append,
+        ..Default::default()
+    })
+    .execute(vec![
+        RecordBatch::try_new(
+            schema(),
+            vec![Arc::new(Int32Array::from_iter_values(100..110))],
+        )
+        .unwrap(),
+    ])
+    .await
+    .unwrap();
+    assert_eq!(ids(&appended), vec![1]);
+    assert_eq!(appended.manifest().max_clustering_id, 1);
+    assert_eq!(appended.manifest().fragments.len(), 3);
+}
+
+#[tokio::test]
+async fn ambiguous_success_is_recognized_by_transaction_identity() {
+    use crate::utils::test::{AmbiguousCommitHandler, AmbiguousFailure};
+    let dir = TempStrDir::default();
+    let handler = Arc::new(AmbiguousCommitHandler::default());
+    let dataset = Dataset::write(
+        rows(0..100),
+        &dir,
+        Some(WriteParams {
+            max_rows_per_file: 50,
+            commit_handler: Some(handler.clone()),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    // the store applies the write but reports a conflict; the commit path
+    // reads the version back and recognizes its own transaction (by the
+    // serialized record, which includes the uuid), so the caller sees success
+    handler.fail_next(AmbiguousFailure::LandAndConflict);
+    let submitted = submission(
+        dataset.manifest().version,
+        vec![definition(1)],
+        vec![(ACTIVE_KEY.to_string(), Some("1".to_string()))],
+    );
+    let uuid = submitted.1.uuid.clone();
+    let committed = commit(&dataset, submitted).await.unwrap();
+    assert_eq!(ids(&committed), vec![1]);
+    assert_eq!(committed.manifest().table_metadata[ACTIVE_KEY], "1");
+    let recorded = committed.read_transaction().await.unwrap().unwrap();
+    assert_eq!(recorded.uuid, uuid);
+}
+
+#[tokio::test]
+async fn restored_manifest_keeps_the_mark_for_later_submissions() {
+    let dir = TempStrDir::default();
+    let dataset = write_dataset(&dir).await;
+    let dataset = commit(
+        &dataset,
+        submission(dataset.manifest().version, vec![definition(1)], vec![]),
+    )
+    .await
+    .unwrap();
+    let with_one = dataset.manifest().version;
+    let dataset = commit(
+        &dataset,
+        submission(
+            dataset.manifest().version,
+            vec![definition(1), definition(2)],
+            vec![(ACTIVE_KEY.to_string(), Some("2".to_string()))],
+        ),
+    )
+    .await
+    .unwrap();
+
+    let mut restored = dataset.checkout_version(with_one).await.unwrap();
+    restored.restore().await.unwrap();
+    // definitions merge and the mark never goes down; the provider keys are
+    // the restored version's
+    assert_eq!(ids(&restored), vec![1, 2]);
+    assert_eq!(restored.manifest().max_clustering_id, 2);
+    assert!(!restored.manifest().table_metadata.contains_key(ACTIVE_KEY));
+
+    // a list built from the pre-restore snapshot still describes the current
+    // definitions exactly, so the next allocation continues at 3
+    let dataset = commit(
+        &restored,
+        submission(
+            restored.manifest().version,
+            vec![definition(1), definition(2), definition(3)],
+            vec![(ACTIVE_KEY.to_string(), Some("3".to_string()))],
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ids(&dataset), vec![1, 2, 3]);
+    assert_eq!(dataset.manifest().max_clustering_id, 3);
 }

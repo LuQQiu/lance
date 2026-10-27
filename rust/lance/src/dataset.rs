@@ -39,8 +39,8 @@ use lance_io::utils::{
 };
 use lance_namespace::LanceNamespace;
 use lance_table::format::{
-    DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, MAGIC, Manifest,
-    ManifestBuildConfig, RowIdMeta, pb, populate_manifest_schema_dictionaries,
+    ClusteringDefinition, DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata,
+    MAGIC, Manifest, ManifestBuildConfig, RowIdMeta, pb, populate_manifest_schema_dictionaries,
 };
 use lance_table::io::commit::{
     CommitConfig, CommitError, CommitHandler, CommitLock, ManifestLocation, ManifestNamingScheme,
@@ -1201,6 +1201,14 @@ impl Dataset {
     /// Get the fully qualified URI of this dataset.
     pub fn uri(&self) -> &str {
         &self.uri
+    }
+
+    /// The commit handler this dataset commits through. Lets a caller wrap it
+    /// for one commit via [`CommitBuilder::with_commit_handler`], for example
+    /// to fence that commit to an exact version, without reopening the
+    /// dataset or knowing how the handler was chosen.
+    pub fn commit_handler(&self) -> Arc<dyn CommitHandler> {
+        self.commit_handler.clone()
     }
 
     pub fn branch_location(&self) -> BranchLocation {
@@ -4328,6 +4336,9 @@ pub(crate) struct ManifestWriteConfig {
     /// `cleanup_frag_reuse_index` against the current manifest entry; see
     /// `ManifestBuildConfig::tagged_frag_reuse_trim`.
     tagged_frag_reuse_trim: bool, // default false
+    /// The writer's complete desired clustering definitions list for an
+    /// `UpdateConfig` commit; see `ManifestBuildConfig::clustering_definitions`.
+    clustering_definitions: Option<Vec<ClusteringDefinition>>, // default None
 }
 
 impl Default for ManifestWriteConfig {
@@ -4342,6 +4353,7 @@ impl Default for ManifestWriteConfig {
             migration_next_row_id: None,
             activate_non_reusable_field_ids: false,
             tagged_frag_reuse_trim: false,
+            clustering_definitions: None,
         }
     }
 }
@@ -4384,6 +4396,7 @@ impl ManifestWriteConfig {
             disable_transaction_file: self.disable_transaction_file,
             migration_next_row_id: self.migration_next_row_id,
             activate_non_reusable_field_ids: self.activate_non_reusable_field_ids,
+            clustering_definitions: self.clustering_definitions.clone(),
             spilled_row_lineage: Default::default(),
         }
     }
