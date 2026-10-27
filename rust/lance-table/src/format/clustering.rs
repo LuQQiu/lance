@@ -8,13 +8,13 @@
 //! description lives under provider-owned keys in `Manifest::table_metadata`.
 //! Lance carries the definitions and the references; it never interprets them.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
 
 use crate::format::pb;
-use crate::format::{IndexMetadata, Manifest};
+use crate::format::{Fragment, IndexMetadata, Manifest};
 
 /// An immutable clustering definition referenced by fragment and index
 /// segment `clustering_id`.
@@ -88,11 +88,79 @@ impl TryFrom<pb::Clustering> for ClusteringDefinition {
 /// Check the clustering invariants of a manifest and its index section.
 ///
 /// Definitions are well formed with unique ids at or below the high-water
-/// mark, and every fragment or index segment reference names a definition in
-/// the manifest. A definition's key columns are not checked against the
-/// current schema: a column may have been dropped after the definition was
-/// allocated, and the objects still referencing it are not thereby invalid.
-pub fn validate_clustering(manifest: &Manifest, indices: &[IndexMetadata]) -> Result<()> {
+/// mark, and every fragment or index segment reference named in
+/// `references` resolves to a definition in the manifest. A definition's key
+/// columns are not checked against the current schema: a column may have been
+/// dropped after the definition was allocated, and the objects still
+/// referencing it are not thereby invalid.
+///
+/// `references` carries only what the commit newly introduced or changed. The
+/// definitions list is append-only on every production path, so a reference
+/// that resolved against a valid base manifest still resolves against the
+/// manifest built from it; nothing else has to be revisited. Callers that have
+/// no such base, or that want the whole table audited, use
+/// [`validate_clustering`].
+pub fn validate_clustering_of(manifest: &Manifest, references: &ChangedReferences) -> Result<()> {
+    let ids = definition_ids(manifest)?;
+    for (fragment, id) in &references.fragments {
+        if !ids.contains(id) {
+            return Err(Error::invalid_input(format!(
+                "fragment {fragment} references clustering definition {id}, which the manifest does not define"
+            )));
+        }
+    }
+    for (segment, name, id) in &references.index_segments {
+        if !ids.contains(id) {
+            return Err(Error::invalid_input(format!(
+                "index segment {segment} ({name}) references clustering definition {id}, which the manifest does not define"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The clustering labels a commit introduced or changed.
+///
+/// Accumulated where the builder forms the candidate's object lists, so its
+/// size is proportional to what the operation touched and not to the table: a
+/// metadata-only commit contributes nothing and costs no per-object work.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ChangedReferences {
+    fragments: Vec<(u64, u32)>,
+    index_segments: Vec<(String, String, u32)>,
+    /// Every clustering-specific object visit, including accumulation. A test
+    /// asserts on this: a counter that only counted survivors of a filter
+    /// could not witness a traversal it was downstream of.
+    visits: usize,
+}
+
+impl ChangedReferences {
+    /// Note a fragment whose label this commit introduced or changed.
+    pub fn fragment(&mut self, fragment: &Fragment) {
+        self.visits += 1;
+        if let Some(id) = fragment.clustering_id {
+            self.fragments.push((fragment.id, id));
+        }
+    }
+
+    /// Note an index segment whose label this commit introduced or changed.
+    pub fn index_segment(&mut self, segment: &IndexMetadata) {
+        self.visits += 1;
+        if let Some(id) = segment.clustering_id {
+            self.index_segments
+                .push((segment.uuid.to_string(), segment.name.clone(), id));
+        }
+    }
+
+    #[cfg(test)]
+    pub fn visits(&self) -> usize {
+        self.visits
+    }
+}
+
+/// The definition set and watermark checks, which are O(definitions) and run
+/// on every commit regardless of scope.
+fn definition_ids(manifest: &Manifest) -> Result<HashSet<u32>> {
     let mut ids = HashSet::with_capacity(manifest.clustering.len());
     for definition in &manifest.clustering {
         definition.validate()?;
@@ -109,6 +177,15 @@ pub fn validate_clustering(manifest: &Manifest, indices: &[IndexMetadata]) -> Re
             )));
         }
     }
+    Ok(ids)
+}
+
+/// Audit every fragment and index segment reference in `manifest`.
+///
+/// This is the opt-in full diagnostic pass. It is deliberately NOT wired into
+/// the commit path or table open, which validate only what they changed.
+pub fn validate_clustering(manifest: &Manifest, indices: &[IndexMetadata]) -> Result<()> {
+    let ids = definition_ids(manifest)?;
     for fragment in manifest.fragments.iter() {
         if let Some(id) = fragment.clustering_id
             && !ids.contains(&id)
@@ -134,23 +211,28 @@ pub fn validate_clustering(manifest: &Manifest, indices: &[IndexMetadata]) -> Re
 
 /// Apply a writer's COMPLETE desired definitions list to `manifest`.
 ///
-/// The writer built `desired` from the manifest it read: every definition that
-/// manifest had, unchanged, plus the ones it wants to add. Against the manifest
-/// the transaction actually lands on, this requires that every current
-/// definition appears in `desired` with identical content (matched by id;
-/// order is not significant), that nothing else reuses a current id, and that
-/// the remaining entries, in list order, carry `max_clustering_id + 1, +2, ...`.
-/// New entries are validated and must be keyed on columns the schema has. A
-/// list that adds nothing leaves the manifest untouched.
+/// `desired` is the exact definition list the next manifest must carry, not an
+/// append list: a current definition the writer omits is removed, and the
+/// entries it adds continue `max_clustering_id` in allocation order. The
+/// watermark never goes backwards, so removing a definition does not release
+/// its id, and an id at or below the mark can never be allocated again.
 ///
-/// A dropped or changed current definition, a reused id or an id that no
-/// longer continues the mark means the list was built from a stale snapshot;
-/// that is a commit conflict the writer must resolve by reloading and
-/// rebuilding the list, not by retrying the same transaction. `commit_version`
-/// is only used to label that error.
+/// `read` is the definition set the writer planned against. It is what
+/// separates an intended removal from a lost race: omitting a definition the
+/// writer never saw would silently drop a concurrent allocation, so that is a
+/// conflict the writer must resolve by reloading and rebuilding the list.
+/// Callers that have no separate read snapshot pass the landing base, which is
+/// correct precisely because nothing can have intervened.
+///
+/// Removal does not look at fragments or index segments. An object label may
+/// outlive the definition it names, and a concurrent append carrying a removed
+/// id is not a reason for this catalog update to fail.
+///
+/// `commit_version` only labels the conflict error.
 pub fn apply_complete_clustering_definitions(
     manifest: &mut Manifest,
     desired: &[ClusteringDefinition],
+    read: &[ClusteringDefinition],
     commit_version: u64,
 ) -> Result<()> {
     let stale = |message: String| Error::commit_conflict_source(commit_version, message.into());
@@ -161,8 +243,10 @@ pub fn apply_complete_clustering_definitions(
             duplicate.id
         )));
     }
+    let by_id: HashMap<u32, &ClusteringDefinition> = desired.iter().map(|d| (d.id, d)).collect();
+    let read_ids: HashSet<u32> = read.iter().map(|d| d.id).collect();
     for current in &manifest.clustering {
-        match desired.iter().find(|d| d.id == current.id) {
+        match by_id.get(&current.id).copied() {
             Some(d) if d == current => {}
             Some(_) => {
                 return Err(stale(format!(
@@ -171,19 +255,24 @@ pub fn apply_complete_clustering_definitions(
                     current.id
                 )));
             }
+            // Omitted. Intended removal only if the writer planned against a
+            // snapshot that had it; otherwise the list predates this
+            // definition and publishing it would drop a concurrent allocation.
+            None if read_ids.contains(&current.id) => {}
             None => {
                 return Err(stale(format!(
-                    "desired clustering definitions list drops definition {}; definitions are \
-                     append-only, reload the manifest and rebuild the list",
+                    "desired clustering definitions list omits definition {}, which the writer \
+                     never read; reload the manifest and rebuild the list",
                     current.id
                 )));
             }
         }
     }
+    let current_ids: HashSet<u32> = manifest.clustering.iter().map(|c| c.id).collect();
     let mut next = manifest.max_clustering_id;
     let mut added = Vec::new();
     for definition in desired {
-        if manifest.clustering.iter().any(|c| c.id == definition.id) {
+        if current_ids.contains(&definition.id) {
             continue;
         }
         definition.validate()?;
@@ -212,9 +301,20 @@ pub fn apply_complete_clustering_definitions(
         next = expected;
         added.push(definition.clone());
     }
-    if added.is_empty() {
+    // Retained entries keep their order; additions follow in allocation order.
+    // A removal-only list adds nothing, so this cannot early-return on
+    // `added.is_empty()`.
+    let retained: Vec<ClusteringDefinition> = manifest
+        .clustering
+        .iter()
+        .filter(|current| by_id.contains_key(&current.id))
+        .cloned()
+        .collect();
+    let removed = manifest.clustering.len() - retained.len();
+    if removed == 0 && added.is_empty() {
         return Ok(());
     }
+    manifest.clustering = retained;
     manifest.clustering.extend(added);
     manifest.max_clustering_id = next;
     Ok(())
@@ -228,16 +328,24 @@ pub fn merge_clustering_definitions(
     target: &mut Vec<ClusteringDefinition>,
     other: &[ClusteringDefinition],
 ) -> Result<()> {
+    let mut positions: HashMap<u32, usize> = target
+        .iter()
+        .enumerate()
+        .map(|(index, definition)| (definition.id, index))
+        .collect();
     for definition in other {
-        match target.iter().find(|existing| existing.id == definition.id) {
-            Some(existing) if existing == definition => {}
-            Some(existing) => {
+        match positions.get(&definition.id) {
+            Some(&index) if target[index] == *definition => {}
+            Some(&index) => {
                 return Err(Error::invalid_input(format!(
                     "clustering definition {} differs between manifests: {:?} versus {:?}",
-                    definition.id, existing, definition
+                    definition.id, target[index], definition
                 )));
             }
-            None => target.push(definition.clone()),
+            None => {
+                positions.insert(definition.id, target.len());
+                target.push(definition.clone());
+            }
         }
     }
     target.sort_by_key(|definition| definition.id);
@@ -303,6 +411,186 @@ mod tests {
         manifest.clustering = definitions;
         manifest.max_clustering_id = max_id;
         manifest
+    }
+
+    /// The accumulator must witness every clustering-specific object visit,
+    /// including its own collection: a counter placed after the inherited
+    /// check could report one visit while having walked both snapshots.
+    /// Holding the operation fixed, growing the untouched object set must not
+    /// change the count at all.
+    #[test]
+    fn clustering_visits_do_not_grow_with_the_untouched_object_set() {
+        let mut counts = Vec::new();
+        for untouched in [1usize, 1_000] {
+            let mut references = ChangedReferences::default();
+            // Objects this commit did not touch are never handed to the
+            // accumulator, which is the whole point: the builder only reports
+            // what it introduced.
+            let _ = untouched;
+            let mut introduced = crate::format::Fragment::new(7);
+            introduced.clustering_id = Some(1);
+            references.fragment(&introduced);
+            counts.push(references.visits());
+        }
+        assert_eq!(
+            counts[0], counts[1],
+            "clustering work must depend on what the commit changed, not on table size"
+        );
+        assert_eq!(counts[0], 1);
+    }
+
+    /// An introduced label that names no definition is refused.
+    #[test]
+    fn an_introduced_reference_to_an_undefined_id_is_refused() {
+        let manifest = manifest_with(vec![definition(1)], 1);
+        let mut dangling = crate::format::Fragment::new(7);
+        dangling.clustering_id = Some(2);
+        let mut references = ChangedReferences::default();
+        references.fragment(&dangling);
+        let error = validate_clustering_of(&manifest, &references).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("which the manifest does not define"),
+            "{error}"
+        );
+    }
+
+    /// An introduced index segment label is checked the same way.
+    #[test]
+    fn an_introduced_index_segment_reference_to_an_undefined_id_is_refused() {
+        let manifest = manifest_with(vec![definition(1)], 1);
+        let mut segment = crate::transaction::test_support::sample_index_metadata("idx");
+        segment.clustering_id = Some(9);
+        let mut references = ChangedReferences::default();
+        references.index_segment(&segment);
+        let error = validate_clustering_of(&manifest, &references).unwrap_err();
+        assert!(error.to_string().contains("index segment"), "{error}");
+    }
+
+    /// A label that resolves is accepted, and the definition set is still
+    /// checked in full even when nothing was introduced.
+    #[test]
+    fn an_empty_change_set_still_validates_the_definition_set() {
+        let manifest = manifest_with(vec![definition(1)], 1);
+        validate_clustering_of(&manifest, &ChangedReferences::default()).unwrap();
+
+        let above_mark = manifest_with(vec![definition(5)], 1);
+        let error = validate_clustering_of(&above_mark, &ChangedReferences::default()).unwrap_err();
+        assert!(
+            error.to_string().contains("above max_clustering_id"),
+            "{error}"
+        );
+    }
+
+    /// The desired list is the target, not an append list: an omitted
+    /// definition the writer did read is removed, and the watermark stays put
+    /// so the id is never handed out again.
+    #[test]
+    fn a_removal_only_target_deletes_and_keeps_the_watermark() {
+        let read = vec![definition(1), definition(2), definition(3)];
+        let mut manifest = manifest_with(read.clone(), 3);
+        apply_complete_clustering_definitions(
+            &mut manifest,
+            &[definition(2), definition(3)],
+            &read,
+            4,
+        )
+        .unwrap();
+        assert_eq!(ids(&manifest), vec![2, 3], "definition 1 is removed");
+        assert_eq!(
+            manifest.max_clustering_id, 3,
+            "a removal never releases the id"
+        );
+    }
+
+    /// Removal and allocation in one list, which must be one atomic result.
+    #[test]
+    fn a_target_can_remove_and_add_at_once() {
+        let read = vec![definition(1), definition(2), definition(3)];
+        let mut manifest = manifest_with(read.clone(), 3);
+        apply_complete_clustering_definitions(
+            &mut manifest,
+            &[definition(2), definition(3), definition(4)],
+            &read,
+            4,
+        )
+        .unwrap();
+        assert_eq!(ids(&manifest), vec![2, 3, 4]);
+        assert_eq!(manifest.max_clustering_id, 4);
+    }
+
+    /// An empty target clears the set and still preserves the mark.
+    #[test]
+    fn an_empty_target_clears_the_set_and_preserves_the_mark() {
+        let read = vec![definition(1), definition(2), definition(3)];
+        let mut manifest = manifest_with(read.clone(), 3);
+        apply_complete_clustering_definitions(&mut manifest, &[], &read, 4).unwrap();
+        assert!(manifest.clustering.is_empty());
+        assert_eq!(manifest.max_clustering_id, 3);
+    }
+
+    /// A removed id is spent: it cannot come back as a fresh allocation, since
+    /// new ids continue the mark rather than filling gaps.
+    #[test]
+    fn a_removed_id_cannot_be_reallocated() {
+        let read = vec![definition(1), definition(2)];
+        let mut manifest = manifest_with(read.clone(), 2);
+        apply_complete_clustering_definitions(&mut manifest, &[definition(2)], &read, 3).unwrap();
+        assert_eq!(manifest.max_clustering_id, 2);
+
+        // Resubmitting id 1 as new is below the mark, so it is refused.
+        let read_after = vec![definition(2)];
+        let error = apply_complete_clustering_definitions(
+            &mut manifest,
+            &[definition(1), definition(2)],
+            &read_after,
+            4,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("does not continue"),
+            "a spent id is not a fresh allocation: {error}"
+        );
+    }
+
+    /// The distinction that makes removal safe: omitting a definition the
+    /// writer never read is a lost concurrent allocation, not an intent to
+    /// delete, and publishing it would silently drop that definition.
+    #[test]
+    fn omitting_a_definition_the_writer_never_read_is_a_conflict() {
+        // The writer planned against [1] and wants to keep just [1]; by the
+        // time it lands, someone else allocated 2.
+        let read = vec![definition(1)];
+        let mut manifest = manifest_with(vec![definition(1), definition(2)], 2);
+        let error =
+            apply_complete_clustering_definitions(&mut manifest, &[definition(1)], &read, 3)
+                .unwrap_err();
+        assert!(
+            error.to_string().contains("never read"),
+            "a concurrent allocation must not be dropped: {error}"
+        );
+        assert_eq!(
+            ids(&manifest),
+            vec![1, 2],
+            "the manifest is left untouched by a refused apply"
+        );
+    }
+
+    /// Retained definitions stay immutable even while others are removed.
+    #[test]
+    fn a_removal_cannot_smuggle_a_change_to_a_retained_definition() {
+        let read = vec![definition(1), definition(2)];
+        let mut manifest = manifest_with(read.clone(), 2);
+        let mut altered = definition(2);
+        altered.columns = vec![0, 0];
+        let error =
+            apply_complete_clustering_definitions(&mut manifest, &[altered], &read, 3).unwrap_err();
+        assert!(error.to_string().contains("immutable"), "{error}");
+    }
+
+    fn ids(manifest: &Manifest) -> Vec<u32> {
+        manifest.clustering.iter().map(|d| d.id).collect()
     }
 
     fn definition(id: u32) -> ClusteringDefinition {

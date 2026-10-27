@@ -9,6 +9,7 @@
 //! drop the index. Getting this wrong does not fail the commit -- it silently
 //! returns stale rows from the index -- so each rule here is paired with a test.
 
+use crate::format::clustering::ChangedReferences;
 use crate::format::overlay::staleness::collect_overlay_stale_frags;
 use crate::format::{Fragment, IndexMetadata};
 use crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
@@ -781,6 +782,7 @@ impl Transaction {
         fragment_id: &mut u64,
         version: u64,
         _next_row_id: Option<&u64>,
+        changed_clustering_references: &mut ChangedReferences,
     ) -> Result<()> {
         // Index fragment positions up front so each rewrite group is located in
         // O(1). Scanning and splicing/retaining the fragment list per group is
@@ -820,6 +822,10 @@ impl Transaction {
 
             let new_fragments = Self::fragments_with_ids(group.new_fragments.clone(), fragment_id)
                 .collect::<Vec<_>>();
+            // These are this commit's outputs, whichever path places them.
+            for fragment in &new_fragments {
+                changed_clustering_references.fragment(fragment);
+            }
 
             // Version metadata for rewritten fragments is handled by the compaction code
             // (recalc_versions_for_rewritten_fragments) which preserves version information
@@ -947,6 +953,7 @@ mod tests {
             &mut fragment_id,
             version,
             None,
+            &mut ChangedReferences::default(),
         )
         .unwrap();
 
@@ -982,6 +989,7 @@ mod tests {
             &mut fragment_id,
             42,
             None,
+            &mut ChangedReferences::default(),
         );
 
         let error = result.unwrap_err();
@@ -1008,6 +1016,7 @@ mod tests {
             &mut fragment_id,
             42,
             None,
+            &mut ChangedReferences::default(),
         );
 
         let error = result.unwrap_err();
@@ -1032,6 +1041,7 @@ mod tests {
             &mut fragment_id,
             42,
             None,
+            &mut ChangedReferences::default(),
         )
         .unwrap();
 
@@ -1063,6 +1073,7 @@ mod tests {
             &mut fragment_id,
             42,
             None,
+            &mut ChangedReferences::default(),
         );
 
         let error = result.unwrap_err();

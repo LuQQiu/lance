@@ -4,7 +4,7 @@
 use arrow_buffer::ToByteSlice;
 use uuid::Uuid;
 
-mod clustering;
+pub(crate) mod clustering;
 mod fragment;
 mod index;
 pub mod key_existence;

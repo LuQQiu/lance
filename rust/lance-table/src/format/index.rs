@@ -356,6 +356,7 @@ impl DeepSizeOf for IndexMetadata {
                     }
                 })
                 .unwrap_or(0)
+            + self.metadata.deep_size_of_children(context)
     }
 }
 
@@ -551,6 +552,28 @@ mod tests {
     use super::*;
     use rstest::rstest;
     use std::collections::HashMap;
+
+    /// Provider metadata is heap-allocated and feeds bounded caches, so it has
+    /// to be in the deep size. Compares two entries rather than asserting
+    /// allocator byte counts, which would be brittle.
+    #[test]
+    fn provider_metadata_counts_towards_the_deep_size() {
+        use lance_core::deepsize::DeepSizeOf;
+
+        let bare = crate::transaction::test_support::sample_index_metadata("idx");
+        let mut carrying = bare.clone();
+        carrying.metadata = HashMap::from([(
+            "org.example.cluster.bucket".to_string(),
+            "a reasonably long provider value".to_string(),
+        )]);
+
+        assert!(
+            carrying.deep_size_of() > bare.deep_size_of(),
+            "metadata must contribute: bare={} carrying={}",
+            bare.deep_size_of(),
+            carrying.deep_size_of()
+        );
+    }
 
     #[test]
     fn test_fragment_bitmap_serialized_run_optimized() {

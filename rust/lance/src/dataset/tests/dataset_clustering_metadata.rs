@@ -700,6 +700,111 @@ fn ids(dataset: &Dataset) -> Vec<u32> {
     dataset.manifest().clustering.iter().map(|d| d.id).collect()
 }
 
+/// A definitions list only applies to `UpdateConfig`. Attaching one to any
+/// other operation must fail rather than commit with the list ignored, and the
+/// table must be left exactly as it was. Exercised through
+/// `CommitBuilder::execute`, since the production commit loop reaches the
+/// builder by a different path than the convenience wrapper.
+#[tokio::test]
+async fn definitions_on_an_append_are_refused_and_change_nothing() {
+    let dir = TempStrDir::default();
+    let dataset = write_dataset(&dir).await;
+    let before = dataset.manifest().version;
+
+    let transaction = Transaction::new(
+        before,
+        Operation::Append {
+            fragments: dataset
+                .get_fragments()
+                .iter()
+                .map(|f| f.metadata.clone())
+                .collect(),
+        },
+        None,
+    );
+    let error = CommitBuilder::new(Arc::new(dataset.clone()))
+        .with_clustering_definitions(vec![definition(1)])
+        .execute(transaction)
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("UpdateConfig"),
+        "an Append carrying definitions must be refused: {error:#}"
+    );
+
+    let reopened = Dataset::open(dataset.uri()).await.unwrap();
+    assert_eq!(
+        reopened.manifest().version,
+        before,
+        "nothing may have landed"
+    );
+    assert!(reopened.manifest().clustering.is_empty());
+    assert_eq!(reopened.manifest().max_clustering_id, 0);
+}
+
+/// An EMPTY list is still an input: it must be refused on an unsupported
+/// operation rather than treated as "nothing to do".
+#[tokio::test]
+async fn an_empty_definitions_list_is_still_refused_on_an_append() {
+    let dir = TempStrDir::default();
+    let dataset = write_dataset(&dir).await;
+    let before = dataset.manifest().version;
+
+    let transaction = Transaction::new(
+        before,
+        Operation::Append {
+            fragments: dataset
+                .get_fragments()
+                .iter()
+                .map(|f| f.metadata.clone())
+                .collect(),
+        },
+        None,
+    );
+    let error = CommitBuilder::new(Arc::new(dataset.clone()))
+        .with_clustering_definitions(vec![])
+        .execute(transaction)
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("UpdateConfig"),
+        "an empty list is an input, not an absence: {error:#}"
+    );
+    let reopened = Dataset::open(dataset.uri()).await.unwrap();
+    assert_eq!(reopened.manifest().version, before);
+}
+
+/// Restore dispatches separately from the prepared build path, so it needs its
+/// own rejection: it would otherwise ignore the list and report success.
+#[tokio::test]
+async fn definitions_on_a_restore_are_refused_and_change_nothing() {
+    let dir = TempStrDir::default();
+    let dataset = write_dataset(&dir).await;
+    let first = dataset.manifest().version;
+    // Land a second version so there is an earlier one to restore to.
+    let dataset = commit(&dataset, submission(first, vec![definition(1)], vec![]))
+        .await
+        .unwrap();
+    let before = dataset.manifest().version;
+
+    let transaction = Transaction::new(before, Operation::Restore { version: first }, None);
+    let error = CommitBuilder::new(Arc::new(dataset.clone()))
+        .with_clustering_definitions(vec![definition(1)])
+        .execute(transaction)
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("UpdateConfig"),
+        "a Restore carrying definitions must be refused: {error:#}"
+    );
+    let reopened = Dataset::open(dataset.uri()).await.unwrap();
+    assert_eq!(
+        reopened.manifest().version,
+        before,
+        "nothing may have landed"
+    );
+}
+
 #[tokio::test]
 async fn complete_list_submission_commits_definitions_and_keys_in_one_version() {
     let dir = TempStrDir::default();
