@@ -1287,21 +1287,11 @@ impl Transaction {
                 for new_index in new_indices {
                     new_index.validate_covering_fields()?;
                 }
-                // A remap replaces a segment with a new UUID that carries the
-                // old segment's label; that label is retained, not introduced.
-                // Only a label no removed segment of the same index carried is
-                // a new reference.
-                let carried_labels = removed_indices
-                    .iter()
-                    .filter_map(|old| old.clustering_id.map(|id| (old.name.as_str(), id)))
-                    .collect::<HashSet<_>>();
+                // Every entry is a segment this commit publishes, whether a new
+                // build, a delta, a merge or a remap carrying its source's
+                // label; each is checked against the definitions.
                 for segment in new_indices.iter() {
-                    let carried = segment
-                        .clustering_id
-                        .is_some_and(|id| carried_labels.contains(&(segment.name.as_str(), id)));
-                    if !carried {
-                        changed_clustering_references.index_segment(segment);
-                    }
+                    changed_clustering_references.index_segment(segment);
                 }
                 final_indices.extend(new_indices.clone());
 
@@ -1966,6 +1956,7 @@ impl Transaction {
                         &mut manifest,
                         desired,
                         read_definitions,
+                        &final_indices,
                         current_manifest.map(|m| m.version + 1).unwrap_or(1),
                     )?;
                 }
@@ -6650,12 +6641,12 @@ mod tests {
         );
     }
 
-    /// Compaction remaps a labelled segment to a new UUID that carries the
-    /// same label. That label is retained, not introduced, so the builder does
-    /// not report it; a label no removed segment of that index carried is a
-    /// new reference and is still checked.
+    /// Every segment a CreateIndex publishes is checked, a remap carrying its
+    /// source's label included: with removal refused while referenced, such
+    /// a label always resolves, and a segment labelled with an undefined id
+    /// is refused whatever it replaces.
     #[test]
-    fn create_index_reports_only_the_labels_it_introduces() {
+    fn create_index_checks_every_segment_it_publishes() {
         let (manifest, _) = manifest_with_object_metadata();
         let mut old = sample_index_metadata("idx");
         old.clustering_id = Some(2);
@@ -6678,34 +6669,11 @@ mod tests {
                 &default_build_config(),
             )
             .unwrap();
-        assert_eq!(LAST_CLUSTERING_VISITS.with(|cell| cell.get()), 0);
+        assert_eq!(LAST_CLUSTERING_VISITS.with(|cell| cell.get()), 1);
         assert_eq!(indices.len(), 1);
         assert_eq!(indices[0].uuid, remapped.uuid);
         assert_eq!(indices[0].clustering_id, Some(2));
 
-        // The same label on another index: nothing removed carried it.
-        let mut fresh = sample_index_metadata("other");
-        fresh.clustering_id = Some(2);
-        let transaction = Transaction::new(
-            manifest.version,
-            Operation::CreateIndex {
-                new_indices: vec![fresh],
-                removed_indices: vec![],
-            },
-            None,
-        );
-        transaction
-            .build_manifest(
-                Some(&manifest),
-                vec![old.clone()],
-                "txn",
-                &default_build_config(),
-            )
-            .unwrap();
-        assert_eq!(LAST_CLUSTERING_VISITS.with(|cell| cell.get()), 1);
-
-        // A replacement segment with a label the removed one did not carry
-        // is an introduced reference and must resolve.
         let mut dangling = sample_index_metadata("idx");
         dangling.clustering_id = Some(7);
         let transaction = Transaction::new(
@@ -6724,6 +6692,82 @@ mod tests {
                 .to_string()
                 .contains("references clustering definition 7"),
             "{error}"
+        );
+    }
+
+    fn definitions_update(
+        current: &Manifest,
+        desired: Vec<crate::format::ClusteringDefinition>,
+    ) -> (Transaction, ManifestBuildConfig) {
+        let transaction = Transaction::new(
+            current.version,
+            Operation::UpdateConfig {
+                config_updates: None,
+                table_metadata_updates: None,
+                schema_metadata_updates: None,
+                field_metadata_updates: HashMap::new(),
+            },
+            None,
+        );
+        let mut config = default_build_config();
+        config.clustering_definitions = Some(desired);
+        (transaction, config)
+    }
+
+    /// On the real build path a target that removes a referenced definition
+    /// is refused, naming the object and the id.
+    #[test]
+    fn a_referenced_removal_is_refused_on_the_build_path() {
+        let (manifest, _) = manifest_with_object_metadata();
+        let (transaction, config) = definitions_update(&manifest, vec![]);
+        let error = transaction
+            .build_manifest(Some(&manifest), vec![], "txn", &config)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cannot remove clustering definition 2: fragment 0"),
+            "{error}"
+        );
+    }
+
+    /// The removal check is the only per-object work a definitions update
+    /// does, and it happens once per collection per attempt: an addition over
+    /// a large table walks nothing, and removing three ids costs the same
+    /// single pass as removing one.
+    #[test]
+    fn a_definitions_update_walks_the_table_only_to_check_a_removal() {
+        let definition = |id: u32| crate::format::ClusteringDefinition {
+            id,
+            columns: vec![0],
+            provider: "org.example.cluster".into(),
+            version: 1,
+        };
+        let mut current = sample_manifest_with_fragments(0..2_000);
+        current.clustering = vec![definition(1), definition(2), definition(3)];
+        current.max_clustering_id = 3;
+        let segments = vec![sample_index_metadata("a"), sample_index_metadata("b")];
+
+        let mut observed = Vec::new();
+        for desired in [
+            vec![definition(1), definition(2), definition(3), definition(4)],
+            vec![definition(2), definition(3)],
+            vec![],
+        ] {
+            crate::format::clustering::reset_removal_scan_visits();
+            let (transaction, config) = definitions_update(&current, desired);
+            transaction
+                .build_manifest(Some(&current), segments.clone(), "txn", &config)
+                .unwrap();
+            observed.push((
+                LAST_CLUSTERING_VISITS.with(|cell| cell.get()),
+                crate::format::clustering::last_removal_scan_visits(),
+            ));
+        }
+        assert_eq!(
+            observed,
+            vec![(0, 0), (0, 2_002), (0, 2_002)],
+            "(introduced references, objects walked for the removal check)"
         );
     }
 

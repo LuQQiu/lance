@@ -19,6 +19,7 @@ use lance_table::feature_flags::FLAG_OBJECT_METADATA;
 use lance_table::format::{ClusteringDefinition, IndexMetadata, Manifest};
 use lance_table::io::manifest::read_manifest_indexes;
 use rstest::rstest;
+use uuid::Uuid;
 
 use crate::Dataset;
 use crate::dataset::optimize::{CompactionOptions, compact_files};
@@ -760,6 +761,281 @@ async fn commit(
 
 fn ids(dataset: &Dataset) -> Vec<u32> {
     dataset.manifest().clustering.iter().map(|d| d.id).collect()
+}
+
+/// Append ten rows as one fragment labelled `clustering_id`, through the real
+/// commit path.
+async fn append_labelled(dataset: &Dataset, clustering_id: u32) -> crate::Result<Dataset> {
+    let mut transaction = InsertBuilder::new(Arc::new(dataset.clone()))
+        .with_params(&WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        })
+        .execute_uncommitted(vec![
+            RecordBatch::try_new(
+                schema(),
+                vec![Arc::new(Int32Array::from_iter_values(100..110))],
+            )
+            .unwrap(),
+        ])
+        .await
+        .unwrap();
+    let Operation::Append { fragments } = &mut transaction.operation else {
+        unreachable!()
+    };
+    for fragment in fragments {
+        fragment.clustering_id = Some(clustering_id);
+        fragment.metadata = object_metadata("5");
+    }
+    CommitBuilder::new(Arc::new(dataset.clone()))
+        .execute(transaction)
+        .await
+}
+
+/// A definition is removed only while nothing references it. Definitions
+/// 1 and 2 are pinned by a fragment and by an index segment respectively;
+/// only 3 can go, one referenced id refuses a whole mixed update, and once
+/// 3 is gone no new object can name it.
+#[tokio::test]
+async fn a_referenced_definition_cannot_be_removed() {
+    let dir = TempStrDir::default();
+    let mut dataset = write_dataset(&dir).await;
+    dataset
+        .create_index(
+            &["i"],
+            IndexType::BTree,
+            Some("idx".into()),
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    let dataset = commit_edited_manifest(&dataset, |manifest, indices| {
+        manifest.clustering = vec![definition(1), definition(2), definition(3)];
+        manifest.max_clustering_id = 3;
+        stamp_fragment(manifest, 0, 1, "0");
+        let segment = indices.iter_mut().find(|idx| idx.name == "idx").unwrap();
+        segment.clustering_id = Some(2);
+        segment.metadata = object_metadata("3");
+    })
+    .await;
+    let version = dataset.manifest().version;
+    let note = ("org.example.note".to_string(), Some("x".to_string()));
+
+    // A live fragment reference blocks the removal of 1.
+    let error = commit(
+        &dataset,
+        submission(
+            version,
+            vec![definition(2), definition(3)],
+            vec![note.clone()],
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("cannot remove clustering definition 1: fragment 0"),
+        "{error}"
+    );
+
+    // An index-only reference blocks the removal of 2.
+    let error = commit(
+        &dataset,
+        submission(
+            version,
+            vec![definition(1), definition(3)],
+            vec![note.clone()],
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("cannot remove clustering definition 2: index segment"),
+        "{error}"
+    );
+
+    // One referenced id refuses the whole mixed update, and clearing the list.
+    let error = commit(
+        &dataset,
+        submission(
+            version,
+            vec![definition(2), definition(4)],
+            vec![note.clone()],
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("definition 1"), "{error}");
+    let error = commit(&dataset, submission(version, vec![], vec![note.clone()]))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("cannot remove"), "{error}");
+
+    // Nothing landed: no removal, no allocation, no watermark move, no patch.
+    let reopened = Dataset::open(&dir).await.unwrap();
+    assert_eq!(reopened.manifest().version, version);
+    assert_eq!(ids(&reopened), vec![1, 2, 3]);
+    assert_eq!(reopened.manifest().max_clustering_id, 3);
+    assert!(
+        !reopened
+            .manifest()
+            .table_metadata
+            .contains_key("org.example.note")
+    );
+    assert_eq!(fragment_by_id(&reopened, 0).clustering_id, Some(1));
+    assert_eq!(
+        named_segments(&reopened, "idx").await[0].clustering_id,
+        Some(2)
+    );
+
+    // The unreferenced definition can go, with the patch, keeping the mark.
+    let dataset = commit(
+        &dataset,
+        submission(version, vec![definition(1), definition(2)], vec![note]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ids(&dataset), vec![1, 2]);
+    assert_eq!(dataset.manifest().max_clustering_id, 3);
+    assert_eq!(dataset.manifest().table_metadata["org.example.note"], "x");
+
+    // Deletion landed first: a new object cannot name the absent definition.
+    let error = append_labelled(&dataset, 3).await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("references clustering definition 3"),
+        "{error}"
+    );
+    let appended = append_labelled(&dataset, 1).await.unwrap();
+    assert_eq!(appended.fragments().last().unwrap().clustering_id, Some(1));
+}
+
+/// Writer A plans to remove an unreferenced definition; before A lands,
+/// writer B publishes a fragment that references it, changing neither the
+/// definitions nor the watermark. A is rebased onto B's manifest and the
+/// removal is checked against that landing snapshot, so it is refused.
+#[tokio::test]
+async fn a_concurrent_reference_blocks_a_planned_removal() {
+    let dir = TempStrDir::default();
+    let dataset = write_dataset(&dir).await;
+    let dataset = commit(
+        &dataset,
+        submission(dataset.manifest().version, vec![definition(1)], vec![]),
+    )
+    .await
+    .unwrap();
+    let planned_at = dataset.manifest().version;
+
+    // B lands first.
+    let after_b = append_labelled(&dataset, 1).await.unwrap();
+    assert_eq!(after_b.manifest().version, planned_at + 1);
+    assert_eq!(ids(&after_b), vec![1]);
+    assert_eq!(after_b.manifest().max_clustering_id, 1);
+
+    // A, from its stale snapshot, is rebased and refused on the new landing
+    // candidate, not on the snapshot it planned against.
+    let error = commit(
+        &dataset,
+        submission(
+            planned_at,
+            vec![],
+            vec![("org.example.note".to_string(), Some("x".to_string()))],
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("cannot remove clustering definition 1: fragment"),
+        "{error}"
+    );
+    let reopened = Dataset::open(&dir).await.unwrap();
+    assert_eq!(
+        reopened.manifest().version,
+        planned_at + 1,
+        "A landed nothing"
+    );
+    assert_eq!(ids(&reopened), vec![1]);
+    assert!(
+        !reopened
+            .manifest()
+            .table_metadata
+            .contains_key("org.example.note")
+    );
+    assert_eq!(
+        reopened.fragments().last().unwrap().clustering_id,
+        Some(1),
+        "B's fragment keeps its label"
+    );
+}
+
+/// A CreateIndex published through the real commit path checks every segment
+/// it carries, including one that replaces an existing segment: an undefined
+/// label is refused, a defined one is kept.
+#[tokio::test]
+async fn create_index_publication_checks_the_segment_label() {
+    let dir = TempStrDir::default();
+    let mut dataset = write_dataset(&dir).await;
+    dataset
+        .create_index(
+            &["i"],
+            IndexType::BTree,
+            Some("idx".into()),
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    let dataset = commit_edited_manifest(&dataset, |manifest, _| {
+        manifest.clustering = vec![definition(1)];
+        manifest.max_clustering_id = 1;
+    })
+    .await;
+    let old = named_segments(&dataset, "idx").await.remove(0);
+
+    let replace_with = |clustering_id: u32| {
+        let dataset = dataset.clone();
+        let old = old.clone();
+        async move {
+            let mut replacement = old.clone();
+            replacement.uuid = Uuid::new_v4();
+            replacement.clustering_id = Some(clustering_id);
+            replacement.metadata = object_metadata("3");
+            let transaction = Transaction::new(
+                dataset.manifest().version,
+                Operation::CreateIndex {
+                    new_indices: vec![replacement],
+                    removed_indices: vec![old],
+                },
+                None,
+            );
+            CommitBuilder::new(Arc::new(dataset))
+                .execute(transaction)
+                .await
+        }
+    };
+
+    let error = replace_with(9).await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("references clustering definition 9"),
+        "{error}"
+    );
+    assert_eq!(named_segments(&dataset, "idx").await[0].uuid, old.uuid);
+
+    let committed = replace_with(1).await.unwrap();
+    let segments = named_segments(&committed, "idx").await;
+    assert_eq!(segments.len(), 1);
+    assert_ne!(segments[0].uuid, old.uuid);
+    assert_eq!(segments[0].clustering_id, Some(1));
+    assert_eq!(segments[0].metadata, object_metadata("3"));
 }
 
 /// A definitions list only applies to `UpdateConfig`. Attaching one to any

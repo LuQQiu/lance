@@ -163,14 +163,17 @@ impl<'a> CommitBuilder<'a> {
     }
 
     /// Commit, together with an `UpdateConfig` transaction, the COMPLETE list of
-    /// clustering definitions the next manifest must hold: every definition the
-    /// read manifest had, unchanged, plus the new ones continuing
-    /// `max_clustering_id` in order. Applied against the manifest the commit
-    /// lands on, so a list built from a stale snapshot is a non-retryable
-    /// commit conflict (reload, rebuild the list, resubmit); a list that adds
-    /// nothing is a no-op. The transaction file stays a plain `UpdateConfig`;
-    /// the manifest is the durable record of the definitions. Any other
-    /// operation refuses this input.
+    /// clustering definitions the next manifest must hold: the target list.
+    /// A current definition the list keeps is unchanged, one it omits is
+    /// removed, and the new ones continue `max_clustering_id` in order; the
+    /// watermark never moves backwards. A definition can be removed only while
+    /// no fragment or index segment in the manifest the commit lands on
+    /// references it; otherwise the whole commit is refused. Applied against
+    /// that landing manifest, so a list built from a stale snapshot is a
+    /// non-retryable commit conflict (reload, rebuild the list, resubmit); a
+    /// list identical to the current one is a no-op. The transaction file
+    /// stays a plain `UpdateConfig`; the manifest is the durable record of the
+    /// definitions. Any other operation refuses this input.
     pub fn with_clustering_definitions(mut self, definitions: Vec<ClusteringDefinition>) -> Self {
         self.clustering_definitions = Some(definitions);
         self

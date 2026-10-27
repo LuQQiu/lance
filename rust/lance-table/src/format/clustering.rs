@@ -94,12 +94,12 @@ impl TryFrom<pb::Clustering> for ClusteringDefinition {
 /// dropped after the definition was allocated, and the objects still
 /// referencing it are not thereby invalid.
 ///
-/// `references` carries only what the commit newly introduced or changed. The
-/// definitions list is append-only on every production path, so a reference
-/// that resolved against a valid base manifest still resolves against the
-/// manifest built from it; nothing else has to be revisited. Callers that have
-/// no such base, or that want the whole table audited, use
-/// [`validate_clustering`].
+/// `references` carries only what the commit newly introduced or changed. A
+/// definition can only be removed while nothing references it (see
+/// [`apply_complete_clustering_definitions`]), so a reference that resolved
+/// against a valid base manifest still resolves against the manifest built
+/// from it; nothing else has to be revisited. Callers that have no such base,
+/// or that want the whole table audited, use [`validate_clustering`].
 pub fn validate_clustering_of(manifest: &Manifest, references: &ChangedReferences) -> Result<()> {
     let ids = definition_ids(manifest)?;
     for (fragment, id) in &references.fragments {
@@ -224,15 +224,19 @@ pub fn validate_clustering(manifest: &Manifest, indices: &[IndexMetadata]) -> Re
 /// Callers that have no separate read snapshot pass the landing base, which is
 /// correct precisely because nothing can have intervened.
 ///
-/// Removal does not look at fragments or index segments. An object label may
-/// outlive the definition it names, and a concurrent append carrying a removed
-/// id is not a reason for this catalog update to fail.
+/// A definition is removed only while nothing references it. `indices` is the
+/// index section the manifest is published with; when the target removes ids,
+/// the manifest's fragments and `indices` are each walked once, and a fragment
+/// or index segment still labelled with a removed id refuses the whole update.
+/// A target that removes nothing walks neither. The manifest is untouched on
+/// every error.
 ///
 /// `commit_version` only labels the conflict error.
 pub fn apply_complete_clustering_definitions(
     manifest: &mut Manifest,
     desired: &[ClusteringDefinition],
     read: &[ClusteringDefinition],
+    indices: &[IndexMetadata],
     commit_version: u64,
 ) -> Result<()> {
     let stale = |message: String| Error::commit_conflict_source(commit_version, message.into());
@@ -310,14 +314,88 @@ pub fn apply_complete_clustering_definitions(
         .filter(|current| by_id.contains_key(&current.id))
         .cloned()
         .collect();
-    let removed = manifest.clustering.len() - retained.len();
-    if removed == 0 && added.is_empty() {
+    let removed_ids: HashSet<u32> = manifest
+        .clustering
+        .iter()
+        .filter(|current| !by_id.contains_key(&current.id))
+        .map(|current| current.id)
+        .collect();
+    if removed_ids.is_empty() && added.is_empty() {
+        #[cfg(test)]
+        LAST_REMOVAL_SCAN_VISITS.with(|cell| cell.set(0));
         return Ok(());
     }
+    refuse_referenced_removals(manifest, indices, &removed_ids)?;
     manifest.clustering = retained;
     manifest.clustering.extend(added);
     manifest.max_clustering_id = next;
     Ok(())
+}
+
+/// Refuse to remove a definition that a fragment or index segment in the
+/// snapshot still references. Each collection is walked once, and only when
+/// `removed_ids` is non-empty: a target that removes nothing costs no
+/// per-object work.
+fn refuse_referenced_removals(
+    manifest: &Manifest,
+    indices: &[IndexMetadata],
+    removed_ids: &HashSet<u32>,
+) -> Result<()> {
+    #[cfg(test)]
+    LAST_REMOVAL_SCAN_VISITS.with(|cell| {
+        cell.set(if removed_ids.is_empty() {
+            0
+        } else {
+            manifest.fragments.len() + indices.len()
+        })
+    });
+    if removed_ids.is_empty() {
+        return Ok(());
+    }
+    if let Some(fragment) = manifest.fragments.iter().find(|fragment| {
+        fragment
+            .clustering_id
+            .is_some_and(|id| removed_ids.contains(&id))
+    }) {
+        return Err(Error::invalid_input(format!(
+            "cannot remove clustering definition {}: fragment {} still references it",
+            fragment.clustering_id.unwrap_or_default(),
+            fragment.id
+        )));
+    }
+    if let Some(segment) = indices.iter().find(|segment| {
+        segment
+            .clustering_id
+            .is_some_and(|id| removed_ids.contains(&id))
+    }) {
+        return Err(Error::invalid_input(format!(
+            "cannot remove clustering definition {}: index segment {} ({}) still references it",
+            segment.clustering_id.unwrap_or_default(),
+            segment.uuid,
+            segment.name
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Objects the last apply walked for the removal check: fragments plus
+    /// index segments when the target removed ids, zero otherwise.
+    static LAST_REMOVAL_SCAN_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Objects the last [`apply_complete_clustering_definitions`] on this thread
+/// walked for its removal check.
+#[cfg(test)]
+pub fn last_removal_scan_visits() -> usize {
+    LAST_REMOVAL_SCAN_VISITS.with(|cell| cell.get())
+}
+
+/// Forget the last removal-check count on this thread.
+#[cfg(test)]
+pub fn reset_removal_scan_visits() {
+    LAST_REMOVAL_SCAN_VISITS.with(|cell| cell.set(0));
 }
 
 /// Add every definition of `other` that `target` lacks, keeping ids sorted.
@@ -494,6 +572,7 @@ mod tests {
             &mut manifest,
             &[definition(2), definition(3)],
             &read,
+            &[],
             4,
         )
         .unwrap();
@@ -513,6 +592,7 @@ mod tests {
             &mut manifest,
             &[definition(2), definition(3), definition(4)],
             &read,
+            &[],
             4,
         )
         .unwrap();
@@ -525,7 +605,7 @@ mod tests {
     fn an_empty_target_clears_the_set_and_preserves_the_mark() {
         let read = vec![definition(1), definition(2), definition(3)];
         let mut manifest = manifest_with(read.clone(), 3);
-        apply_complete_clustering_definitions(&mut manifest, &[], &read, 4).unwrap();
+        apply_complete_clustering_definitions(&mut manifest, &[], &read, &[], 4).unwrap();
         assert!(manifest.clustering.is_empty());
         assert_eq!(manifest.max_clustering_id, 3);
     }
@@ -536,7 +616,8 @@ mod tests {
     fn a_removed_id_cannot_be_reallocated() {
         let read = vec![definition(1), definition(2)];
         let mut manifest = manifest_with(read.clone(), 2);
-        apply_complete_clustering_definitions(&mut manifest, &[definition(2)], &read, 3).unwrap();
+        apply_complete_clustering_definitions(&mut manifest, &[definition(2)], &read, &[], 3)
+            .unwrap();
         assert_eq!(manifest.max_clustering_id, 2);
 
         // Resubmitting id 1 as new is below the mark, so it is refused.
@@ -545,6 +626,7 @@ mod tests {
             &mut manifest,
             &[definition(1), definition(2)],
             &read_after,
+            &[],
             4,
         )
         .unwrap_err();
@@ -564,7 +646,7 @@ mod tests {
         let read = vec![definition(1)];
         let mut manifest = manifest_with(vec![definition(1), definition(2)], 2);
         let error =
-            apply_complete_clustering_definitions(&mut manifest, &[definition(1)], &read, 3)
+            apply_complete_clustering_definitions(&mut manifest, &[definition(1)], &read, &[], 3)
                 .unwrap_err();
         assert!(
             error.to_string().contains("never read"),
@@ -584,9 +666,138 @@ mod tests {
         let mut manifest = manifest_with(read.clone(), 2);
         let mut altered = definition(2);
         altered.columns = vec![0, 0];
-        let error =
-            apply_complete_clustering_definitions(&mut manifest, &[altered], &read, 3).unwrap_err();
+        let error = apply_complete_clustering_definitions(&mut manifest, &[altered], &read, &[], 3)
+            .unwrap_err();
         assert!(error.to_string().contains("immutable"), "{error}");
+    }
+
+    /// A fragment still labelled with a definition pins it: the target that
+    /// omits it is refused and the manifest is left exactly as it was.
+    #[test]
+    fn a_fragment_reference_blocks_the_removal() {
+        let read = vec![definition(1), definition(2), definition(3)];
+        let mut manifest = manifest_with(read.clone(), 3);
+        std::sync::Arc::make_mut(&mut manifest.fragments)[0].clustering_id = Some(1);
+        let error = apply_complete_clustering_definitions(
+            &mut manifest,
+            &[definition(2), definition(3)],
+            &read,
+            &[],
+            4,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cannot remove clustering definition 1: fragment 0"),
+            "{error}"
+        );
+        assert_eq!(ids(&manifest), vec![1, 2, 3]);
+        assert_eq!(manifest.max_clustering_id, 3);
+    }
+
+    /// An index segment alone pins a definition just the same.
+    #[test]
+    fn an_index_segment_reference_blocks_the_removal() {
+        let read = vec![definition(1), definition(2), definition(3)];
+        let mut manifest = manifest_with(read.clone(), 3);
+        let mut segment = crate::transaction::test_support::sample_index_metadata("idx");
+        segment.clustering_id = Some(2);
+        let error = apply_complete_clustering_definitions(
+            &mut manifest,
+            &[definition(1), definition(3)],
+            &read,
+            std::slice::from_ref(&segment),
+            4,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains(&format!(
+                "cannot remove clustering definition 2: index segment {} (idx)",
+                segment.uuid
+            )),
+            "{error}"
+        );
+        assert_eq!(ids(&manifest), vec![1, 2, 3]);
+
+        // The unreferenced one can still go.
+        apply_complete_clustering_definitions(
+            &mut manifest,
+            &[definition(1), definition(2)],
+            &read,
+            &[segment],
+            4,
+        )
+        .unwrap();
+        assert_eq!(ids(&manifest), vec![1, 2]);
+        assert_eq!(manifest.max_clustering_id, 3);
+    }
+
+    /// One referenced id refuses the whole mixed update: no removal, no
+    /// allocation and no watermark movement get through.
+    #[test]
+    fn one_referenced_id_refuses_the_whole_mixed_update() {
+        let read = vec![definition(1), definition(2), definition(3)];
+        let mut manifest = manifest_with(read.clone(), 3);
+        std::sync::Arc::make_mut(&mut manifest.fragments)[0].clustering_id = Some(2);
+        let error = apply_complete_clustering_definitions(
+            &mut manifest,
+            &[definition(3), definition(4)],
+            &read,
+            &[],
+            4,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("definition 2"), "{error}");
+        assert_eq!(ids(&manifest), vec![1, 2, 3], "nothing removed");
+        assert_eq!(manifest.max_clustering_id, 3, "nothing allocated");
+    }
+
+    /// The removal check walks each collection once per apply, however many
+    /// ids the target removes, and not at all when it removes none.
+    #[test]
+    fn the_removal_check_walks_each_collection_once() {
+        let read = vec![definition(1), definition(2), definition(3)];
+        let fragments: Vec<Fragment> = (0..500).map(Fragment::new).collect();
+        let segments: Vec<IndexMetadata> = (0..7)
+            .map(|_| crate::transaction::test_support::sample_index_metadata("idx"))
+            .collect();
+        let fresh = || {
+            let mut manifest = manifest_with(read.clone(), 3);
+            manifest.fragments = std::sync::Arc::new(fragments.clone());
+            manifest
+        };
+
+        apply_complete_clustering_definitions(
+            &mut fresh(),
+            &[definition(1), definition(2), definition(3), definition(4)],
+            &read,
+            &segments,
+            4,
+        )
+        .unwrap();
+        assert_eq!(last_removal_scan_visits(), 0, "an addition walks nothing");
+
+        apply_complete_clustering_definitions(
+            &mut fresh(),
+            &[definition(2), definition(3)],
+            &read,
+            &segments,
+            4,
+        )
+        .unwrap();
+        assert_eq!(
+            last_removal_scan_visits(),
+            507,
+            "one removed id: one pass each"
+        );
+
+        apply_complete_clustering_definitions(&mut fresh(), &[], &read, &segments, 4).unwrap();
+        assert_eq!(
+            last_removal_scan_visits(),
+            507,
+            "three removed ids: still one pass each"
+        );
     }
 
     fn ids(manifest: &Manifest) -> Vec<u32> {
