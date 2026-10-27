@@ -1221,6 +1221,14 @@ impl Dataset {
         &self.uri
     }
 
+    /// The commit handler this dataset commits through. Lets a caller wrap it
+    /// for one commit via [`CommitBuilder::with_commit_handler`], for example
+    /// to fence that commit to an exact version, without reopening the
+    /// dataset or knowing how the handler was chosen.
+    pub fn commit_handler(&self) -> Arc<dyn CommitHandler> {
+        self.commit_handler.clone()
+    }
+
     pub fn branch_location(&self) -> BranchLocation {
         BranchLocation {
             path: self.base.clone(),
