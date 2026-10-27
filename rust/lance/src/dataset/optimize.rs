@@ -16461,7 +16461,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_compaction_preserves_blob_values(dataset, &expected).await;
+        Box::pin(assert_compaction_preserves_blob_values(dataset, &expected)).await;
     }
 
     #[tokio::test]
@@ -16501,7 +16501,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_compaction_preserves_blob_values(dataset, &expected).await;
+        Box::pin(assert_compaction_preserves_blob_values(dataset, &expected)).await;
     }
 
     #[tokio::test]
