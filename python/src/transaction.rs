@@ -15,7 +15,7 @@ use lance::datatypes::{Field, Schema};
 use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
 use lance_table::format::{BasePath, DataFile, Fragment, IndexFile, IndexMetadata};
 use lance_table::system_index::mem_wal::CompactedSsTable;
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyNotImplementedError, PyValueError};
 use pyo3::types::{PyDict, PyList};
 use pyo3::{Bound, FromPyObject, PyAny, PyResult, Python};
 use pyo3::{intern, prelude::*};
@@ -709,6 +709,7 @@ impl FromPyObject<'_, '_> for PyLance<Operation> {
                     table_metadata_updates,
                     schema_metadata_updates,
                     field_metadata_updates,
+                    clustering_definitions: None,
                 };
                 Ok(Self(op))
             }
@@ -937,7 +938,15 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                 table_metadata_updates,
                 schema_metadata_updates,
                 field_metadata_updates,
+                clustering_definitions,
             } => {
+                if clustering_definitions.is_some() {
+                    // an in-memory input of an in-process writer; it has no
+                    // Python form and must not be dropped silently
+                    return Err(PyNotImplementedError::new_err(
+                        "UpdateConfig.clustering_definitions is an in-memory input and cannot be exported",
+                    ));
+                }
                 if let Ok(cls) = namespace.getattr("UpdateConfig") {
                     let config = export_update_map(py, config_updates)?;
                     let table_meta = export_update_map(py, table_metadata_updates)?;

@@ -22,7 +22,9 @@ use crate::format::{
     DataFile, DataStorageFormat, Fragment, IndexMetadata, Manifest, ManifestBuildConfig, RowIdMeta,
     overlay::DataOverlayFile,
 };
-use crate::format::{merge_clustering_definitions, validate_clustering};
+use crate::format::{
+    apply_complete_clustering_definitions, merge_clustering_definitions, validate_clustering,
+};
 use crate::io::{
     commit::CommitHandler,
     manifest::{read_manifest, read_manifest_indexes},
@@ -1933,7 +1935,15 @@ impl Transaction {
                 table_metadata_updates,
                 schema_metadata_updates,
                 field_metadata_updates,
+                clustering_definitions,
             } => {
+                if let Some(desired) = clustering_definitions {
+                    apply_complete_clustering_definitions(
+                        &mut manifest,
+                        desired,
+                        current_manifest.map(|m| m.version + 1).unwrap_or(1),
+                    )?;
+                }
                 if let Some(config_updates) = config_updates {
                     let mut config = manifest.config.clone();
                     apply_update_map(&mut config, config_updates);
@@ -2215,6 +2225,7 @@ mod tests {
                 table_metadata_updates: None,
                 schema_metadata_updates: None,
                 field_metadata_updates: HashMap::new(),
+                clustering_definitions: None,
             },
             _ => unreachable!(),
         }
@@ -3692,6 +3703,7 @@ mod tests {
                 table_metadata_updates: None,
                 schema_metadata_updates: None,
                 field_metadata_updates: HashMap::new(),
+                clustering_definitions: None,
             },
             None,
         );

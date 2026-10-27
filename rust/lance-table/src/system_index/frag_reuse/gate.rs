@@ -563,6 +563,7 @@ mod tests {
                 table_metadata_updates: None,
                 schema_metadata_updates: None,
                 field_metadata_updates: HashMap::new(),
+                clustering_definitions: None,
             },
             "update_mem_wal_state" => Operation::UpdateMemWalState {
                 compacted_sstables: vec![],

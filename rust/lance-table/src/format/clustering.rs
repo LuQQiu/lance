@@ -132,6 +132,94 @@ pub fn validate_clustering(manifest: &Manifest, indices: &[IndexMetadata]) -> Re
     Ok(())
 }
 
+/// Apply a writer's COMPLETE desired definitions list to `manifest`.
+///
+/// The writer built `desired` from the manifest it read: every definition that
+/// manifest had, unchanged, plus the ones it wants to add. Against the manifest
+/// the transaction actually lands on, this requires that every current
+/// definition appears in `desired` with identical content (matched by id;
+/// order is not significant), that nothing else reuses a current id, and that
+/// the remaining entries, in list order, carry `max_clustering_id + 1, +2, ...`.
+/// New entries are validated and must be keyed on columns the schema has. A
+/// list that adds nothing leaves the manifest untouched.
+///
+/// A dropped or changed current definition, a reused id or an id that no
+/// longer continues the mark means the list was built from a stale snapshot;
+/// that is a commit conflict the writer must resolve by reloading and
+/// rebuilding the list, not by retrying the same transaction. `commit_version`
+/// is only used to label that error.
+pub fn apply_complete_clustering_definitions(
+    manifest: &mut Manifest,
+    desired: &[ClusteringDefinition],
+    commit_version: u64,
+) -> Result<()> {
+    let stale = |message: String| Error::commit_conflict_source(commit_version, message.into());
+    let mut seen = HashSet::with_capacity(desired.len());
+    if let Some(duplicate) = desired.iter().find(|d| !seen.insert(d.id)) {
+        return Err(Error::invalid_input(format!(
+            "desired clustering definitions list names id {} more than once",
+            duplicate.id
+        )));
+    }
+    for current in &manifest.clustering {
+        match desired.iter().find(|d| d.id == current.id) {
+            Some(d) if d == current => {}
+            Some(_) => {
+                return Err(stale(format!(
+                    "desired clustering definitions list changes definition {}, which is immutable; \
+                     reload the manifest and rebuild the list",
+                    current.id
+                )));
+            }
+            None => {
+                return Err(stale(format!(
+                    "desired clustering definitions list drops definition {}; definitions are \
+                     append-only, reload the manifest and rebuild the list",
+                    current.id
+                )));
+            }
+        }
+    }
+    let mut next = manifest.max_clustering_id;
+    let mut added = Vec::new();
+    for definition in desired {
+        if manifest.clustering.iter().any(|c| c.id == definition.id) {
+            continue;
+        }
+        definition.validate()?;
+        let Some(expected) = next.checked_add(1) else {
+            return Err(Error::invalid_input(
+                "clustering definition ids are exhausted",
+            ));
+        };
+        if definition.id != expected {
+            return Err(stale(format!(
+                "new clustering definition {} does not continue max_clustering_id {} (expected {}); \
+                 reload the manifest and rebuild the list",
+                definition.id, manifest.max_clustering_id, expected
+            )));
+        }
+        if let Some(missing) = definition
+            .columns
+            .iter()
+            .find(|column| manifest.schema.field_by_id(**column).is_none())
+        {
+            return Err(Error::invalid_input(format!(
+                "clustering definition {} is keyed on field id {missing}, which is not in the schema",
+                definition.id
+            )));
+        }
+        next = expected;
+        added.push(definition.clone());
+    }
+    if added.is_empty() {
+        return Ok(());
+    }
+    manifest.clustering.extend(added);
+    manifest.max_clustering_id = next;
+    Ok(())
+}
+
 /// Add every definition of `other` that `target` lacks, keeping ids sorted.
 ///
 /// A definition is immutable, so the same id must carry the same content on

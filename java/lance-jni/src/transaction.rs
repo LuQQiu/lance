@@ -1105,7 +1105,16 @@ fn convert_to_java_operation_inner<'local>(
             table_metadata_updates,
             schema_metadata_updates,
             field_metadata_updates,
+            clustering_definitions,
         } => {
+            if clustering_definitions.is_some() {
+                // an in-memory input of an in-process writer; it has no Java
+                // form and must not be dropped silently
+                return Err(crate::error::Error::unsupported_error(
+                    "UpdateConfig.clustering_definitions is an in-memory input and cannot be exported"
+                        .to_string(),
+                ));
+            }
             let config_updates_obj = export_update_map(env, &config_updates)?;
             let table_metadata_updates_obj = export_update_map(env, &table_metadata_updates)?;
             let schema_metadata_updates_obj = export_update_map(env, &schema_metadata_updates)?;
@@ -1860,6 +1869,7 @@ fn convert_to_rust_operation(
                 table_metadata_updates,
                 schema_metadata_updates,
                 field_metadata_updates,
+                clustering_definitions: None,
             }
         }
         "Append" => {

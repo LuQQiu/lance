@@ -16,7 +16,10 @@ mod transaction;
 pub use crate::rowids::version::{
     RowDatasetVersionMeta, RowDatasetVersionRun, RowDatasetVersionSequence,
 };
-pub use clustering::{ClusteringDefinition, merge_clustering_definitions, validate_clustering};
+pub use clustering::{
+    ClusteringDefinition, apply_complete_clustering_definitions, merge_clustering_definitions,
+    validate_clustering,
+};
 pub use fragment::*;
 pub use index::{IndexFile, IndexMetadata, index_metadata_codec, list_index_files_with_sizes};
 

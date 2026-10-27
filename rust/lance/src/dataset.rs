@@ -4333,6 +4333,7 @@ impl Dataset {
                 table_metadata_updates: None,
                 schema_metadata_updates: None,
                 field_metadata_updates,
+                clustering_definitions: None,
             },
         )
         .await
