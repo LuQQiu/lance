@@ -15143,6 +15143,7 @@ mod tests {
                     .filter(|fragment| covered.contains(fragment.id as u32))
                     .cloned()
                     .collect(),
+                output_clustering: None,
             }],
             read_version: dataset.version().version,
             options: CompactionOptions::default(),
@@ -15259,6 +15260,7 @@ mod tests {
         let plan = CompactionPlan {
             tasks: vec![TaskData {
                 fragments: dataset.fragments().as_ref().clone(),
+                output_clustering: None,
             }],
             read_version: dataset.version().version,
             options: CompactionOptions::default(),

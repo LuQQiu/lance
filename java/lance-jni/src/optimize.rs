@@ -360,8 +360,23 @@ const COMPACTION_OPTIONS_CLASS: &str = "org/lance/compaction/CompactionOptions";
 const COMPACTION_MODE_CLASS: &str = "org/lance/compaction/CompactionMode";
 const COMPACTION_OPTIONS_CONSTRUCTOR_SIG: &str = "(Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/List;Ljava/util/Optional;)V";
 
+/// The Java `TaskData` carries no output clustering label, so a labelled task
+/// cannot cross into Java without losing the planner's instruction; it is
+/// refused rather than exported unlabelled.
+fn refuse_labelled_task(task: &TaskData) -> Result<()> {
+    match &task.output_clustering {
+        None => Ok(()),
+        Some(label) => Err(crate::Error::unsupported_error(format!(
+            "a compaction task whose outputs carry clustering definition {} cannot be passed \
+             through the Java binding, which has no field for the label",
+            label.clustering_id
+        ))),
+    }
+}
+
 impl IntoJava for &TaskData {
     fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
+        refuse_labelled_task(self)?;
         let fragments = export_vec(env, &self.fragments)?;
         Ok(env.new_object(
             TASK_DATA_CLASS,
@@ -534,8 +549,10 @@ impl FromJObjectWithEnv<TaskData> for JObject<'_> {
         let task_data = import_vec_from_method(env, self, "getFragments", |env, fragment| {
             fragment.extract_object(env)
         })?;
+        // A Java task carries no label: its outputs are unlabelled.
         Ok(TaskData {
             fragments: task_data,
+            output_clustering: None,
         })
     }
 }
@@ -576,5 +593,31 @@ impl FromJObjectWithEnv<RewriteResult> for JObject<'_> {
             original_fragments,
             row_addrs,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use lance::dataset::optimize::{OutputClustering, TaskData};
+
+    use super::refuse_labelled_task;
+
+    #[test]
+    fn a_labelled_task_is_refused_and_an_unlabelled_one_passes() {
+        let unlabelled = TaskData {
+            fragments: vec![],
+            output_clustering: None,
+        };
+        refuse_labelled_task(&unlabelled).unwrap();
+        let labelled = TaskData {
+            fragments: vec![],
+            output_clustering: Some(OutputClustering {
+                clustering_id: 7,
+                metadata: Default::default(),
+            }),
+        };
+        let error = refuse_labelled_task(&labelled).unwrap_err();
+        let text = format!("{error:?}");
+        assert!(text.contains("definition 7"), "{text}");
     }
 }
