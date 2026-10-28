@@ -2004,6 +2004,7 @@ impl Transaction {
                         .map(|state| state.manifest.clustering.as_slice())
                         .or_else(|| current_manifest.map(|m| m.clustering.as_slice()))
                         .unwrap_or(&[]);
+                    let mark_before = manifest.max_clustering_id;
                     apply_complete_clustering_definitions(
                         &mut manifest,
                         desired,
@@ -2011,6 +2012,9 @@ impl Transaction {
                         &final_indices,
                         current_manifest.map(|m| m.version + 1).unwrap_or(1),
                     )?;
+                    if manifest.max_clustering_id > mark_before {
+                        Self::activate_field_identity_for_clustering(&mut manifest)?;
+                    }
                 }
                 if let Some(config_updates) = config_updates {
                     let mut config = manifest.config.clone();
@@ -2207,6 +2211,46 @@ impl Transaction {
 
         validate_non_reusable_field_id_flags(&manifest)?;
         Ok((manifest, final_indices))
+    }
+
+    /// Definitions key on field ids, so allocating one commits the table to
+    /// the non-reusable field-id contract: a dropped id is never handed to a
+    /// later column and an overwrite assigns ids above the mark, so a
+    /// definition can lose its field but never silently name another. The
+    /// activation lands in the same manifest as the allocation, at the mark
+    /// the landing candidate actually holds; a table already under the
+    /// contract is left alone. Duplicate file field ids are the one state the
+    /// explicit migration repairs first and activation would freeze, so they
+    /// are refused here rather than activated over.
+    fn activate_field_identity_for_clustering(manifest: &mut Manifest) -> Result<()> {
+        if manifest.uses_non_reusable_field_ids() {
+            return Ok(());
+        }
+        if let Some((fragment, field)) = Self::duplicate_file_field_id(manifest) {
+            return Err(Error::invalid_input(format!(
+                "cannot allocate a clustering definition: fragment {fragment} stores field id \
+                 {field} in more than one data file, which must be repaired before field ids \
+                 become non-reusable; migrate the dataset to non-reusable field ids first"
+            )));
+        }
+        manifest.activate_non_reusable_field_ids();
+        manifest.writer_feature_flags |= FLAG_NON_REUSABLE_FIELD_IDS;
+        Ok(())
+    }
+
+    /// The first (fragment, field id) whose field id appears in two data files
+    /// of the same fragment, if any.
+    fn duplicate_file_field_id(manifest: &Manifest) -> Option<(u64, i32)> {
+        let mut seen = HashSet::new();
+        for fragment in manifest.fragments.iter().filter(|f| f.files.len() > 1) {
+            seen.clear();
+            for field in fragment.files.iter().flat_map(|file| file.fields.iter()) {
+                if *field >= 0 && !seen.insert(*field) {
+                    return Some((fragment.id, *field));
+                }
+            }
+        }
+        None
     }
 
     /// Remove data files that only contain tombstoned fields (-2)
@@ -7085,6 +7129,90 @@ mod tests {
             observed,
             vec![(0, 0), (0, 2_002), (0, 2_002)],
             "(introduced references, objects walked for the removal check)"
+        );
+    }
+
+    /// Allocating the first definition on a reusable-id table activates the
+    /// non-reusable field-id contract in the same candidate, at the mark the
+    /// candidate holds, and carries the writer bit even with automatic flag
+    /// derivation off. Removal-only and empty targets do not activate it.
+    #[test]
+    fn allocating_a_definition_activates_non_reusable_field_ids_in_the_same_candidate() {
+        let definition = |id: u32| crate::format::ClusteringDefinition {
+            id,
+            columns: vec![0],
+            provider: "org.example.cluster".into(),
+            version: 1,
+        };
+        let current = sample_manifest();
+        assert!(!current.uses_non_reusable_field_ids());
+        let (transaction, mut config) = definitions_update(&current, vec![definition(1)]);
+        config.auto_set_feature_flags = false;
+        let (activated, _) = transaction
+            .build_manifest(Some(&current), vec![], "txn", &config)
+            .unwrap();
+        assert_eq!(activated.clustering, vec![definition(1)]);
+        assert_eq!(activated.max_allocated_field_id, Some(0));
+        assert_ne!(
+            activated.writer_feature_flags & FLAG_NON_REUSABLE_FIELD_IDS,
+            0
+        );
+        assert_eq!(
+            activated.reader_feature_flags & FLAG_NON_REUSABLE_FIELD_IDS,
+            0
+        );
+
+        // A table already under the contract keeps its own mark.
+        let mut active = sample_manifest();
+        active.max_allocated_field_id = Some(7);
+        active.writer_feature_flags |= FLAG_NON_REUSABLE_FIELD_IDS;
+        let (transaction, config) = definitions_update(&active, vec![definition(1)]);
+        let (result, _) = transaction
+            .build_manifest(Some(&active), vec![], "txn", &config)
+            .unwrap();
+        assert_eq!(result.max_allocated_field_id, Some(7));
+
+        // Removing, or an empty target on an unconfigured table, activates nothing.
+        let mut configured = sample_manifest();
+        configured.clustering = vec![definition(1)];
+        configured.max_clustering_id = 1;
+        for (base, desired) in [(&configured, vec![]), (&current, vec![])] {
+            let (transaction, config) = definitions_update(base, desired);
+            let (result, _) = transaction
+                .build_manifest(Some(base), vec![], "txn", &config)
+                .unwrap();
+            assert!(!result.uses_non_reusable_field_ids());
+            assert_eq!(result.writer_feature_flags & FLAG_NON_REUSABLE_FIELD_IDS, 0);
+        }
+    }
+
+    /// A fragment storing one field id in two data files is the state the
+    /// explicit migration repairs first; activating over it would freeze the
+    /// duplicate, so the allocation is refused instead.
+    #[test]
+    fn allocation_is_refused_over_duplicate_file_field_ids() {
+        let mut current = sample_manifest();
+        Arc::make_mut(&mut current.fragments)[0].files = vec![
+            DataFile::new_legacy_from_fields("a.lance", vec![0], None),
+            DataFile::new_legacy_from_fields("b.lance", vec![0], None),
+        ];
+        let (transaction, config) = definitions_update(
+            &current,
+            vec![crate::format::ClusteringDefinition {
+                id: 1,
+                columns: vec![0],
+                provider: "org.example.cluster".into(),
+                version: 1,
+            }],
+        );
+        let error = transaction
+            .build_manifest(Some(&current), vec![], "txn", &config)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("fragment 0 stores field id 0 in more than one data file"),
+            "{error}"
         );
     }
 

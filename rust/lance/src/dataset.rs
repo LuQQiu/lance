@@ -4426,6 +4426,10 @@ impl ManifestWriteConfig {
     ///
     /// The timestamp is resolved here rather than during the build so it goes
     /// through this crate's mockable `SystemTime`.
+    pub(crate) fn has_clustering_definitions(&self) -> bool {
+        self.clustering_definitions.is_some()
+    }
+
     pub(crate) fn to_build_config(&self) -> ManifestBuildConfig {
         ManifestBuildConfig {
             auto_set_feature_flags: self.auto_set_feature_flags,
