@@ -1401,9 +1401,13 @@ async fn a_prior_writers_index_list_cache_entry_is_not_consulted() {
     use lance_core::cache::{CacheCodec, CacheKey, CacheKeySchema, KeyBuilder};
     use std::borrow::Cow;
 
+    /// The real `IndexMetadataKey`, field for field and byte for byte, at the
+    /// schema version this build shared with the prior writer. The version is
+    /// the only difference, so a hit here would be a hit for that writer.
     struct PriorWriterIndexMetadataKey<'a> {
         version: u64,
         store_identity: &'a str,
+        e_tag: Option<&'a str>,
     }
 
     impl CacheKey for PriorWriterIndexMetadataKey<'_> {
@@ -1411,10 +1415,11 @@ async fn a_prior_writers_index_list_cache_entry_is_not_consulted() {
 
         fn key(&self) -> Cow<'_, str> {
             Cow::Owned(format!(
-                "{}:{}/{}",
+                "{}:{}/{}/{}",
                 self.store_identity.len(),
                 self.store_identity,
-                self.version
+                self.version,
+                self.e_tag.unwrap_or("")
             ))
         }
 
@@ -1423,13 +1428,19 @@ async fn a_prior_writers_index_list_cache_entry_is_not_consulted() {
         }
 
         fn schema() -> CacheKeySchema {
-            // The schema this build shared with the prior writer.
             CacheKeySchema::new("lance.index.metadata-key", 2)
         }
 
         fn write_key(&self, builder: &mut KeyBuilder) {
             builder.write_str(self.store_identity);
             builder.write_u64(self.version);
+            match self.e_tag {
+                Some(e_tag) => {
+                    builder.write_some();
+                    builder.write_str(e_tag);
+                }
+                None => builder.write_none(),
+            }
         }
 
         fn codec() -> Option<CacheCodec> {
@@ -1475,6 +1486,7 @@ async fn a_prior_writers_index_list_cache_entry_is_not_consulted() {
             &PriorWriterIndexMetadataKey {
                 version: dataset.manifest().version,
                 store_identity: &dataset.object_store.store_prefix,
+                e_tag: dataset.manifest_location.e_tag.as_deref(),
             },
             Arc::new(stripped),
         )
