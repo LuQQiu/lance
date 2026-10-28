@@ -15,7 +15,7 @@ use lance_core::utils::tempfile::TempStrDir;
 use lance_index::IndexType;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
-use lance_table::feature_flags::FLAG_OBJECT_METADATA;
+use lance_table::feature_flags::{FLAG_NON_REUSABLE_FIELD_IDS, FLAG_OBJECT_METADATA};
 use lance_table::format::{ClusteringDefinition, IndexMetadata, Manifest};
 use lance_table::io::manifest::read_manifest_indexes;
 use rstest::rstest;
@@ -761,6 +761,323 @@ async fn commit(
 
 fn ids(dataset: &Dataset) -> Vec<u32> {
     dataset.manifest().clustering.iter().map(|d| d.id).collect()
+}
+
+fn field_ids(dataset: &Dataset) -> Vec<(String, i32)> {
+    dataset
+        .schema()
+        .fields
+        .iter()
+        .map(|field| (field.name.clone(), field.id))
+        .collect()
+}
+
+async fn write_named_column(uri: &str, name: &str, mode: WriteMode) -> Dataset {
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        name,
+        DataType::Int32,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from_iter_values(0..10))],
+    )
+    .unwrap();
+    Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        uri,
+        Some(WriteParams {
+            mode,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap()
+}
+
+/// Allocating the first definition on a reusable-id table activates the
+/// non-reusable field-id contract in the same version: definitions, both
+/// watermarks, the metadata patch and the writer bit land together, and the
+/// existing field ids are untouched. Later submissions, removals and a clear
+/// leave the activation and its mark alone.
+#[tokio::test]
+async fn the_first_definition_activates_non_reusable_field_ids_atomically() {
+    let dir = TempStrDir::default();
+    let dataset = write_dataset(&dir).await;
+    assert!(!dataset.manifest().uses_non_reusable_field_ids());
+    let before = dataset.manifest().version;
+    let ids_before = field_ids(&dataset);
+    let mark_before = dataset.manifest().max_field_id();
+
+    let dataset = commit(
+        &dataset,
+        submission(
+            before,
+            vec![definition(1)],
+            vec![("org.example.note".to_string(), Some("x".to_string()))],
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        dataset.manifest().version,
+        before + 1,
+        "exactly one version"
+    );
+    let check = |dataset: &Dataset| {
+        let manifest = dataset.manifest();
+        assert_eq!(ids(dataset), vec![1]);
+        assert_eq!(manifest.max_clustering_id, 1);
+        assert_eq!(manifest.max_allocated_field_id, Some(mark_before));
+        assert_ne!(
+            manifest.writer_feature_flags & FLAG_NON_REUSABLE_FIELD_IDS,
+            0
+        );
+        assert_eq!(
+            manifest.reader_feature_flags & FLAG_NON_REUSABLE_FIELD_IDS,
+            0
+        );
+        assert_eq!(manifest.table_metadata["org.example.note"], "x");
+        assert_eq!(field_ids(dataset), ids_before);
+    };
+    check(&dataset);
+    check(&Dataset::open(&dir).await.unwrap());
+
+    // Already active: a second allocation adds a version, not a new mark.
+    let dataset = commit(
+        &dataset,
+        submission(
+            dataset.manifest().version,
+            vec![definition(1), definition(2)],
+            vec![],
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.manifest().version, before + 2);
+    assert_eq!(dataset.manifest().max_allocated_field_id, Some(mark_before));
+
+    // Removal and a clear keep the activation.
+    let dataset = commit(
+        &dataset,
+        submission(dataset.manifest().version, vec![], vec![]),
+    )
+    .await
+    .unwrap();
+    assert!(dataset.manifest().clustering.is_empty());
+    assert_eq!(dataset.manifest().max_allocated_field_id, Some(mark_before));
+    assert_ne!(
+        dataset.manifest().writer_feature_flags & FLAG_NON_REUSABLE_FIELD_IDS,
+        0
+    );
+}
+
+/// A refused first submission publishes nothing: no activation, no
+/// definitions, no mark, no metadata. An empty target on an unconfigured table
+/// commits its metadata without activating anything.
+#[tokio::test]
+async fn a_refused_first_submission_activates_nothing() {
+    let dir = TempStrDir::default();
+    let dataset = write_dataset(&dir).await;
+    let version = dataset.manifest().version;
+    let note = ("org.example.note".to_string(), Some("x".to_string()));
+
+    let error = commit(
+        &dataset,
+        submission(
+            version,
+            vec![ClusteringDefinition {
+                columns: vec![7],
+                ..definition(1)
+            }],
+            vec![note.clone()],
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("not in the schema"), "{error}");
+    let error = commit(
+        &dataset,
+        submission(version, vec![definition(2)], vec![note.clone()]),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, Error::CommitConflict { .. }), "{error:?}");
+
+    let reopened = Dataset::open(&dir).await.unwrap();
+    assert_eq!(reopened.manifest().version, version);
+    assert!(!reopened.manifest().uses_non_reusable_field_ids());
+    assert_eq!(
+        reopened.manifest().writer_feature_flags & FLAG_NON_REUSABLE_FIELD_IDS,
+        0
+    );
+    assert!(reopened.manifest().clustering.is_empty());
+    assert_eq!(reopened.manifest().max_clustering_id, 0);
+    assert!(
+        !reopened
+            .manifest()
+            .table_metadata
+            .contains_key("org.example.note")
+    );
+
+    let dataset = commit(&dataset, submission(version, vec![], vec![note]))
+        .await
+        .unwrap();
+    assert_eq!(dataset.manifest().table_metadata["org.example.note"], "x");
+    assert!(!dataset.manifest().uses_non_reusable_field_ids());
+}
+
+/// A table that already uses non-reusable field ids keeps its mark: the
+/// allocation neither resets nor re-activates it.
+#[tokio::test]
+async fn an_already_activated_table_keeps_its_field_id_mark() {
+    let dir = TempStrDir::default();
+    let mut dataset = write_dataset(&dir).await;
+    dataset.migrate_to_non_reusable_field_ids().await.unwrap();
+    let version = dataset.manifest().version;
+    let mark = dataset.manifest().max_allocated_field_id;
+    assert!(mark.is_some());
+
+    let dataset = commit(&dataset, submission(version, vec![definition(1)], vec![]))
+        .await
+        .unwrap();
+    assert_eq!(dataset.manifest().version, version + 1);
+    assert_eq!(dataset.manifest().max_allocated_field_id, mark);
+    assert_eq!(ids(&dataset), vec![1]);
+}
+
+/// With the contract active, a definition can lose its key field but never
+/// silently name another one: a column added after a drop and the fields of
+/// an overwrite, unrelated or same-named, all get ids above the mark.
+#[tokio::test]
+async fn definitions_keep_their_field_identity_across_drop_add_and_overwrite() {
+    let dir = TempStrDir::default();
+    let dataset = write_dataset(&dir).await;
+    let mut dataset = commit(
+        &dataset,
+        submission(dataset.manifest().version, vec![definition(1)], vec![]),
+    )
+    .await
+    .unwrap();
+    let key_id = dataset.schema().field("i").unwrap().id;
+    assert_eq!(definition(1).columns, vec![key_id]);
+
+    // Drop the keyed column, then add one: the new column's id is fresh.
+    dataset
+        .add_columns(
+            NewColumnTransform::SqlExpressions(vec![("j".to_string(), "i + 1".to_string())]),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let mark_after_add = dataset.manifest().max_field_id();
+    dataset.drop_columns(&["i"]).await.unwrap();
+    dataset
+        .add_columns(
+            NewColumnTransform::SqlExpressions(vec![("k".to_string(), "j + 1".to_string())]),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let k_id = dataset.schema().field("k").unwrap().id;
+    assert!(
+        k_id > mark_after_add,
+        "k got {k_id}, mark was {mark_after_add}"
+    );
+    assert_ne!(k_id, key_id);
+    assert!(dataset.schema().field_by_id(key_id).is_none());
+    assert_eq!(dataset.manifest().clustering, vec![definition(1)]);
+
+    // Overwrite with an unrelated schema, then with the original one: both
+    // allocate above the mark; the definitions and marks survive.
+    let mark = dataset.manifest().max_field_id();
+    let overwritten = write_named_column(&dir, "user_id", WriteMode::Overwrite).await;
+    let user_id = overwritten.schema().field("user_id").unwrap().id;
+    assert!(user_id > mark, "user_id got {user_id}, mark was {mark}");
+    assert_eq!(overwritten.manifest().clustering, vec![definition(1)]);
+    assert_eq!(overwritten.manifest().max_clustering_id, 1);
+    assert!(overwritten.manifest().uses_non_reusable_field_ids());
+
+    let again = write_named_column(&dir, "i", WriteMode::Overwrite).await;
+    let i_again = again.schema().field("i").unwrap().id;
+    assert!(i_again > user_id, "i got {i_again} after {user_id}");
+    assert_ne!(
+        i_again, key_id,
+        "the same name does not get the old id back"
+    );
+    assert_eq!(again.manifest().clustering, vec![definition(1)]);
+}
+
+/// Writer A plans the first definition from version v. Before A lands, B
+/// either adds a column or activates the contract explicitly. A is rebased and
+/// activation is computed on the landing candidate: the mark covers B's
+/// column, and B's own activation is kept rather than recomputed.
+#[tokio::test]
+async fn a_stale_first_submission_activates_at_the_landing_mark() {
+    for b_activates in [false, true] {
+        let dir = TempStrDir::default();
+        let dataset = write_dataset(&dir).await;
+        let planned_at = dataset.manifest().version;
+
+        let mut b = dataset.clone();
+        if b_activates {
+            b.migrate_to_non_reusable_field_ids().await.unwrap();
+        } else {
+            b.add_columns(
+                NewColumnTransform::SqlExpressions(vec![("j".to_string(), "i + 1".to_string())]),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(b.manifest().version, planned_at + 1);
+        let expected_mark = if b_activates {
+            b.manifest().max_allocated_field_id.unwrap()
+        } else {
+            b.schema().field("j").unwrap().id
+        };
+
+        let landed = commit(
+            &dataset,
+            submission(planned_at, vec![definition(1)], vec![]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(landed.manifest().version, planned_at + 2);
+        assert_eq!(ids(&landed), vec![1]);
+        assert_eq!(
+            landed.manifest().max_allocated_field_id,
+            Some(expected_mark),
+            "b_activates={b_activates}"
+        );
+        assert_ne!(
+            landed.manifest().writer_feature_flags & FLAG_NON_REUSABLE_FIELD_IDS,
+            0
+        );
+    }
+}
+
+/// A detached commit is outside the version chain; it cannot carry a
+/// definitions list.
+#[tokio::test]
+async fn definitions_cannot_be_committed_detached() {
+    let dir = TempStrDir::default();
+    let dataset = write_dataset(&dir).await;
+    let (desired, transaction) =
+        submission(dataset.manifest().version, vec![definition(1)], vec![]);
+    let error = CommitBuilder::new(Arc::new(dataset.clone()))
+        .with_detached(true)
+        .with_clustering_definitions(desired)
+        .execute(transaction)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("committed detached"), "{error}");
+    let reopened = Dataset::open(&dir).await.unwrap();
+    assert!(reopened.manifest().clustering.is_empty());
+    assert!(!reopened.manifest().uses_non_reusable_field_ids());
 }
 
 /// Append ten rows as one fragment labelled `clustering_id`, through the real

@@ -844,7 +844,9 @@ pub struct ManifestBuildConfig {
     /// snapshot (a changed current definition, an omitted definition the writer
     /// never read, or a new id that no longer continues the mark) is a
     /// non-retryable commit conflict: the writer reloads and rebuilds the list.
-    /// A list identical to the current one is a no-op.
+    /// A list identical to the current one is a no-op. Allocating a definition
+    /// on a table with reusable field ids activates non-reusable field ids in
+    /// the same commit, since definitions key on field ids.
     pub clustering_definitions: Option<Vec<ClusteringDefinition>>,
     /// Row lineage sequences of the current manifest's fragments that live
     /// outside the manifest, read ahead of the build. An update that rewrites

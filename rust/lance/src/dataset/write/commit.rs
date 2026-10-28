@@ -173,7 +173,14 @@ impl<'a> CommitBuilder<'a> {
     /// non-retryable commit conflict (reload, rebuild the list, resubmit); a
     /// list identical to the current one is a no-op. The transaction file
     /// stays a plain `UpdateConfig`; the manifest is the durable record of the
-    /// definitions. Any other operation refuses this input.
+    /// definitions. Any other operation refuses this input, and so does a
+    /// detached commit.
+    ///
+    /// Definitions key on schema field ids, so allocating the first one on a
+    /// table with reusable field ids activates non-reusable field ids in the
+    /// same commit (see [`Dataset::migrate_to_non_reusable_field_ids`]): a
+    /// dropped key field's id is never handed to a later column, and an
+    /// overwrite assigns ids above the mark. Activation is permanent.
     pub fn with_clustering_definitions(mut self, definitions: Vec<ClusteringDefinition>) -> Self {
         self.clustering_definitions = Some(definitions);
         self

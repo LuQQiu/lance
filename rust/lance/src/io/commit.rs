@@ -1303,6 +1303,13 @@ pub(crate) async fn do_commit_detached_transaction(
     retry_timeout: Duration,
 ) -> Result<(Manifest, ManifestLocation)> {
     ensure_can_write_manifest(&dataset.manifest)?;
+    // Definitions are allocated against the version chain: a detached
+    // manifest's ids and field-identity activation would be invisible to it.
+    if write_config.has_clustering_definitions() {
+        return Err(Error::invalid_input(
+            "a clustering definitions list cannot be committed detached",
+        ));
+    }
     let mut transaction = transaction.clone();
     canonicalize_non_reusable_field_ids(Some(&dataset.manifest), &mut transaction.operation, None)?;
     let transaction = &transaction;
