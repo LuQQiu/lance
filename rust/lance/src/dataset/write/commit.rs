@@ -180,7 +180,9 @@ impl<'a> CommitBuilder<'a> {
     /// table with reusable field ids activates non-reusable field ids in the
     /// same commit (see [`Dataset::migrate_to_non_reusable_field_ids`]): a
     /// dropped key field's id is never handed to a later column, and an
-    /// overwrite assigns ids above the mark. Activation is permanent.
+    /// overwrite assigns ids above the mark. Activation is permanent, and under
+    /// that contract versions from before it can no longer be restored; they
+    /// stay readable.
     pub fn with_clustering_definitions(mut self, definitions: Vec<ClusteringDefinition>) -> Self {
         self.clustering_definitions = Some(definitions);
         self
@@ -363,6 +365,16 @@ impl<'a> CommitBuilder<'a> {
     }
 
     async fn execute_inner(self, transaction: Transaction) -> Result<Dataset> {
+        // A definitions list is a commit-time input for UpdateConfig alone. Every
+        // other operation is refused here, before any path is chosen: the
+        // new-dataset paths never reach the manifest builder's own check.
+        if self.clustering_definitions.is_some()
+            && !matches!(transaction.operation, Operation::UpdateConfig { .. })
+        {
+            return Err(Error::invalid_input(
+                "a complete clustering definitions list can only be committed with UpdateConfig",
+            ));
+        }
         if matches!(
             transaction.operation,
             Operation::Clone {
