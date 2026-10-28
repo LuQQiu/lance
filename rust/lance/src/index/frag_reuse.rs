@@ -5669,6 +5669,7 @@ mod tests {
             read_version: dataset.manifest.version,
             original_fragments: vec![overlaid],
             row_addrs: Some(serialized),
+            fragment_order: crate::dataset::optimize::FragmentOrder::PreserveRowOrder,
         };
         let fragments_before: Vec<u64> = dataset.fragments().iter().map(|f| f.id).collect();
         let error = crate::dataset::optimize::commit_compaction(

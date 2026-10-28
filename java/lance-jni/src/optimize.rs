@@ -595,6 +595,8 @@ impl FromJObjectWithEnv<RewriteResult> for JObject<'_> {
             read_version,
             original_fragments,
             row_addrs,
+            // A Java result carries no placement: it was planned in row order.
+            fragment_order: lance::dataset::optimize::FragmentOrder::PreserveRowOrder,
         })
     }
 }

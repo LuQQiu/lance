@@ -1047,6 +1047,28 @@ impl DefaultCompactionPlanner {
             }
         }
 
+        // A fragment covered by an index this build cannot read cannot be
+        // remapped here; ordinary planning holds it back, an explicit group
+        // naming it is refused before anything is written.
+        if !dataset.manifest.uses_stable_row_ids() && !self.options.defer_index_remap {
+            for (index, covered) in unremappable_index_coverage(dataset).await? {
+                if let Some(fragment) =
+                    groups
+                        .iter()
+                        .flat_map(|group| &group.fragments)
+                        .find(|fragment| {
+                            u32::try_from(fragment.id).is_ok_and(|id| covered.contains(id))
+                        })
+                {
+                    return Err(Error::invalid_input(format!(
+                        "compaction group names fragment {}, which is covered by index '{index}' \
+                         that this build cannot read and so cannot remap",
+                        fragment.id
+                    )));
+                }
+            }
+        }
+
         let schema_field_ids = dataset
             .schema()
             .fields_pre_order()
@@ -1152,11 +1174,14 @@ impl DefaultCompactionPlanner {
                 current.pos_range.end = offset + 1;
             }
             constrained.extend(current);
+            // A split can leave one fragment on its own; it is rewritten only
+            // for the reasons ordinary compaction rewrites a fragment alone.
             all_tasks.extend(
                 constrained
                     .into_iter()
                     .filter(|bin| !bin.is_noop())
                     .flat_map(|bin| bin.split_for_size(self.options.target_rows_per_fragment))
+                    .filter(|bin| !bin.is_noop())
                     .map(|bin| {
                         let live_rows = bin.row_counts.iter().sum();
                         (
@@ -1171,6 +1196,30 @@ impl DefaultCompactionPlanner {
             );
         }
 
+        // In place only the sources change identity, so `max_source_fragments`
+        // bounds them directly: tasks are kept in group order until the next
+        // would exceed it, as the row and byte budgets are applied below.
+        let all_tasks = if let Some(max_frags) = self.options.max_source_fragments {
+            let num_candidate_tasks = all_tasks.len();
+            let mut total = 0_usize;
+            let mut kept = Vec::with_capacity(all_tasks.len());
+            for (task, live_rows) in all_tasks {
+                total += task.fragments.len();
+                if total > max_frags {
+                    break;
+                }
+                kept.push((task, live_rows));
+            }
+            if kept.is_empty() && num_candidate_tasks > 0 {
+                warn!(
+                    "Grouped compaction plan is empty: the first of {num_candidate_tasks} tasks \
+                     already exceeds max_source_fragments={max_frags}"
+                );
+            }
+            kept
+        } else {
+            all_tasks
+        };
         let tasks = limit_tasks_to_source_budget(&self.options, dataset.schema(), all_tasks)?;
 
         let mut options = self.options.clone();
@@ -3019,6 +3068,11 @@ pub struct RewriteResult {
     ///   deferred index remap post-processing, or (2) used with reserved
     ///   fragment IDs to build old-to-new mappings.
     pub row_addrs: Option<Vec<u8>>,
+    /// The placement the task was planned and executed under; the commit must
+    /// agree, since in-place results replace only their sources while
+    /// row-order results relabel the fragments after them.
+    #[serde(default)]
+    pub fragment_order: FragmentOrder,
 }
 
 /// Returns the version the reservation committed at; `dataset` is not moved to it.
@@ -3182,7 +3236,6 @@ fn rebase_sources_in_place(
     manifest_fragments: &[Fragment],
     completed_tasks: Vec<RewriteResult>,
     max_affected_fragments: Option<usize>,
-    read_version: u64,
     current_version: u64,
 ) -> Result<Vec<RewriteResult>> {
     let mut tasks = Vec::with_capacity(completed_tasks.len());
@@ -3209,21 +3262,19 @@ fn rebase_sources_in_place(
         }
         tasks.push(task);
     }
+    // The count depends on the tasks alone, so a later version cannot make it
+    // fit: this is never a retryable conflict.
     if let Some(max_frags) = max_affected_fragments
         && sources.len() > max_frags
     {
-        let message = format!(
+        return Err(Error::invalid_input(format!(
             "compaction would change {} fragment identities, exceeding max_source_fragments={max_frags}",
             sources.len()
-        );
-        if read_version < current_version {
-            return Err(Error::retryable_commit_conflict_source(
-                current_version,
-                message.into(),
-            ));
-        }
-        return Err(Error::invalid_input(message));
+        )));
     }
+    // Outputs take ids in task order and tasks arrive in completion order;
+    // sorting by first source keeps a group's rows in source order every run.
+    tasks.sort_by_key(|task| task.original_fragments[0].id);
     Ok(tasks)
 }
 
@@ -3338,6 +3389,7 @@ fn complete_rewrite_suffix(
             read_version,
             original_fragments: vec![fragment],
             row_addrs: None,
+            fragment_order: FragmentOrder::PreserveRowOrder,
         });
         position += 1;
     }
@@ -3601,6 +3653,7 @@ async fn rewrite_files(
             read_version: dataset.manifest.version,
             original_fragments: task.fragments,
             row_addrs: None,
+            fragment_order: options.fragment_order,
         });
     }
 
@@ -3961,6 +4014,7 @@ async fn rewrite_files(
         read_version: dataset.manifest.version,
         original_fragments: fragments,
         row_addrs,
+        fragment_order: options.fragment_order,
     })
 }
 
@@ -4548,6 +4602,22 @@ pub async fn commit_compaction(
     // all replacement IDs can be reserved as one ordered suffix. Replacing in
     // place leaves untouched fragments alone: only the listed sources go, and
     // the outputs take fresh ids, which sort to the end.
+    let planned_order = completed_tasks[0].fragment_order;
+    if let Some(other) = completed_tasks
+        .iter()
+        .find(|task| task.fragment_order != planned_order)
+    {
+        return Err(Error::invalid_input(format!(
+            "compaction results were planned under different fragment orders ({planned_order:?} and {:?}) and cannot be committed together",
+            other.fragment_order
+        )));
+    }
+    if planned_order != options.fragment_order {
+        return Err(Error::invalid_input(format!(
+            "compaction results were planned under fragment order {planned_order:?} but the commit options say {:?}; commit with the plan's options",
+            options.fragment_order
+        )));
+    }
     let mut completed_tasks = match options.fragment_order {
         FragmentOrder::PreserveRowOrder => complete_rewrite_suffix(
             &dataset.manifest.fragments,
@@ -4560,7 +4630,6 @@ pub async fn commit_compaction(
             &dataset.manifest.fragments,
             completed_tasks,
             options.max_source_fragments,
-            tasks_read_version,
             dataset.manifest.version,
         )?,
     };
@@ -5643,8 +5712,9 @@ mod tests {
         assert_eq!(all, (0..400).collect::<Vec<_>>());
 
         // A second group over the now non-adjacent remainder, under a budget
-        // that bounds exactly the selected sources.
-        let error = compact_files_with_planner(
+        // that bounds exactly the selected sources: a group over budget is not
+        // planned, and nothing is written.
+        let metrics = compact_files_with_planner(
             &mut dataset,
             None,
             &Groups(
@@ -5656,11 +5726,9 @@ mod tests {
             ),
         )
         .await
-        .unwrap_err();
-        assert!(
-            error.to_string().contains("max_source_fragments=1"),
-            "{error}"
-        );
+        .unwrap();
+        assert_eq!(metrics.fragments_removed, 0);
+        assert_eq!(dataset.manifest.fragments.as_ref(), &after);
         compact_files_with_planner(
             &mut dataset,
             None,
@@ -5690,6 +5758,104 @@ mod tests {
             Some("b")
         );
         assert_eq!(dataset.count_rows(None).await.unwrap(), 400);
+    }
+
+    /// A group split into several tasks lands its rows in source order however
+    /// the tasks finish, and in-place results refuse a commit under options
+    /// that would relabel the fragments around them.
+    #[tokio::test]
+    async fn grouped_compaction_orders_outputs_by_source_and_keeps_its_mode() {
+        let dir = TempStrDir::default();
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from_iter_values(0..400))],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &dir,
+            Some(WriteParams {
+                max_rows_per_file: 100,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let before = dataset.manifest.fragments.as_ref().clone();
+        let options = CompactionOptions {
+            target_rows_per_fragment: 200,
+            ..Default::default()
+        };
+        let planner = DefaultCompactionPlanner::new(options.clone()).unwrap();
+        let plan = planner
+            .plan_groups(
+                &dataset,
+                vec![CompactionGroup {
+                    fragments: before.clone(),
+                    output_clustering_id: None,
+                    output_metadata: HashMap::new(),
+                }],
+            )
+            .await
+            .unwrap();
+        assert_eq!(plan.tasks.len(), 2, "{:?}", plan.tasks);
+
+        // Execute in reverse so completion order differs from source order.
+        let mut results = Vec::new();
+        for task in plan
+            .compaction_tasks()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+        {
+            results.push(task.execute(&dataset).await.unwrap());
+        }
+        assert!(
+            results
+                .iter()
+                .all(|r| r.fragment_order == FragmentOrder::ReplaceInPlace)
+        );
+
+        // Default commit options would relabel; the results refuse them.
+        let error = commit_compaction(
+            &mut dataset,
+            results.clone(),
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &CompactionOptions::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("fragment order"), "{error}");
+        assert_eq!(dataset.manifest.fragments.as_ref(), &before);
+
+        commit_compaction(
+            &mut dataset,
+            results,
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &plan.options,
+        )
+        .await
+        .unwrap();
+        let after = dataset.manifest.fragments.as_ref().clone();
+        assert_eq!(after.iter().map(|f| f.id).collect::<Vec<_>>(), vec![4, 5]);
+        for (fragment, expected) in after.iter().zip([0..200_i64, 200..400]) {
+            let mut scanner = dataset.scan();
+            scanner
+                .with_fragments(vec![fragment.clone()])
+                .scan_in_order(true)
+                .project(&["a"])
+                .unwrap();
+            let batch = scanner.try_into_batch().await.unwrap();
+            let values = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values()
+                .to_vec();
+            assert_eq!(values, expected.collect::<Vec<_>>(), "{fragment:?}");
+        }
     }
 
     /// With stable row ids and deferred remapping, a non-adjacent group's
@@ -17396,6 +17562,7 @@ mod tests {
             read_version: 1,
             original_fragments: vec![source.clone()],
             row_addrs: None,
+            fragment_order: FragmentOrder::PreserveRowOrder,
         };
 
         let error =
@@ -17423,6 +17590,7 @@ mod tests {
             read_version: dataset.version().version,
             original_fragments: vec![trailing],
             row_addrs: None,
+            fragment_order: FragmentOrder::PreserveRowOrder,
         }];
 
         prepare_metadata_only_relabels(&dataset, &mut tasks)
