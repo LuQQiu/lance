@@ -1096,6 +1096,83 @@ async fn a_stale_first_submission_activates_at_the_landing_mark() {
     }
 }
 
+/// A definitions list is the writer's read dependency on the key fields of
+/// every definition it names, retained ones included. A writer that carries
+/// the unchanged list after another writer renamed or retyped a key lands
+/// nothing, and the same list planned again from the landing snapshot lands.
+#[rstest]
+#[case::rename("rename")]
+#[case::cast("cast")]
+#[tokio::test]
+async fn a_retained_definitions_key_change_refuses_the_list(#[case] change: &'static str) {
+    let dir = TempStrDir::default();
+    let read = with_region_column(write_named_column(&dir, "a", WriteMode::Create).await).await;
+    let key_id = read.schema().field("region").unwrap().id;
+    let configured = ClusteringDefinition {
+        columns: vec![key_id],
+        ..definition(1)
+    };
+    let read = commit(
+        &read,
+        submission(read.manifest().version, vec![configured.clone()], vec![]),
+    )
+    .await
+    .unwrap();
+    let planned_at = read.manifest().version;
+
+    let mut b = Dataset::open(&dir).await.unwrap();
+    let alteration = match change {
+        "rename" => crate::dataset::ColumnAlteration::new("region".into()).rename("zone".into()),
+        _ => crate::dataset::ColumnAlteration::new("region".into())
+            .cast_to(arrow_schema::DataType::Int64),
+    };
+    b.alter_columns(&[alteration]).await.unwrap();
+
+    let note = ("org.example.note".to_string(), Some("x".to_string()));
+    let error = commit(
+        &read,
+        submission(planned_at, vec![configured.clone()], vec![note.clone()]),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(error, crate::Error::CommitConflict { .. }),
+        "{change}: {error:?}"
+    );
+    assert!(
+        error.to_string().contains("rebuild the list"),
+        "{change}: {error}"
+    );
+    let reopened = Dataset::open(&dir).await.unwrap();
+    assert_eq!(
+        reopened.manifest().version,
+        b.manifest().version,
+        "{change}: A landed nothing"
+    );
+    assert!(
+        !reopened
+            .manifest()
+            .table_metadata
+            .contains_key("org.example.note")
+    );
+
+    let landed = commit(
+        &reopened,
+        submission(
+            reopened.manifest().version,
+            vec![configured.clone()],
+            vec![note],
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(landed.manifest().clustering, vec![configured]);
+    assert_eq!(
+        landed.manifest().table_metadata.get("org.example.note"),
+        Some(&"x".to_string())
+    );
+}
+
 /// Writer A resolves its key field in a reusable-id snapshot; before A lands,
 /// writer B replaces the schema in a way that can hand A's key id to another
 /// column: an overwrite, a drop followed by an add, the same with the original

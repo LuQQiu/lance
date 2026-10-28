@@ -174,7 +174,11 @@ impl<'a> CommitBuilder<'a> {
     /// list identical to the current one is a no-op. The transaction file
     /// stays a plain `UpdateConfig`; the manifest is the durable record of the
     /// definitions. Any other operation refuses this input, and so does a
-    /// detached commit.
+    /// detached commit. The list is also the writer's read dependency on the
+    /// key fields of every definition it names: a key renamed, retyped or
+    /// re-parented between the snapshot the writer read and the landing
+    /// manifest refuses the commit the same way, so metadata derived from
+    /// those keys is never published against a schema it was not planned on.
     ///
     /// Definitions key on schema field ids, so allocating the first one on a
     /// table with reusable field ids activates non-reusable field ids in the
