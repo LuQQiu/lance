@@ -474,7 +474,7 @@ async fn test_rtree_merge_drops_a_fragment_replaced_since_the_compaction() {
 /// A data replacement after the compaction drops coverage (BTree).
 #[tokio::test]
 async fn test_btree_merge_drops_a_fragment_replaced_since_the_compaction() {
-    let (dataset, staged, rewritten) = btree_staged_over_a_compaction().await;
+    let (dataset, staged, rewritten) = Box::pin(btree_staged_over_a_compaction()).await;
     let replaced = Arc::new(Int32Array::from_iter_values((0..12).map(|_| 999))) as ArrayRef;
     let mut dataset = replace_column(dataset, rewritten, "age", replaced).await;
 
@@ -495,7 +495,7 @@ async fn test_btree_merge_drops_a_fragment_replaced_since_the_compaction() {
 #[tokio::test]
 async fn test_btree_merge_drops_a_fragment_updated_in_place_since_the_compaction() {
     use crate::dataset::{MergeInsertBuilder, MergeInsertWriteMode, WhenMatched, WhenNotMatched};
-    let (mut dataset, staged, rewritten) = btree_staged_over_a_compaction().await;
+    let (mut dataset, staged, rewritten) = Box::pin(btree_staged_over_a_compaction()).await;
     // A column the patch leaves alone, so the update rewrites `age` in place.
     dataset
         .add_columns(
@@ -554,7 +554,7 @@ async fn test_btree_merge_drops_a_fragment_updated_in_place_since_the_compaction
 /// An overlay on the compaction's output drops coverage (BTree).
 #[tokio::test]
 async fn test_btree_merge_drops_a_fragment_overlaid_since_the_compaction() {
-    let (dataset, staged, rewritten) = btree_staged_over_a_compaction().await;
+    let (dataset, staged, rewritten) = Box::pin(btree_staged_over_a_compaction()).await;
 
     let dataset = commit_overlay(
         dataset,
@@ -638,7 +638,7 @@ async fn test_rtree_merge_drops_a_fragment_replaced_before_the_compaction() {
 /// If the manifest the compaction committed is cleaned up, coverage is dropped.
 #[tokio::test]
 async fn test_btree_merge_drops_a_fragment_whose_creation_manifest_was_cleaned_up() {
-    let (dataset, staged, rewritten) = btree_staged_over_a_compaction().await;
+    let (dataset, staged, rewritten) = Box::pin(btree_staged_over_a_compaction()).await;
     let compaction = dataset.manifest.version;
     let kept = dataset
         .merge_existing_index_segments(staged.clone())
@@ -769,8 +769,8 @@ async fn rtree_merge_history_reads(dir: &TempStrDir, fragments: i32) -> usize {
 async fn test_rtree_merge_dates_every_group_of_a_compaction_together() {
     let two = TempStrDir::default();
     let four = TempStrDir::default();
-    let two_groups = rtree_merge_history_reads(&two, 4).await;
-    let four_groups = rtree_merge_history_reads(&four, 8).await;
+    let two_groups = Box::pin(rtree_merge_history_reads(&two, 4)).await;
+    let four_groups = Box::pin(rtree_merge_history_reads(&four, 8)).await;
     assert_eq!(
         four_groups, two_groups,
         "doubling the groups took the merge from {two_groups} reads of version \
@@ -1559,7 +1559,7 @@ async fn segment_saved_behind_a_trimmed_link(uri: &str) -> (Vec<IndexMetadata>, 
 #[tokio::test]
 async fn test_merge_does_not_cover_a_fragment_behind_a_trimmed_link() {
     let dir = TempStrDir::default();
-    let (saved, _) = segment_saved_behind_a_trimmed_link(dir.as_str()).await;
+    let (saved, _) = Box::pin(segment_saved_behind_a_trimmed_link(dir.as_str())).await;
     let mut dataset = Dataset::open(dir.as_str()).await.unwrap();
 
     let merged = dataset.merge_existing_index_segments(saved).await.unwrap();

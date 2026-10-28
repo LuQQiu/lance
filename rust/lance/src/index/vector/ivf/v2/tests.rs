@@ -5380,8 +5380,13 @@ async fn test_spfresh_join_split() {
     let mut next_id = total_rows as u64;
     let mut expected_rows = total_rows;
 
-    let (deleted_rows, appended_rows, actual_partitions) =
-        shrink_smallest_partition(&mut dataset, INDEX_NAME, 1, &mut next_id).await;
+    let (deleted_rows, appended_rows, actual_partitions) = Box::pin(shrink_smallest_partition(
+        &mut dataset,
+        INDEX_NAME,
+        1,
+        &mut next_id,
+    ))
+    .await;
     expected_rows = expected_rows - deleted_rows + appended_rows;
     assert_eq!(actual_partitions, 1);
     assert_eq!(dataset.count_all_rows().await.unwrap(), expected_rows);

@@ -350,7 +350,7 @@ async fn do_test_binary_copy_empty_string_scalar_index(version: LanceFileVersion
 #[tokio::test]
 async fn test_binary_copy_with_defer_remap() {
     for version in NON_LEGACY_VERSIONS {
-        do_test_binary_copy_with_defer_remap(version).await;
+        Box::pin(do_test_binary_copy_with_defer_remap(version)).await;
     }
 }
 

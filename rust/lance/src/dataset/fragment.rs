@@ -7711,7 +7711,7 @@ mod tests {
         #[case::row_address_only(true)]
         #[tokio::test]
         async fn skips_unused_sequence(#[case] addresses_only: bool) {
-            let (_dir, dataset) = fixture(true).await;
+            let (_dir, dataset) = Box::pin(fixture(true)).await;
             let fragment = dataset.get_fragments().remove(0);
             let projection = if addresses_only {
                 dataset.schema().project::<&str>(&[]).unwrap()
@@ -7756,7 +7756,7 @@ mod tests {
         #[case::row_address_only(true)]
         #[tokio::test]
         async fn skips_unused_scan_sequence(#[case] addresses_only: bool) {
-            let (_dir, dataset) = fixture(true).await;
+            let (_dir, dataset) = Box::pin(fixture(true)).await;
             let mut scanner = dataset.scan();
             if addresses_only {
                 scanner.project::<&str>(&[]).unwrap().with_row_address();
@@ -7775,7 +7775,7 @@ mod tests {
         #[case::spilled(true)]
         #[tokio::test]
         async fn late_ids_on_cloned_reader(#[case] spill: bool) {
-            let (_dir, dataset) = fixture(spill).await;
+            let (_dir, dataset) = Box::pin(fixture(spill)).await;
             for (index, fragment) in dataset.get_fragments().into_iter().enumerate() {
                 let reader = fragment
                     .open(dataset.schema(), FragReadConfig::default())
@@ -7878,7 +7878,7 @@ mod tests {
         #[case::row_addresses(false)]
         #[tokio::test]
         async fn row_stream_loads_only_for_id_mapping(#[case] stable_ids: bool) {
-            let (_dir, dataset) = fixture(true).await;
+            let (_dir, dataset) = Box::pin(fixture(true)).await;
             let dataset = Arc::new(dataset);
             let fragments = dataset.get_fragments();
             let keys = [Some(14_u64), None, Some(2), Some(13), Some(2)].map(|id| {
@@ -7936,7 +7936,7 @@ mod tests {
 
         #[tokio::test]
         async fn indexed_scan_still_maps_stable_ids() {
-            let (_dir, mut dataset) = fixture(true).await;
+            let (_dir, mut dataset) = Box::pin(fixture(true)).await;
             dataset
                 .create_index(
                     &["i"],
@@ -7972,7 +7972,7 @@ mod tests {
 
         #[tokio::test]
         async fn shared_load_retries_and_preserves_request_store() {
-            let (_dir, dataset) = fixture(true).await;
+            let (_dir, dataset) = Box::pin(fixture(true)).await;
             let failures = Arc::new(FailingProxyStore::new());
             let tracker = Arc::new(IOTracker::default());
             let request_dataset = dataset.with_object_store_wrappers([

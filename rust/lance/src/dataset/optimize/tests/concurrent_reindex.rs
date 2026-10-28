@@ -857,8 +857,11 @@ async fn index_under_workload(seed: u64, kinds: &[Op], rebuild: bool) -> bool {
     let before = workload.draw(kinds, 6);
     let during = workload.draw(kinds, 3);
     let racing = workload.clone();
-    let (mut builder, _) =
-        builder_racing(uri, Box::pin(async move { racing.run(during).await })).await;
+    let (mut builder, _) = Box::pin(builder_racing(
+        uri,
+        Box::pin(async move { racing.run(during).await }),
+    ))
+    .await;
 
     Box::pin(workload.run(before.clone())).await;
     match build_index(&mut builder, "val", "val_idx", rebuild).await {
