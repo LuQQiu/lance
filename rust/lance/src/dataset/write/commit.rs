@@ -180,9 +180,10 @@ impl<'a> CommitBuilder<'a> {
     /// table with reusable field ids activates non-reusable field ids in the
     /// same commit (see [`Dataset::migrate_to_non_reusable_field_ids`]): a
     /// dropped key field's id is never handed to a later column, and an
-    /// overwrite assigns ids above the mark. Activation is permanent, and under
-    /// that contract versions from before it can no longer be restored; they
-    /// stay readable.
+    /// overwrite assigns ids above the mark. Activation is permanent: clearing
+    /// the definitions does not undo it, and under that contract the versions
+    /// from before the activating commit can no longer be restored (they stay
+    /// readable). A table already under the contract is unaffected.
     pub fn with_clustering_definitions(mut self, definitions: Vec<ClusteringDefinition>) -> Self {
         self.clustering_definitions = Some(definitions);
         self

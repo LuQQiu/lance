@@ -1391,6 +1391,120 @@ async fn the_first_allocation_makes_earlier_versions_unrestorable_but_readable()
     );
 }
 
+/// A build that does not know segment labels caches the index list with every
+/// segment unlabelled, under the key schema this build used to share with it.
+/// Such an entry on a shared persistent cache must miss: the next commit
+/// refills from the manifest and keeps the label, and the definition that
+/// segment names still cannot be removed.
+#[tokio::test]
+async fn a_prior_writers_index_list_cache_entry_is_not_consulted() {
+    use lance_core::cache::{CacheCodec, CacheKey, CacheKeySchema, KeyBuilder};
+    use std::borrow::Cow;
+
+    struct PriorWriterIndexMetadataKey<'a> {
+        version: u64,
+        store_identity: &'a str,
+    }
+
+    impl CacheKey for PriorWriterIndexMetadataKey<'_> {
+        type ValueType = Vec<IndexMetadata>;
+
+        fn key(&self) -> Cow<'_, str> {
+            Cow::Owned(format!(
+                "{}:{}/{}",
+                self.store_identity.len(),
+                self.store_identity,
+                self.version
+            ))
+        }
+
+        fn type_name() -> &'static str {
+            "Vec<IndexMetadata>"
+        }
+
+        fn schema() -> CacheKeySchema {
+            // The schema this build shared with the prior writer.
+            CacheKeySchema::new("lance.index.metadata-key", 2)
+        }
+
+        fn write_key(&self, builder: &mut KeyBuilder) {
+            builder.write_str(self.store_identity);
+            builder.write_u64(self.version);
+        }
+
+        fn codec() -> Option<CacheCodec> {
+            Some(lance_table::format::index_metadata_codec())
+        }
+    }
+
+    let dir = TempStrDir::default();
+    let mut dataset = write_dataset(&dir).await;
+    dataset
+        .create_index(
+            &["i"],
+            IndexType::BTree,
+            Some("idx".into()),
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    let mut dataset = commit_edited_manifest(&dataset, |manifest, indices| {
+        manifest.clustering = vec![definition(1)];
+        manifest.max_clustering_id = 1;
+        let segment = indices.iter_mut().find(|idx| idx.name == "idx").unwrap();
+        segment.clustering_id = Some(1);
+        segment.metadata = object_metadata("3");
+    })
+    .await;
+
+    // What the prior writer would have cached for this version: the same
+    // list with the fields it did not know stripped.
+    let stripped = named_segments(&dataset, "idx")
+        .await
+        .into_iter()
+        .map(|segment| IndexMetadata {
+            clustering_id: None,
+            metadata: Default::default(),
+            ..segment
+        })
+        .collect::<Vec<_>>();
+    dataset
+        .index_cache
+        .insert_with_key(
+            &PriorWriterIndexMetadataKey {
+                version: dataset.manifest().version,
+                store_identity: &dataset.object_store.store_prefix,
+            },
+            Arc::new(stripped),
+        )
+        .await;
+
+    // A commit that republishes the index section must not trust that entry.
+    dataset.delete("false").await.unwrap();
+    let segment = named_segments(&dataset, "idx").await.remove(0);
+    assert_eq!(
+        segment.clustering_id,
+        Some(1),
+        "the label survived the commit"
+    );
+    assert_eq!(segment.metadata, object_metadata("3"));
+
+    // And the definition that segment names is still pinned.
+    let error = commit(
+        &dataset,
+        submission(dataset.manifest().version, vec![], vec![]),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("cannot remove clustering definition 1: index segment"),
+        "{error}"
+    );
+}
+
 /// A detached commit is outside the version chain; it cannot carry a
 /// definitions list.
 #[tokio::test]
