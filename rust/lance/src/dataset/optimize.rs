@@ -851,9 +851,19 @@ impl DefaultCompactionPlanner {
     }
 }
 
-#[async_trait::async_trait]
-impl CompactionPlanner for DefaultCompactionPlanner {
-    async fn plan(&self, dataset: &Dataset) -> Result<CompactionPlan> {
+impl DefaultCompactionPlanner {
+    /// Plan over `fragments` alone, in the order given (ascending ids), as if
+    /// they were adjacent: a fragment of the table that is not in the list is
+    /// not a boundary between its neighbours in the list, unlike an excluded
+    /// fragment, which still ends a bin. [`CompactionPlanner::plan`] is this
+    /// over every fragment of the table. A caller uses it to plan a group of
+    /// fragments that share a property across the fragments of other groups
+    /// interleaved with them.
+    pub async fn plan_fragments(
+        &self,
+        dataset: &Dataset,
+        fragments: Vec<FileFragment>,
+    ) -> Result<CompactionPlan> {
         let write_version = self.options.write_version(dataset);
         versions::validate_write_version(
             dataset.manifest.data_storage_format.lance_file_format(),
@@ -878,10 +888,8 @@ impl CompactionPlanner for DefaultCompactionPlanner {
             reject_eager_remap_over_undrained_fri(dataset).await?;
         }
 
-        // get_fragments should be returning fragments in sorted order (by id)
-        // and fragment ids should be unique
-        let fragments = dataset.get_fragments();
-
+        // get_fragments returns fragments in sorted order (by id) with unique
+        // ids, and a caller's list must come the same way.
         debug_assert!(
             fragments.windows(2).all(|w| w[0].id() < w[1].id()),
             "fragments in manifest are not sorted"
@@ -1073,6 +1081,13 @@ impl CompactionPlanner for DefaultCompactionPlanner {
         compaction_plan.extend_tasks(tasks);
 
         Ok(compaction_plan)
+    }
+}
+
+#[async_trait::async_trait]
+impl CompactionPlanner for DefaultCompactionPlanner {
+    async fn plan(&self, dataset: &Dataset) -> Result<CompactionPlan> {
+        self.plan_fragments(dataset, dataset.get_fragments()).await
     }
 }
 
@@ -4248,6 +4263,62 @@ mod tests {
         async fn create_remapper(&self, _: &Dataset) -> Result<Option<Box<dyn IndexRemapper>>> {
             Ok(Some(Box::new(self.clone())))
         }
+    }
+
+    /// `plan_fragments` bins the listed fragments as neighbours across the
+    /// table's other fragments, while an excluded fragment in the list still
+    /// ends a bin; `plan` over the whole table is unchanged.
+    #[tokio::test]
+    async fn plan_fragments_treats_the_listed_fragments_as_adjacent() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from_iter_values(0..600))],
+        )
+        .unwrap();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            uri,
+            Some(WriteParams {
+                max_rows_per_file: 100,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.fragments().len(), 6);
+        let options = CompactionOptions {
+            target_rows_per_fragment: 1_000,
+            ..Default::default()
+        };
+        let ids = |task: &TaskData| task.fragments.iter().map(|f| f.id).collect::<Vec<_>>();
+
+        let even: Vec<FileFragment> = dataset
+            .get_fragments()
+            .into_iter()
+            .filter(|f| f.id() % 2 == 0)
+            .collect();
+        let planner = DefaultCompactionPlanner::new(options.clone()).unwrap();
+        let plan = planner
+            .plan_fragments(&dataset, even.clone())
+            .await
+            .unwrap();
+        assert_eq!(plan.tasks.len(), 1, "{:?}", plan.tasks);
+        assert_eq!(ids(&plan.tasks[0]), vec![0, 2, 4]);
+
+        let bounded = DefaultCompactionPlanner::new(CompactionOptions {
+            excluded_fragment_ids: vec![2],
+            ..options.clone()
+        })
+        .unwrap();
+        let plan = bounded.plan_fragments(&dataset, even).await.unwrap();
+        assert!(plan.tasks.is_empty(), "{:?}", plan.tasks);
+
+        let plan = planner.plan(&dataset).await.unwrap();
+        assert_eq!(plan.tasks.len(), 1);
+        assert_eq!(ids(&plan.tasks[0]), vec![0, 1, 2, 3, 4, 5]);
     }
 
     /// A planner that keeps a compaction inside one clustered group stamps
