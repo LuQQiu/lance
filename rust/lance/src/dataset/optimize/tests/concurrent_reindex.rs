@@ -859,7 +859,7 @@ async fn index_under_workload(seed: u64, kinds: &[Op], rebuild: bool) -> bool {
     let racing = workload.clone();
     let (mut builder, _) = Box::pin(builder_racing(
         uri,
-        Box::pin(async move { racing.run(during).await }),
+        Box::pin(async move { Box::pin(racing.run(during)).await }),
     ))
     .await;
 
