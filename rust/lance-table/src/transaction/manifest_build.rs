@@ -7325,8 +7325,9 @@ mod tests {
         );
     }
 
-    /// On the real build path, a rebased allocation whose key field now names
-    /// another column is refused, and one whose field kept its identity lands.
+    /// On the real build path, a rebased list whose key field now names
+    /// another column is refused, allocation or retained, and one whose field
+    /// kept its identity lands.
     #[test]
     fn a_rebased_allocation_is_refused_when_its_key_field_changed_identity() {
         let definition = crate::format::ClusteringDefinition {
@@ -7381,7 +7382,29 @@ mod tests {
                 }),
             )
             .unwrap();
-        assert_eq!(result.clustering, vec![definition]);
+        assert_eq!(result.clustering, vec![definition.clone()]);
+
+        // The same list carried unchanged over a rename of its key is refused
+        // too: the list is the writer's read dependency on the key fields.
+        read.clustering = vec![definition.clone()];
+        read.max_clustering_id = 1;
+        landing.clustering = vec![definition.clone()];
+        landing.max_clustering_id = 1;
+        landing.schema = schema_named("user_id");
+        let (transaction, config) = definitions_update(&read, vec![definition]);
+        let error = transaction
+            .build_manifest_with_read_version(
+                Some(&landing),
+                vec![],
+                "txn",
+                &config,
+                Some(ReadVersionState {
+                    manifest: &read,
+                    indices: &[],
+                }),
+            )
+            .unwrap_err();
+        assert!(matches!(error, Error::CommitConflict { .. }), "{error:?}");
     }
 
     /// The non-contiguous path appends its outputs instead of splicing them;

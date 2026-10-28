@@ -333,31 +333,53 @@ pub fn apply_complete_clustering_definitions(
     Ok(())
 }
 
-/// Refuse to allocate a definition whose key fields are not the fields the
-/// writer planned against.
+/// Refuse a definitions list whose key fields are not the fields the writer
+/// planned against.
 ///
 /// A definition keys on field ids. The writer resolved its key columns in the
-/// snapshot it read; a rebased attempt lands on a later schema, and on a table
-/// with reusable field ids an id may by then name another column (a dropped
-/// key replaced by a new column, or an overwrite that numbered a new schema
-/// from zero). Allocating would freeze that binding, so each key field of a
-/// new definition must be the same field in both schemas: same name, same
-/// parent, same type. A field the landing schema lacks is left to the
-/// allocation's own schema check. Only definitions new to `manifest` are
-/// checked, so a retained list costs nothing here.
+/// snapshot it read; a rebased attempt lands on a later schema, where an id
+/// may by then name another column (a dropped key replaced by a new column on
+/// a table with reusable field ids, an overwrite that numbered a new schema
+/// from zero) or the same column renamed or retyped. The list is the writer's
+/// read dependency on those fields: whatever it publishes alongside the list
+/// (an allocation, a removal, metadata derived from the keys) was planned
+/// against the fields as read, so each key field of every listed definition
+/// must be the same field in both schemas: same name, same parent, same
+/// type. A key field the landing schema lacks is refused for a retained
+/// definition and left to the allocation's own schema check for a new one.
 pub fn refuse_key_fields_that_changed_identity(
     read_schema: &Schema,
     landing: &Manifest,
     desired: &[ClusteringDefinition],
     commit_version: u64,
 ) -> Result<()> {
-    let current_ids: HashSet<u32> = landing.clustering.iter().map(|c| c.id).collect();
-    for definition in desired.iter().filter(|d| !current_ids.contains(&d.id)) {
+    let retained: HashSet<u32> = landing.clustering.iter().map(|c| c.id).collect();
+    for definition in desired {
         for column in &definition.columns {
-            let (Some(planned), Some(landed)) = (
+            let (planned, landed) = (
                 read_schema.field_by_id(*column),
                 landing.schema.field_by_id(*column),
-            ) else {
+            );
+            let (Some(planned), landed) = (planned, landed) else {
+                continue;
+            };
+            let Some(landed) = landed else {
+                // A retained definition's key that the landing schema no
+                // longer has (dropped, or replaced by a cast under a new id)
+                // is a changed dependency; for a new definition the
+                // allocation's own schema check reports the missing field.
+                if retained.contains(&definition.id) {
+                    return Err(Error::commit_conflict_source(
+                        commit_version,
+                        format!(
+                            "clustering definition {} is keyed on field id {column}, which named {:?} \
+                             when the writer read the table and no longer exists; reload the \
+                             manifest and rebuild the list",
+                            definition.id, planned.name
+                        )
+                        .into(),
+                    ));
+                }
                 continue;
             };
             if planned.name != landed.name
@@ -848,9 +870,9 @@ mod tests {
         );
     }
 
-    /// A rebased allocation is refused when its key field id names a
-    /// different column than the writer read; a same-identity field, a field
-    /// the landing schema lacks, and a retained definition are all left alone.
+    /// A rebased list is refused when a listed definition's key field id names
+    /// a different column than the writer read, new or retained; a
+    /// same-identity field and a field the landing schema lacks are left alone.
     #[test]
     fn a_key_field_that_changed_identity_refuses_the_allocation() {
         let schema_of = |name: &str, data_type: arrow_schema::DataType| {
@@ -879,15 +901,21 @@ mod tests {
         landing.schema = schema_of("region", arrow_schema::DataType::Int32);
         refuse_key_fields_that_changed_identity(&read, &landing, &[definition(1)], 3).unwrap();
 
-        // A retained definition is not re-checked, whatever the field became.
+        // A retained definition is the writer's dependency too: the list is
+        // refused when its key was renamed under it, and passes while the key
+        // kept its identity.
         landing.schema = schema_of("user_id", arrow_schema::DataType::Int32);
         landing.clustering = vec![definition(1)];
         landing.max_clustering_id = 1;
+        let error = refuse_key_fields_that_changed_identity(&read, &landing, &[definition(1)], 3)
+            .unwrap_err();
+        assert!(matches!(error, Error::CommitConflict { .. }), "{error:?}");
+        landing.schema = schema_of("region", arrow_schema::DataType::Int32);
         refuse_key_fields_that_changed_identity(&read, &landing, &[definition(1)], 3).unwrap();
 
-        // A key the landing schema lacks is the allocation check's business.
-        landing.clustering = vec![];
-        landing.max_clustering_id = 0;
+        // A retained definition whose key the landing schema no longer has
+        // (dropped, or cast under a new id) is refused; for a new definition
+        // that is the allocation check's business.
         landing.schema = lance_core::datatypes::Schema::try_from(&arrow_schema::Schema::new(vec![
             arrow_schema::Field::new("x", arrow_schema::DataType::Int32, false),
         ]))
@@ -895,6 +923,11 @@ mod tests {
         for field in landing.schema.fields.iter_mut() {
             field.id = 9;
         }
+        let error = refuse_key_fields_that_changed_identity(&read, &landing, &[definition(1)], 3)
+            .unwrap_err();
+        assert!(error.to_string().contains("no longer exists"), "{error}");
+        landing.clustering = vec![];
+        landing.max_clustering_id = 0;
         refuse_key_fields_that_changed_identity(&read, &landing, &[definition(1)], 3).unwrap();
     }
 
