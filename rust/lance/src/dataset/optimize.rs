@@ -1214,6 +1214,7 @@ impl CompactionPlanner for DefaultCompactionPlanner {
                 (
                     TaskData {
                         fragments: bin.fragments,
+                        output_clustering: None,
                     },
                     live_rows,
                 )
@@ -2368,6 +2369,24 @@ async fn prepare_reader(
 pub struct TaskData {
     /// The fragments to compact.
     pub fragments: Vec<Fragment>,
+    /// The clustering label the task's output fragments carry, chosen by the
+    /// planner. Unset, the outputs carry none, whatever the inputs carried:
+    /// Lance does not infer a label from the inputs, since a compaction may
+    /// span fragments of different clusterings. A planner that keeps a
+    /// compaction inside one clustered group sets the group's label here, and
+    /// the commit refuses a label whose definition the manifest does not hold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_clustering: Option<OutputClustering>,
+}
+
+/// The clustering label a compaction task stamps on its output fragments.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputClustering {
+    /// `Fragment::clustering_id` of every output.
+    pub clustering_id: u32,
+    /// `Fragment::metadata` of every output, replacing whatever the writer set.
+    #[serde(default)]
+    pub metadata: HashMap<String, String>,
 }
 
 /// A standalone task that can be serialized and sent to another machine for
@@ -3565,6 +3584,13 @@ async fn rewrite_files(
         .sum();
 
     log::info!("Compaction task {}: completed", task_id);
+
+    if let Some(output) = &task.output_clustering {
+        for fragment in &mut new_fragments {
+            fragment.clustering_id = Some(output.clustering_id);
+            fragment.metadata = output.metadata.clone();
+        }
+    }
 
     Ok(RewriteResult {
         metrics,
@@ -4854,6 +4880,144 @@ mod tests {
         async fn create_remapper(&self, _: &Dataset) -> Result<Option<Box<dyn IndexRemapper>>> {
             Ok(Some(Box::new(self.clone())))
         }
+    }
+
+    /// A planner that keeps a compaction inside one clustered group stamps
+    /// that group's label on the outputs; without a label the outputs carry
+    /// none, whatever the inputs carried; a label whose definition the
+    /// manifest lacks is refused at commit and nothing is rewritten.
+    #[tokio::test]
+    async fn compaction_outputs_carry_the_tasks_clustering_label() {
+        use crate::dataset::CommitBuilder;
+        use crate::dataset::transaction::{Operation, Transaction};
+        use lance_table::format::ClusteringDefinition;
+
+        struct Labelling {
+            inner: DefaultCompactionPlanner,
+            label: Option<OutputClustering>,
+        }
+
+        #[async_trait::async_trait]
+        impl CompactionPlanner for Labelling {
+            async fn plan(&self, dataset: &Dataset) -> Result<CompactionPlan> {
+                let mut plan = self.inner.plan(dataset).await?;
+                for task in &mut plan.tasks {
+                    task.output_clustering = self.label.clone();
+                }
+                Ok(plan)
+            }
+        }
+
+        async fn three_fragments(uri: &str) -> Dataset {
+            let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int64Array::from_iter_values(0..300))],
+            )
+            .unwrap();
+            let dataset = Dataset::write(
+                RecordBatchIterator::new(vec![Ok(batch)], schema),
+                uri,
+                Some(WriteParams {
+                    max_rows_per_file: 100,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(dataset.fragments().len(), 3);
+            dataset
+        }
+
+        let options = CompactionOptions {
+            target_rows_per_fragment: 1_000,
+            ..Default::default()
+        };
+        let label = OutputClustering {
+            clustering_id: 1,
+            metadata: [("bucket".to_string(), "7".to_string())].into(),
+        };
+
+        // Labelled outputs under a defined definition.
+        let dir = TempStrDir::default();
+        let dataset = three_fragments(&dir).await;
+        let definition = ClusteringDefinition {
+            id: 1,
+            columns: vec![0],
+            provider: "org.example.cluster".into(),
+            version: 1,
+        };
+        let mut dataset = CommitBuilder::new(Arc::new(dataset.clone()))
+            .with_clustering_definitions(vec![definition])
+            .execute(Transaction::new(
+                dataset.manifest.version,
+                Operation::UpdateConfig {
+                    config_updates: None,
+                    table_metadata_updates: None,
+                    schema_metadata_updates: None,
+                    field_metadata_updates: HashMap::new(),
+                },
+                None,
+            ))
+            .await
+            .unwrap();
+        let planner = Labelling {
+            inner: DefaultCompactionPlanner::new(options.clone()).unwrap(),
+            label: Some(label.clone()),
+        };
+        compact_files_with_planner(&mut dataset, None, &planner)
+            .await
+            .unwrap();
+        assert!(dataset.fragments().len() < 3, "{:?}", dataset.fragments());
+        for output in dataset.fragments().iter() {
+            assert_eq!(output.clustering_id, Some(1), "{output:?}");
+            assert_eq!(output.metadata.get("bucket").map(String::as_str), Some("7"));
+        }
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 300);
+
+        // No label: unlabelled outputs, even over labelled inputs.
+        let planner = Labelling {
+            inner: DefaultCompactionPlanner::new(options.clone()).unwrap(),
+            label: None,
+        };
+        let dir = TempStrDir::default();
+        let mut dataset = three_fragments(&dir).await;
+        compact_files_with_planner(&mut dataset, None, &planner)
+            .await
+            .unwrap();
+        assert!(dataset.fragments().len() < 3, "{:?}", dataset.fragments());
+        for output in dataset.fragments().iter() {
+            assert_eq!(output.clustering_id, None, "{output:?}");
+            assert!(output.metadata.is_empty(), "{output:?}");
+        }
+
+        // A label whose definition the manifest does not hold is refused.
+        let planner = Labelling {
+            inner: DefaultCompactionPlanner::new(options).unwrap(),
+            label: Some(OutputClustering {
+                clustering_id: 9,
+                metadata: HashMap::new(),
+            }),
+        };
+        let dir = TempStrDir::default();
+        let mut dataset = three_fragments(&dir).await;
+        let version = dataset.manifest.version;
+        let error = compact_files_with_planner(&mut dataset, None, &planner)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("clustering"), "{error}");
+        // The id reservation commits before the rewrite is refused; the data
+        // and its (absent) labels are untouched.
+        let reopened = Dataset::open(&dir).await.unwrap();
+        assert!(reopened.manifest.version <= version + 1);
+        assert_eq!(reopened.fragments().len(), 3);
+        assert!(
+            reopened
+                .fragments()
+                .iter()
+                .all(|f| f.clustering_id.is_none())
+        );
+        assert_eq!(reopened.count_rows(None).await.unwrap(), 300);
     }
 
     #[rstest]
@@ -8216,6 +8380,7 @@ mod tests {
             Cow::Borrowed(&dataset),
             TaskData {
                 fragments: fragments.clone(),
+                output_clustering: None,
             },
             &options,
         )
@@ -13988,6 +14153,7 @@ mod tests {
         for group in groups {
             let task = TaskData {
                 fragments: group.iter().map(|idx| fragments[*idx].clone()).collect(),
+                output_clustering: None,
             };
             completed.push(
                 rewrite_files(Cow::Borrowed(&dataset), task, &options)
@@ -14233,6 +14399,7 @@ mod tests {
             Cow::Borrowed(&stale),
             TaskData {
                 fragments: vec![fragments[1].clone(), fragments[2].clone()],
+                output_clustering: None,
             },
             &options,
         )
@@ -14242,6 +14409,7 @@ mod tests {
             Cow::Borrowed(&stale),
             TaskData {
                 fragments: vec![fragments[0].clone()],
+                output_clustering: None,
             },
             &options,
         )
@@ -14566,6 +14734,7 @@ mod tests {
         let task = CompactionTask {
             task: TaskData {
                 fragments: dataset.fragments().as_ref().clone(),
+                output_clustering: None,
             },
             read_version: dataset.manifest.version,
             options: deferred_options.clone(),
