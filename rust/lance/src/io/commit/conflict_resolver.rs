@@ -3432,20 +3432,16 @@ pub(crate) fn refuse_field_identity_change(
     Ok(())
 }
 
-/// Every field of `read` is still the same field (name, parent, type) under
-/// the same id in `landing`. Added fields are fine; a missing, renamed or
-/// retyped one is not.
+/// Every field of `read` is still the same field under the same id in
+/// `landing`: same path of names and logical types from the root. Added
+/// fields are fine; a missing, renamed, moved or retyped one is not, while
+/// metadata and nullability edits are.
 fn keeps_every_field_identity(
     read: &lance_core::datatypes::Schema,
     landing: &lance_core::datatypes::Schema,
 ) -> bool {
-    read.fields_pre_order().all(|field| {
-        landing.field_by_id(field.id).is_some_and(|landed| {
-            landed.name == field.name
-                && landed.parent_id == field.parent_id
-                && landed.data_type() == field.data_type()
-        })
-    })
+    read.fields_pre_order()
+        .all(|field| lance_table::format::same_field_identity(read, landing, field.id))
 }
 
 fn wrong_operation_err(op: &Operation) -> Error {

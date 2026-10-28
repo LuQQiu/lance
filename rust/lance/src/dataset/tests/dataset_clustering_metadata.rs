@@ -1332,7 +1332,8 @@ async fn a_stale_allocation_cannot_cross_a_field_identity_change(#[case] race: &
     );
 
     // Under the contract from the start, the same race leaves A's key without
-    // a field; nothing in the window can give its id to another column.
+    // a field; nothing in the window can give its id to another column, and
+    // the vanished key is still a changed dependency, not bad input.
     if matches!(race, "overwrite" | "drop_add") {
         let dir = TempStrDir::default();
         let mut read =
@@ -1349,8 +1350,9 @@ async fn a_stale_allocation_cannot_cross_a_field_identity_change(#[case] race: &
             .await
             .unwrap_err();
         assert!(
-            error.to_string().contains("not in the schema"),
-            "{race}: {error}"
+            matches!(error, crate::Error::CommitConflict { .. })
+                && error.to_string().contains("no longer exists"),
+            "{race}: {error:?}"
         );
     }
 }

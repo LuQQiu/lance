@@ -333,6 +333,25 @@ pub fn apply_complete_clustering_definitions(
     Ok(())
 }
 
+/// Whether field `id` is the same field in `read` and `landing`: present in
+/// both, and the same name and logical type at every level from the root
+/// down. A renamed ancestor changes the column a key names; metadata or
+/// nullability edits below a nested key do not.
+pub fn same_field_identity(read: &Schema, landing: &Schema, id: i32) -> bool {
+    match (
+        read.field_ancestry_by_id(id),
+        landing.field_ancestry_by_id(id),
+    ) {
+        (Some(planned), Some(landed)) => {
+            planned.len() == landed.len()
+                && planned.iter().zip(&landed).all(|(p, l)| {
+                    p.id == l.id && p.name == l.name && p.logical_type == l.logical_type
+                })
+        }
+        _ => false,
+    }
+}
+
 /// Refuse a definitions list whose key fields are not the fields the writer
 /// planned against.
 ///
@@ -340,59 +359,52 @@ pub fn apply_complete_clustering_definitions(
 /// snapshot it read; a rebased attempt lands on a later schema, where an id
 /// may by then name another column (a dropped key replaced by a new column on
 /// a table with reusable field ids, an overwrite that numbered a new schema
-/// from zero) or the same column renamed or retyped. The list is the writer's
-/// read dependency on those fields: whatever it publishes alongside the list
-/// (an allocation, a removal, metadata derived from the keys) was planned
-/// against the fields as read, so each key field of every listed definition
-/// must be the same field in both schemas: same name, same parent, same
-/// type. A key field the landing schema lacks is refused for a retained
-/// definition and left to the allocation's own schema check for a new one.
+/// from zero), the same column renamed, retyped or moved, or no column at all
+/// (dropped, or cast under a new id). The list is the writer's read
+/// dependency on those fields: whatever it publishes alongside the list (an
+/// allocation, a removal, metadata derived from the keys) was planned against
+/// the fields as read, so each key field of every listed definition must be
+/// the same field in both schemas, by its whole path. A key the writer's own
+/// snapshot already lacked is history, not a change.
 pub fn refuse_key_fields_that_changed_identity(
     read_schema: &Schema,
     landing: &Manifest,
     desired: &[ClusteringDefinition],
     commit_version: u64,
 ) -> Result<()> {
-    let retained: HashSet<u32> = landing.clustering.iter().map(|c| c.id).collect();
+    let path = |schema: &Schema, id: i32| {
+        schema
+            .field_path(id)
+            .unwrap_or_else(|_| format!("field id {id}"))
+    };
     for definition in desired {
         for column in &definition.columns {
-            let (planned, landed) = (
-                read_schema.field_by_id(*column),
-                landing.schema.field_by_id(*column),
-            );
-            let (Some(planned), landed) = (planned, landed) else {
+            if read_schema.field_by_id(*column).is_none() {
                 continue;
-            };
-            let Some(landed) = landed else {
-                // A retained definition's key that the landing schema no
-                // longer has (dropped, or replaced by a cast under a new id)
-                // is a changed dependency; for a new definition the
-                // allocation's own schema check reports the missing field.
-                if retained.contains(&definition.id) {
-                    return Err(Error::commit_conflict_source(
-                        commit_version,
-                        format!(
-                            "clustering definition {} is keyed on field id {column}, which named {:?} \
-                             when the writer read the table and no longer exists; reload the \
-                             manifest and rebuild the list",
-                            definition.id, planned.name
-                        )
-                        .into(),
-                    ));
-                }
-                continue;
-            };
-            if planned.name != landed.name
-                || planned.parent_id != landed.parent_id
-                || planned.data_type() != landed.data_type()
-            {
+            }
+            if landing.schema.field_by_id(*column).is_none() {
+                return Err(Error::commit_conflict_source(
+                    commit_version,
+                    format!(
+                        "clustering definition {} is keyed on field id {column}, which named {:?} \
+                         when the writer read the table and no longer exists; reload the \
+                         manifest and rebuild the list",
+                        definition.id,
+                        path(read_schema, *column)
+                    )
+                    .into(),
+                ));
+            }
+            if !same_field_identity(read_schema, &landing.schema, *column) {
                 return Err(Error::commit_conflict_source(
                     commit_version,
                     format!(
                         "clustering definition {} is keyed on field id {column}, which named {:?} \
                          when the writer read the table and names {:?} now; reload the manifest \
                          and rebuild the list",
-                        definition.id, planned.name, landed.name
+                        definition.id,
+                        path(read_schema, *column),
+                        path(&landing.schema, *column)
                     )
                     .into(),
                 ));
@@ -913,9 +925,9 @@ mod tests {
         landing.schema = schema_of("region", arrow_schema::DataType::Int32);
         refuse_key_fields_that_changed_identity(&read, &landing, &[definition(1)], 3).unwrap();
 
-        // A retained definition whose key the landing schema no longer has
-        // (dropped, or cast under a new id) is refused; for a new definition
-        // that is the allocation check's business.
+        // A key the landing schema no longer has (dropped, or cast under a
+        // new id) is refused for a retained and for a new definition alike;
+        // a key the writer's own snapshot already lacked is history.
         landing.schema = lance_core::datatypes::Schema::try_from(&arrow_schema::Schema::new(vec![
             arrow_schema::Field::new("x", arrow_schema::DataType::Int32, false),
         ]))
@@ -928,7 +940,65 @@ mod tests {
         assert!(error.to_string().contains("no longer exists"), "{error}");
         landing.clustering = vec![];
         landing.max_clustering_id = 0;
-        refuse_key_fields_that_changed_identity(&read, &landing, &[definition(1)], 3).unwrap();
+        let error = refuse_key_fields_that_changed_identity(&read, &landing, &[definition(1)], 3)
+            .unwrap_err();
+        assert!(matches!(error, Error::CommitConflict { .. }), "{error:?}");
+        let never_had_it = schema_of("other", arrow_schema::DataType::Int32);
+        let mut never_had_it = never_had_it;
+        for field in never_had_it.fields.iter_mut() {
+            field.id = 9;
+        }
+        refuse_key_fields_that_changed_identity(&never_had_it, &landing, &[definition(1)], 3)
+            .unwrap();
+    }
+
+    /// A nested key is identified by its whole path: renaming its parent
+    /// struct changes the column it names, while metadata on a sibling child
+    /// of that struct does not.
+    #[test]
+    fn a_nested_keys_identity_includes_its_ancestors() {
+        let nested = |parent: &str, sibling_metadata: Option<(&str, &str)>| {
+            let mut sibling = arrow_schema::Field::new("zip", arrow_schema::DataType::Int32, true);
+            if let Some((k, v)) = sibling_metadata {
+                sibling = sibling.with_metadata([(k.to_string(), v.to_string())].into());
+            }
+            lance_core::datatypes::Schema::try_from(&arrow_schema::Schema::new(vec![
+                arrow_schema::Field::new(
+                    parent,
+                    arrow_schema::DataType::Struct(
+                        vec![
+                            arrow_schema::Field::new("region", arrow_schema::DataType::Utf8, true),
+                            sibling,
+                        ]
+                        .into(),
+                    ),
+                    true,
+                ),
+            ]))
+            .unwrap()
+        };
+        let read = nested("info", None);
+        let key_id = read.field("info.region").unwrap().id;
+        let keyed = ClusteringDefinition {
+            columns: vec![key_id],
+            ..definition(1)
+        };
+        let mut landing = manifest_with(vec![], 0);
+        landing.schema = nested("meta", None);
+        let error = refuse_key_fields_that_changed_identity(
+            &read,
+            &landing,
+            std::slice::from_ref(&keyed),
+            3,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("named \"info.region\"")
+                && error.to_string().contains("names \"meta.region\" now"),
+            "{error}"
+        );
+        landing.schema = nested("info", Some(("note", "x")));
+        refuse_key_fields_that_changed_identity(&read, &landing, &[keyed], 3).unwrap();
     }
 
     fn ids(manifest: &Manifest) -> Vec<u32> {
