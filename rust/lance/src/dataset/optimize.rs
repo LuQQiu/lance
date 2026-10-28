@@ -5051,21 +5051,22 @@ mod tests {
         assert_eq!(dataset.count_rows(None).await.unwrap(), 300);
 
         // Id only: outputs carry the definition and empty metadata, replacing
-        // the metadata the previous round stamped.
-        let mut dataset = with_definition(append_two_unstamped(&dataset, &dir).await, 2).await;
-        compact_files_with_planner(&mut dataset, None, &stamping(Some(2), &[]))
+        // the metadata the previous round stamped. Definition ids continue the
+        // manifest's maximum, so this table's first definition is 1.
+        let mut dataset = with_definition(append_two_unstamped(&dataset, &dir).await, 1).await;
+        compact_files_with_planner(&mut dataset, None, &stamping(Some(1), &[]))
             .await
             .unwrap();
         assert_eq!(dataset.count_rows(None).await.unwrap(), 340);
-        assert_outputs(&dataset, Some(2), &[]);
+        assert_outputs(&dataset, Some(1), &[]);
 
         // Serialized tasks carry both properties and omit them when unset.
-        let plan = stamping(Some(2), &[("k", "v")])
+        let plan = stamping(Some(1), &[("k", "v")])
             .plan(&dataset)
             .await
             .unwrap();
         let json = serde_json::to_string(&plan.tasks[0]).unwrap();
-        assert!(json.contains("\"output_clustering_id\":2"), "{json}");
+        assert!(json.contains("\"output_clustering_id\":1"), "{json}");
         assert!(json.contains("\"output_metadata\""), "{json}");
         let back: TaskData = serde_json::from_str(&json).unwrap();
         assert_eq!(back, plan.tasks[0]);
