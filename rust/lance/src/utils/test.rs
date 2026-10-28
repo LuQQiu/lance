@@ -1069,7 +1069,8 @@ pub async fn compact_into_two(dataset: &mut Dataset, fragment_ids: &[u64]) -> Ve
     let task = CompactionTask {
         task: TaskData {
             fragments,
-            output_clustering: None,
+            output_clustering_id: None,
+            output_metadata: Default::default(),
         },
         read_version: dataset.manifest.version,
         options: options.clone(),

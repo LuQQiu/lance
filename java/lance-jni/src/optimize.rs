@@ -360,23 +360,24 @@ const COMPACTION_OPTIONS_CLASS: &str = "org/lance/compaction/CompactionOptions";
 const COMPACTION_MODE_CLASS: &str = "org/lance/compaction/CompactionMode";
 const COMPACTION_OPTIONS_CONSTRUCTOR_SIG: &str = "(Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/List;Ljava/util/Optional;)V";
 
-/// The Java `TaskData` carries no output clustering label, so a labelled task
-/// cannot cross into Java without losing the planner's instruction; it is
-/// refused rather than exported unlabelled.
-fn refuse_labelled_task(task: &TaskData) -> Result<()> {
-    match &task.output_clustering {
-        None => Ok(()),
-        Some(label) => Err(crate::Error::unsupported_error(format!(
-            "a compaction task whose outputs carry clustering definition {} cannot be passed \
-             through the Java binding, which has no field for the label",
-            label.clustering_id
-        ))),
+/// The Java `TaskData` carries no output properties, so a task whose outputs
+/// carry a clustering id or metadata cannot cross into Java without losing
+/// the planner's instruction; it is refused rather than exported stripped.
+fn refuse_output_properties(task: &TaskData) -> Result<()> {
+    if task.output_clustering_id.is_none() && task.output_metadata.is_empty() {
+        return Ok(());
     }
+    Err(crate::Error::unsupported_error(format!(
+        "a compaction task whose outputs carry clustering definition {:?} and {} metadata \
+         entries cannot be passed through the Java binding, which has no fields for them",
+        task.output_clustering_id,
+        task.output_metadata.len()
+    )))
 }
 
 impl IntoJava for &TaskData {
     fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
-        refuse_labelled_task(self)?;
+        refuse_output_properties(self)?;
         let fragments = export_vec(env, &self.fragments)?;
         Ok(env.new_object(
             TASK_DATA_CLASS,
@@ -549,10 +550,12 @@ impl FromJObjectWithEnv<TaskData> for JObject<'_> {
         let task_data = import_vec_from_method(env, self, "getFragments", |env, fragment| {
             fragment.extract_object(env)
         })?;
-        // A Java task carries no label: its outputs are unlabelled.
+        // A Java task carries no output properties: its outputs carry no
+        // definition and no metadata.
         Ok(TaskData {
             fragments: task_data,
-            output_clustering: None,
+            output_clustering_id: None,
+            output_metadata: Default::default(),
         })
     }
 }
@@ -598,26 +601,32 @@ impl FromJObjectWithEnv<RewriteResult> for JObject<'_> {
 
 #[cfg(test)]
 mod tests {
-    use lance::dataset::optimize::{OutputClustering, TaskData};
+    use lance::dataset::optimize::TaskData;
 
-    use super::refuse_labelled_task;
+    use super::refuse_output_properties;
+
+    fn task(clustering_id: Option<u32>, metadata: &[(&str, &str)]) -> TaskData {
+        TaskData {
+            fragments: vec![],
+            output_clustering_id: clustering_id,
+            output_metadata: metadata
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        }
+    }
 
     #[test]
-    fn a_labelled_task_is_refused_and_an_unlabelled_one_passes() {
-        let unlabelled = TaskData {
-            fragments: vec![],
-            output_clustering: None,
-        };
-        refuse_labelled_task(&unlabelled).unwrap();
-        let labelled = TaskData {
-            fragments: vec![],
-            output_clustering: Some(OutputClustering {
-                clustering_id: 7,
-                metadata: Default::default(),
-            }),
-        };
-        let error = refuse_labelled_task(&labelled).unwrap_err();
-        let text = format!("{error:?}");
-        assert!(text.contains("definition 7"), "{text}");
+    fn a_task_with_output_properties_is_refused_and_a_plain_one_passes() {
+        refuse_output_properties(&task(None, &[])).unwrap();
+        for (id, metadata) in [
+            (Some(7), &[][..]),
+            (None, &[("bucket", "3")][..]),
+            (Some(7), &[("bucket", "3")][..]),
+        ] {
+            let error = refuse_output_properties(&task(id, metadata)).unwrap_err();
+            let text = format!("{error:?}");
+            assert!(text.contains("Java binding"), "{text}");
+        }
     }
 }
