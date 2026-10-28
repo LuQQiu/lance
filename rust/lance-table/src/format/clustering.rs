@@ -10,7 +10,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use lance_core::datatypes::Schema;
+use lance_core::datatypes::{Field, Schema};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
 
@@ -334,9 +334,12 @@ pub fn apply_complete_clustering_definitions(
 }
 
 /// Whether field `id` is the same field in `read` and `landing`: present in
-/// both, and the same name and logical type at every level from the root
-/// down. A renamed ancestor changes the column a key names; metadata or
-/// nullability edits below a nested key do not.
+/// both, with the same id, name and logical type at every level from the
+/// root down to the field, and the same shape below it (every descendant's
+/// id, name and logical type, in order). A renamed ancestor changes the
+/// column a key names; a composite key's retyped, renamed, added or removed
+/// child changes the value it holds; metadata and nullability edits anywhere
+/// change neither.
 pub fn same_field_identity(read: &Schema, landing: &Schema, id: i32) -> bool {
     match (
         read.field_ancestry_by_id(id),
@@ -344,12 +347,29 @@ pub fn same_field_identity(read: &Schema, landing: &Schema, id: i32) -> bool {
     ) {
         (Some(planned), Some(landed)) => {
             planned.len() == landed.len()
-                && planned.iter().zip(&landed).all(|(p, l)| {
-                    p.id == l.id && p.name == l.name && p.logical_type == l.logical_type
-                })
+                && planned
+                    .iter()
+                    .zip(&landed)
+                    .all(|(p, l)| same_field_shallow(p, l))
+                && same_subtree(planned[planned.len() - 1], landed[landed.len() - 1])
         }
         _ => false,
     }
+}
+
+fn same_field_shallow(planned: &Field, landed: &Field) -> bool {
+    planned.id == landed.id
+        && planned.name == landed.name
+        && planned.logical_type == landed.logical_type
+}
+
+fn same_subtree(planned: &Field, landed: &Field) -> bool {
+    planned.children.len() == landed.children.len()
+        && planned
+            .children
+            .iter()
+            .zip(&landed.children)
+            .all(|(p, l)| same_field_shallow(p, l) && same_subtree(p, l))
 }
 
 /// Refuse a definitions list whose key fields are not the fields the writer
@@ -952,9 +972,10 @@ mod tests {
             .unwrap();
     }
 
-    /// A nested key is identified by its whole path: renaming its parent
-    /// struct changes the column it names, while metadata on a sibling child
-    /// of that struct does not.
+    /// A nested key is identified by its whole path and, for a composite
+    /// key, its whole subtree: renaming its parent struct changes the column
+    /// it names, a child of a struct key changing shape changes its value,
+    /// while metadata on a sibling child does not.
     #[test]
     fn a_nested_keys_identity_includes_its_ancestors() {
         let nested = |parent: &str, sibling_metadata: Option<(&str, &str)>| {
@@ -998,7 +1019,89 @@ mod tests {
             "{error}"
         );
         landing.schema = nested("info", Some(("note", "x")));
-        refuse_key_fields_that_changed_identity(&read, &landing, &[keyed], 3).unwrap();
+        refuse_key_fields_that_changed_identity(&read, &landing, std::slice::from_ref(&keyed), 3)
+            .unwrap();
+
+        // A key that is itself the struct depends on its children's shape:
+        // a retyped, renamed, added or removed child is a change; metadata
+        // on a child is not. A primitive key inside the struct does not
+        // depend on its siblings.
+        let struct_id = read.field("info").unwrap().id;
+        let on_struct = ClusteringDefinition {
+            columns: vec![struct_id],
+            ..definition(1)
+        };
+        let with_children = |children: Vec<arrow_schema::Field>| {
+            lance_core::datatypes::Schema::try_from(&arrow_schema::Schema::new(vec![
+                arrow_schema::Field::new(
+                    "info",
+                    arrow_schema::DataType::Struct(children.into()),
+                    true,
+                ),
+            ]))
+            .unwrap()
+        };
+        let region = |dt: arrow_schema::DataType| arrow_schema::Field::new("region", dt, true);
+        let zip = arrow_schema::Field::new("zip", arrow_schema::DataType::Int32, true);
+        let same = with_children(vec![region(arrow_schema::DataType::Utf8), zip.clone()]);
+        landing.schema = same;
+        refuse_key_fields_that_changed_identity(
+            &read,
+            &landing,
+            std::slice::from_ref(&on_struct),
+            3,
+        )
+        .unwrap();
+        for (what, changed) in [
+            (
+                "retyped child",
+                with_children(vec![region(arrow_schema::DataType::Int64), zip.clone()]),
+            ),
+            (
+                "renamed child",
+                with_children(vec![
+                    arrow_schema::Field::new("area", arrow_schema::DataType::Utf8, true),
+                    zip.clone(),
+                ]),
+            ),
+            (
+                "removed child",
+                with_children(vec![region(arrow_schema::DataType::Utf8)]),
+            ),
+            (
+                "added child",
+                with_children(vec![
+                    region(arrow_schema::DataType::Utf8),
+                    zip,
+                    arrow_schema::Field::new("extra", arrow_schema::DataType::Int32, true),
+                ]),
+            ),
+        ] {
+            landing.schema = changed;
+            let error = refuse_key_fields_that_changed_identity(
+                &read,
+                &landing,
+                std::slice::from_ref(&on_struct),
+                3,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(error, Error::CommitConflict { .. }),
+                "{what}: {error:?}"
+            );
+            // The primitive key inside the struct is unaffected by its siblings.
+            if what != "renamed child" && what != "retyped child" {
+                refuse_key_fields_that_changed_identity(
+                    &read,
+                    &landing,
+                    std::slice::from_ref(&keyed),
+                    3,
+                )
+                .unwrap();
+            }
+        }
+        landing.schema = nested("info", Some(("note", "x")));
+        refuse_key_fields_that_changed_identity(&read, &landing, &[on_struct], 3).unwrap();
     }
 
     fn ids(manifest: &Manifest) -> Vec<u32> {
