@@ -2375,6 +2375,13 @@ pub struct TaskData {
     /// span fragments of different clusterings. A planner that keeps a
     /// compaction inside one clustered group sets the group's label here, and
     /// the commit refuses a label whose definition the manifest does not hold.
+    ///
+    /// Serialized tasks stay readable in both directions, but the label is
+    /// honoured only by a worker that knows the field: a worker built before
+    /// it ignores the label and rewrites unlabelled. A planner that hands
+    /// labelled tasks to other processes must know they run this version or
+    /// newer; the Java binding refuses to export a labelled task for that
+    /// reason.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_clustering: Option<OutputClustering>,
 }
@@ -4975,17 +4982,46 @@ mod tests {
         }
         assert_eq!(dataset.count_rows(None).await.unwrap(), 300);
 
-        // No label: unlabelled outputs, even over labelled inputs.
+        // No label: unlabelled outputs, even over labelled inputs. The
+        // labelled fragment from above is joined by two unlabelled appends;
+        // compacting all three without a label strips it.
+        let appended = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)])),
+            vec![Arc::new(Int64Array::from_iter_values(300..320))],
+        )
+        .unwrap();
+        for _ in 0..2 {
+            dataset = Dataset::write(
+                RecordBatchIterator::new(vec![Ok(appended.clone())], appended.schema()),
+                &dir,
+                Some(WriteParams {
+                    mode: WriteMode::Append,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        }
+        assert!(
+            dataset
+                .fragments()
+                .iter()
+                .any(|f| f.clustering_id == Some(1))
+        );
+        assert!(
+            dataset
+                .fragments()
+                .iter()
+                .any(|f| f.clustering_id.is_none())
+        );
         let planner = Labelling {
             inner: DefaultCompactionPlanner::new(options.clone()).unwrap(),
             label: None,
         };
-        let dir = TempStrDir::default();
-        let mut dataset = three_fragments(&dir).await;
         compact_files_with_planner(&mut dataset, None, &planner)
             .await
             .unwrap();
-        assert!(dataset.fragments().len() < 3, "{:?}", dataset.fragments());
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 340);
         for output in dataset.fragments().iter() {
             assert_eq!(output.clustering_id, None, "{output:?}");
             assert!(output.metadata.is_empty(), "{output:?}");
@@ -5006,8 +5042,9 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("clustering"), "{error}");
-        // The id reservation commits before the rewrite is refused; the data
-        // and its (absent) labels are untouched.
+        // The rewrite is refused. The id reservation commits first and the
+        // rewritten files may have been staged; the table's data, fragments
+        // and (absent) labels are untouched.
         let reopened = Dataset::open(&dir).await.unwrap();
         assert!(reopened.manifest.version <= version + 1);
         assert_eq!(reopened.fragments().len(), 3);
