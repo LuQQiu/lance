@@ -1777,11 +1777,12 @@ pub(crate) async fn commit_transaction(
 
     // An allocating clustering submission from a reusable-id snapshot: judge
     // every transaction in its window for field-identity changes; see
-    // `refuse_field_identity_change`.
-    let identity_fence = (write_config
-        .allocates_clustering_definitions(&original_dataset.manifest)
-        && !original_dataset.manifest.uses_non_reusable_field_ids())
-    .then(|| original_dataset.schema().clone());
+    // `refuse_field_identity_change`. Decided from the version the transaction
+    // read, not from the handle it was submitted through, which may already
+    // be at a later, activated version.
+    let identity_fence = (!read_version_dataset.manifest.uses_non_reusable_field_ids()
+        && write_config.allocates_clustering_definitions(&read_version_dataset.manifest))
+    .then(|| read_version_dataset.schema().clone());
 
     while backoff.attempt() < num_attempts {
         // We are pessimistic here and assume there may be other transactions
@@ -1818,6 +1819,19 @@ pub(crate) async fn commit_transaction(
                     format!(
                         "versions {missing:?} were cleaned up, so this index cannot be carried \
                          through the deferred compaction it covers; rebuild it"
+                    )
+                    .into(),
+                ));
+            }
+            // A cleaned-up version may have replaced a key field; an identity
+            // window with a hole cannot be judged, so it is refused.
+            if identity_fence.is_some() && !missing.is_empty() {
+                return Err(Error::commit_conflict_source(
+                    dataset.manifest.version,
+                    format!(
+                        "versions {missing:?} between this submission's read version and the \
+                         latest were cleaned up, so the field identity of its clustering keys \
+                         cannot be checked; reload the table and rebuild the list"
                     )
                     .into(),
                 ));

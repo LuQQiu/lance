@@ -4391,12 +4391,14 @@ impl ManifestWriteConfig {
     }
 
     /// Whether the definitions list names an id the read manifest does not
-    /// hold, i.e. the commit allocates.
+    /// hold, i.e. the commit allocates. One pass over each list; the
+    /// allocation itself is validated by the manifest build.
     pub(crate) fn allocates_clustering_definitions(&self, read: &Manifest) -> bool {
         self.clustering_definitions.as_ref().is_some_and(|desired| {
+            let current: HashSet<u32> = read.clustering.iter().map(|c| c.id).collect();
             desired
                 .iter()
-                .any(|definition| !read.clustering.iter().any(|c| c.id == definition.id))
+                .any(|definition| !current.contains(&definition.id))
         })
     }
 
