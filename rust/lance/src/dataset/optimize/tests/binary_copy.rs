@@ -221,7 +221,7 @@ async fn test_binary_copy_falls_back_for_non_schema_column_order() {
 #[tokio::test]
 async fn test_binary_copy_packed_struct_column_mapping() {
     for version in NON_LEGACY_VERSIONS {
-        do_test_binary_copy_packed_struct_column_mapping(version).await;
+        Box::pin(do_test_binary_copy_packed_struct_column_mapping(version)).await;
     }
 }
 
@@ -282,7 +282,7 @@ async fn do_test_binary_copy_packed_struct_column_mapping(version: LanceFileVers
 #[tokio::test]
 async fn test_binary_copy_empty_string_scalar_index() {
     for version in NON_LEGACY_VERSIONS {
-        do_test_binary_copy_empty_string_scalar_index(version).await;
+        Box::pin(do_test_binary_copy_empty_string_scalar_index(version)).await;
     }
 }
 

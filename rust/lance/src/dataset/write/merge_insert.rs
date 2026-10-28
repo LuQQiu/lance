@@ -4657,13 +4657,13 @@ mod tests {
 
             let job_builder = self.job_builder.expect("job_builder must be set");
             let job = job_builder(ds);
-            let ds = check_then_refresh_dataset(
+            let ds = Box::pin(check_then_refresh_dataset(
                 new_batch,
                 job,
                 &self.expected_left_keys,
                 &self.expected_right_keys,
                 &self.expected_stats,
-            )
+            ))
             .await;
 
             let row_ids_after = get_row_ids_for_keys(&ds, &self.test_keys).await;
