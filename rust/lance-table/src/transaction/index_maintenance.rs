@@ -859,11 +859,15 @@ impl Transaction {
                 replacement.base_id = None;
             }
             // Independent remaps preserve the source's historical metadata. Only
-            // a physical merge publishes a new segment's details and version.
+            // a physical merge publishes a new segment's details and version,
+            // and a merged segment is a new object: it carries neither the
+            // first source's clustering reference nor its metadata.
             if replacements.len() > 1 {
                 replacement.index_details =
                     Some(Arc::new(rewritten_index.new_index_details.clone()));
                 replacement.index_version = rewritten_index.new_index_version as i32;
+                replacement.clustering_id = None;
+                replacement.metadata = Default::default();
             }
             replacement.dataset_version = source_indices
                 .iter()
@@ -1686,6 +1690,11 @@ mod tests {
         );
         first.base_id = Some(0);
         second.base_id = Some(0);
+        // Differently labelled sources: the merged segment inherits neither.
+        first.clustering_id = Some(1);
+        first.metadata = HashMap::from([("org.example.k".to_string(), "a".to_string())]);
+        second.clustering_id = Some(2);
+        second.metadata = HashMap::from([("org.example.k".to_string(), "b".to_string())]);
         let first_id = first.uuid;
         let second_id = second.uuid;
         let merged_id = Uuid::new_v4();
@@ -1745,6 +1754,51 @@ mod tests {
         assert_eq!(
             indices[0].fragment_bitmap.as_ref().unwrap(),
             &RoaringBitmap::from_iter([5])
+        );
+        assert_eq!(
+            indices[0].clustering_id, None,
+            "a merged segment is a new object"
+        );
+        assert!(indices[0].metadata.is_empty());
+    }
+
+    /// A single-source remap is the same segment under a new UUID: it keeps
+    /// its clustering reference and metadata.
+    #[test]
+    fn test_handle_rewrite_indices_single_source_remap_keeps_labels() {
+        let mut source = create_test_index(
+            "vector_idx",
+            1,
+            3,
+            Some(RoaringBitmap::from_iter([1])),
+            true,
+        );
+        source.clustering_id = Some(1);
+        source.metadata = HashMap::from([("org.example.k".to_string(), "a".to_string())]);
+        let old_id = source.uuid;
+        let new_id = Uuid::new_v4();
+        let rewritten_indices = vec![RewrittenIndex {
+            old_id,
+            new_id,
+            new_index_details: prost_types::Any {
+                type_url: "type.googleapis.com/lance.index.VectorIndexDetails".to_string(),
+                value: vec![],
+            },
+            new_index_version: 1,
+            new_index_files: None,
+        }];
+        let groups = vec![RewriteGroup {
+            old_fragments: vec![Fragment::new(1)],
+            new_fragments: vec![Fragment::new(5)],
+        }];
+        let mut indices = vec![source];
+        Transaction::handle_rewrite_indices(&mut indices, &rewritten_indices, &groups).unwrap();
+        assert_eq!(indices.len(), 1);
+        assert_eq!(indices[0].uuid, new_id);
+        assert_eq!(indices[0].clustering_id, Some(1));
+        assert_eq!(
+            indices[0].metadata,
+            HashMap::from([("org.example.k".to_string(), "a".to_string())])
         );
     }
 

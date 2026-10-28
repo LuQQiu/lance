@@ -8,13 +8,17 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, RecordBatchReader};
+use arrow_array::{
+    FixedSizeListArray, Float32Array, Int32Array, RecordBatch, RecordBatchIterator,
+    RecordBatchReader,
+};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use lance_core::Error;
 use lance_core::utils::tempfile::TempStrDir;
 use lance_index::IndexType;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
+use lance_linalg::distance::MetricType;
 use lance_table::feature_flags::{FLAG_NON_REUSABLE_FIELD_IDS, FLAG_OBJECT_METADATA};
 use lance_table::format::{ClusteringDefinition, IndexMetadata, Manifest};
 use lance_table::io::manifest::read_manifest_indexes;
@@ -28,6 +32,7 @@ use crate::dataset::transaction::{Operation, Transaction, UpdateMap, UpdateMapEn
 use crate::dataset::write::{CommitBuilder, InsertBuilder, WriteMode, WriteParams};
 use crate::dataset::{ManifestWriteConfig, NewColumnTransform, write_manifest_file};
 use crate::index::DatasetIndexExt;
+use crate::index::vector::VectorIndexParams;
 
 const PROVIDER: &str = "org.example.cluster";
 const BUCKET_KEY: &str = "org.example.cluster.bucket";
@@ -1401,9 +1406,13 @@ async fn a_prior_writers_index_list_cache_entry_is_not_consulted() {
     use lance_core::cache::{CacheCodec, CacheKey, CacheKeySchema, KeyBuilder};
     use std::borrow::Cow;
 
+    /// The real `IndexMetadataKey`, field for field and byte for byte, at the
+    /// schema version this build shared with the prior writer. The version is
+    /// the only difference, so a hit here would be a hit for that writer.
     struct PriorWriterIndexMetadataKey<'a> {
         version: u64,
         store_identity: &'a str,
+        e_tag: Option<&'a str>,
     }
 
     impl CacheKey for PriorWriterIndexMetadataKey<'_> {
@@ -1411,10 +1420,11 @@ async fn a_prior_writers_index_list_cache_entry_is_not_consulted() {
 
         fn key(&self) -> Cow<'_, str> {
             Cow::Owned(format!(
-                "{}:{}/{}",
+                "{}:{}/{}/{}",
                 self.store_identity.len(),
                 self.store_identity,
-                self.version
+                self.version,
+                self.e_tag.unwrap_or("")
             ))
         }
 
@@ -1423,13 +1433,19 @@ async fn a_prior_writers_index_list_cache_entry_is_not_consulted() {
         }
 
         fn schema() -> CacheKeySchema {
-            // The schema this build shared with the prior writer.
             CacheKeySchema::new("lance.index.metadata-key", 2)
         }
 
         fn write_key(&self, builder: &mut KeyBuilder) {
             builder.write_str(self.store_identity);
             builder.write_u64(self.version);
+            match self.e_tag {
+                Some(e_tag) => {
+                    builder.write_some();
+                    builder.write_str(e_tag);
+                }
+                None => builder.write_none(),
+            }
         }
 
         fn codec() -> Option<CacheCodec> {
@@ -1475,6 +1491,7 @@ async fn a_prior_writers_index_list_cache_entry_is_not_consulted() {
             &PriorWriterIndexMetadataKey {
                 version: dataset.manifest().version,
                 store_identity: &dataset.object_store.store_prefix,
+                e_tag: dataset.manifest_location.e_tag.as_deref(),
             },
             Arc::new(stripped),
         )
@@ -1503,6 +1520,126 @@ async fn a_prior_writers_index_list_cache_entry_is_not_consulted() {
             .contains("cannot remove clustering definition 1: index segment"),
         "{error}"
     );
+}
+
+const VEC_DIM: i32 = 4;
+
+fn vector_rows(ids: std::ops::Range<i32>) -> (Arc<ArrowSchema>, RecordBatch) {
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        ArrowField::new(
+            "vec",
+            DataType::FixedSizeList(
+                Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                VEC_DIM,
+            ),
+            true,
+        ),
+    ]));
+    let values = Float32Array::from_iter_values(
+        ids.clone()
+            .flat_map(|id| (0..VEC_DIM).map(move |d| (id * VEC_DIM + d) as f32)),
+    );
+    let vectors = FixedSizeListArray::try_new(
+        Arc::new(ArrowField::new("item", DataType::Float32, true)),
+        VEC_DIM,
+        Arc::new(values),
+        None,
+    )
+    .unwrap();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(ids)),
+            Arc::new(vectors),
+        ],
+    )
+    .unwrap();
+    (schema, batch)
+}
+
+/// Compaction without stable row ids remaps the vector segments that cover
+/// the rewritten fragments into one new segment. That segment is a new
+/// object: with the two sources labelled differently, the published segment
+/// carries neither label nor metadata.
+#[tokio::test]
+async fn compaction_merging_vector_segments_publishes_an_unlabelled_segment() {
+    let dir = TempStrDir::default();
+    let (schema, batch) = vector_rows(0..64);
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+        &dir,
+        Some(WriteParams {
+            max_rows_per_file: 32,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["vec"],
+            IndexType::Vector,
+            Some("vec_idx".into()),
+            &VectorIndexParams::ivf_flat(1, MetricType::L2),
+            true,
+        )
+        .await
+        .unwrap();
+    let (_, more) = vector_rows(64..128);
+    Dataset::write(
+        RecordBatchIterator::new(vec![Ok(more)], schema),
+        dataset.uri(),
+        Some(WriteParams {
+            mode: WriteMode::Append,
+            max_rows_per_file: 32,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset.checkout_latest().await.unwrap();
+    dataset
+        .optimize_indices(&OptimizeOptions::append())
+        .await
+        .unwrap();
+    assert_eq!(named_segments(&dataset, "vec_idx").await.len(), 2);
+
+    let mut dataset = commit_edited_manifest(&dataset, |manifest, indices| {
+        manifest.clustering = vec![definition(1), definition(2)];
+        manifest.max_clustering_id = 2;
+        for (position, segment) in indices
+            .iter_mut()
+            .filter(|segment| segment.name == "vec_idx")
+            .enumerate()
+        {
+            segment.clustering_id = Some(position as u32 + 1);
+            segment.metadata = object_metadata(&position.to_string());
+        }
+    })
+    .await;
+
+    // Every fragment compacts into one, so both segments are replaced by one.
+    compact_files(
+        &mut dataset,
+        CompactionOptions {
+            target_rows_per_fragment: 1_000,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.fragments().len(), 1);
+    let merged = named_segments(&dataset, "vec_idx").await;
+    assert_eq!(merged.len(), 1, "{merged:?}");
+    assert_eq!(
+        merged[0].clustering_id, None,
+        "a merged segment is a new object"
+    );
+    assert!(merged[0].metadata.is_empty());
+    // The definitions themselves are untouched by the rewrite.
+    assert_eq!(ids(&dataset), vec![1, 2]);
 }
 
 /// A detached commit is outside the version chain; it cannot carry a
