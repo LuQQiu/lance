@@ -1775,6 +1775,14 @@ pub(crate) async fn commit_transaction(
     // delete it if the commit ultimately fails.
     let mut current_transaction_file = String::new();
 
+    // An allocating clustering submission from a reusable-id snapshot: judge
+    // every transaction in its window for field-identity changes; see
+    // `refuse_field_identity_change`.
+    let identity_fence = (write_config
+        .allocates_clustering_definitions(&original_dataset.manifest)
+        && !original_dataset.manifest.uses_non_reusable_field_ids())
+    .then(|| original_dataset.schema().clone());
+
     while backoff.attempt() < num_attempts {
         // We are pessimistic here and assume there may be other transactions
         // we need to check for. We could be optimistic here and blindly
@@ -1816,6 +1824,13 @@ pub(crate) async fn commit_transaction(
             }
 
             for (other_version, other_transaction) in other_transactions.iter() {
+                if let Some(read_schema) = &identity_fence {
+                    conflict_resolver::refuse_field_identity_change(
+                        read_schema,
+                        other_transaction,
+                        *other_version,
+                    )?;
+                }
                 rebase.check_txn(other_transaction, *other_version)?;
             }
 

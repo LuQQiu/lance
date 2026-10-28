@@ -4390,6 +4390,16 @@ impl ManifestWriteConfig {
         self.clustering_definitions.is_some()
     }
 
+    /// Whether the definitions list names an id the read manifest does not
+    /// hold, i.e. the commit allocates.
+    pub(crate) fn allocates_clustering_definitions(&self, read: &Manifest) -> bool {
+        self.clustering_definitions.as_ref().is_some_and(|desired| {
+            desired
+                .iter()
+                .any(|definition| !read.clustering.iter().any(|c| c.id == definition.id))
+        })
+    }
+
     pub(crate) fn to_build_config(&self) -> ManifestBuildConfig {
         ManifestBuildConfig {
             auto_set_feature_flags: self.auto_set_feature_flags,
