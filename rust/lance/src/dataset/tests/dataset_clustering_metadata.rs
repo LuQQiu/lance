@@ -22,6 +22,7 @@ use rstest::rstest;
 use uuid::Uuid;
 
 use crate::Dataset;
+use crate::dataset::cleanup::CleanupPolicyBuilder;
 use crate::dataset::optimize::{CompactionOptions, compact_files};
 use crate::dataset::transaction::{Operation, Transaction, UpdateMap, UpdateMapEntry};
 use crate::dataset::write::{CommitBuilder, InsertBuilder, WriteMode, WriteParams};
@@ -1209,6 +1210,101 @@ async fn a_stale_allocation_cannot_cross_a_field_identity_change(#[case] race: &
         assert!(
             error.to_string().contains("not in the schema"),
             "{race}: {error}"
+        );
+    }
+}
+
+/// The fence is decided from the version the transaction read, whatever handle
+/// it is submitted through: the original snapshot, a handle already at the
+/// latest (activated) version, or the table URI. A same-name overwrite then an
+/// explicit activation is refused through all three. When a version inside the
+/// window has been cleaned up the window cannot be judged and is refused too.
+/// Without a replacement, the same submissions land and allocate.
+#[rstest]
+#[case::read_handle("read", true, false)]
+#[case::latest_handle("latest", true, false)]
+#[case::uri("uri", true, false)]
+#[case::cleaned_window("read", true, true)]
+#[case::latest_handle_no_replacement("latest", false, false)]
+#[case::uri_no_replacement("uri", false, false)]
+#[case::latest_handle_unrelated_append("latest-append", false, false)]
+#[case::uri_unrelated_append("uri-append", false, false)]
+#[tokio::test]
+async fn the_fence_follows_the_read_version_not_the_handle(
+    #[case] destination: &str,
+    #[case] replaced: bool,
+    #[case] cleaned: bool,
+) {
+    let dir = TempStrDir::default();
+    let read = write_named_columns(&dir, &["a", "region"], WriteMode::Create).await;
+    let read_version = read.manifest().version;
+    let key_id = read.schema().field("region").unwrap().id;
+    let (destination, appended) = match destination.strip_suffix("-append") {
+        Some(destination) => (destination, true),
+        None => (destination, false),
+    };
+    let mut latest = if replaced {
+        // Reusable ids give the replacement the old id, name and type.
+        write_named_columns(&dir, &["a", "region"], WriteMode::Overwrite).await
+    } else if appended {
+        // An unrelated append in the window changes no field identity.
+        write_named_columns(&dir, &["a", "region"], WriteMode::Append).await
+    } else {
+        read.clone()
+    };
+    assert_eq!(latest.schema().field("region").unwrap().id, key_id);
+    latest.migrate_to_non_reusable_field_ids().await.unwrap();
+    let before = latest.manifest().version;
+    if cleaned {
+        let policy = CleanupPolicyBuilder::default()
+            .versions(vec![read_version + 1])
+            .unwrap()
+            .build();
+        let removed = latest.cleanup_with_policy(policy).await.unwrap();
+        assert_eq!(removed.old_versions, 1);
+    }
+
+    let (_, transaction) = submission(read_version, vec![], vec![]);
+    let desired = vec![ClusteringDefinition {
+        columns: vec![key_id],
+        ..definition(1)
+    }];
+    let builder = match destination {
+        "read" => CommitBuilder::new(Arc::new(read.clone())),
+        "latest" => CommitBuilder::new(Arc::new(Dataset::open(&dir).await.unwrap())),
+        "uri" => CommitBuilder::new(dir.as_str()),
+        _ => unreachable!(),
+    };
+    let result = builder
+        .with_clustering_definitions(desired)
+        .execute(transaction)
+        .await;
+    let reopened = Dataset::open(&dir).await.unwrap();
+    if replaced {
+        let Err(error) = result else {
+            panic!("{destination} cleaned={cleaned}: a replaced key was allocated")
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("may have given one of those ids to another column")
+                || message.contains("cannot be checked"),
+            "{destination} cleaned={cleaned}: {error}"
+        );
+        assert_eq!(
+            reopened.manifest().version,
+            before,
+            "{destination}: nothing landed"
+        );
+        assert!(reopened.manifest().clustering.is_empty());
+    } else {
+        let landed = result.unwrap();
+        assert_eq!(landed.manifest().version, before + 1);
+        assert_eq!(landed.manifest().clustering[0].columns, vec![key_id]);
+        assert_eq!(reopened.manifest().version, before + 1);
+        assert_eq!(
+            reopened.fragments().len(),
+            if appended { 2 } else { 1 },
+            "{destination}: the window's append is kept"
         );
     }
 }
