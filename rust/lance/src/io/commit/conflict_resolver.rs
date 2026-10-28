@@ -3388,6 +3388,57 @@ fn overlay_group_coverage(group: &DataOverlayGroup) -> RoaringBitmap {
     union
 }
 
+/// Refuse a concurrent transaction that could hand one of an allocating
+/// clustering submission's key field ids to another column.
+///
+/// A definition keys on field ids the writer resolved in `read_schema`, a
+/// snapshot that still used reusable ids. Until the allocation itself
+/// activates the non-reusable contract, a schema replacement in the window
+/// (an overwrite, a drop, a restore, or a merge that does not keep every read
+/// field under its id with the same name, parent and type) may reassign an id,
+/// and a drop followed by a re-add with the same name and type hides that in
+/// the final shape. So the transaction, not the landing schema, is judged.
+/// Appends, deletes, updates, index builds and additive merges rebase as usual.
+pub(crate) fn refuse_field_identity_change(
+    read_schema: &lance_core::datatypes::Schema,
+    other_transaction: &Transaction,
+    other_version: u64,
+) -> Result<()> {
+    let may_change_identity = match &other_transaction.operation {
+        Operation::Overwrite { .. } | Operation::Project { .. } | Operation::Restore { .. } => true,
+        Operation::Merge { schema, .. } => !keeps_every_field_identity(read_schema, schema),
+        _ => false,
+    };
+    if may_change_identity {
+        return Err(Error::incompatible_transaction_source(
+            format!(
+                "This UpdateConfig allocates clustering definitions keyed on field ids read \
+                 before concurrent transaction {} at version {other_version}, which may have \
+                 given one of those ids to another column; reload the table and rebuild the list.",
+                other_transaction.operation
+            )
+            .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Every field of `read` is still the same field (name, parent, type) under
+/// the same id in `landing`. Added fields are fine; a missing, renamed or
+/// retyped one is not.
+fn keeps_every_field_identity(
+    read: &lance_core::datatypes::Schema,
+    landing: &lance_core::datatypes::Schema,
+) -> bool {
+    read.fields_pre_order().all(|field| {
+        landing.field_by_id(field.id).is_some_and(|landed| {
+            landed.name == field.name
+                && landed.parent_id == field.parent_id
+                && landed.data_type() == field.data_type()
+        })
+    })
+}
+
 fn wrong_operation_err(op: &Operation) -> Error {
     Error::internal(format!("function called against a wrong operation: {}", op))
 }

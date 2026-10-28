@@ -773,14 +773,37 @@ fn field_ids(dataset: &Dataset) -> Vec<(String, i32)> {
 }
 
 async fn write_named_column(uri: &str, name: &str, mode: WriteMode) -> Dataset {
-    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-        name,
-        DataType::Int32,
-        false,
-    )]));
+    write_named_columns(uri, &[name], mode).await
+}
+
+/// Add `region` as its own data file, so dropping it releases its field id on
+/// a reusable-id table.
+async fn with_region_column(mut dataset: Dataset) -> Dataset {
+    dataset
+        .add_columns(
+            NewColumnTransform::SqlExpressions(vec![("region".to_string(), "a + 1".to_string())]),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    dataset
+}
+
+/// Int32 columns in the given order, so the last name gets the highest id.
+async fn write_named_columns(uri: &str, names: &[&str], mode: WriteMode) -> Dataset {
+    let schema = Arc::new(ArrowSchema::new(
+        names
+            .iter()
+            .map(|name| ArrowField::new(*name, DataType::Int32, false))
+            .collect::<Vec<_>>(),
+    ));
     let batch = RecordBatch::try_new(
         schema.clone(),
-        vec![Arc::new(Int32Array::from_iter_values(0..10))],
+        names
+            .iter()
+            .map(|_| Arc::new(Int32Array::from_iter_values(0..10)) as _)
+            .collect(),
     )
     .unwrap();
     Dataset::write(
@@ -1016,7 +1039,8 @@ async fn definitions_keep_their_field_identity_across_drop_add_and_overwrite() {
 /// column, and B's own activation is kept rather than recomputed.
 #[tokio::test]
 async fn a_stale_first_submission_activates_at_the_landing_mark() {
-    for b_activates in [false, true] {
+    for b_does in ["append", "add_column", "activate"] {
+        let b_activates = b_does == "activate";
         let dir = TempStrDir::default();
         let dataset = write_dataset(&dir).await;
         let planned_at = dataset.manifest().version;
@@ -1024,6 +1048,17 @@ async fn a_stale_first_submission_activates_at_the_landing_mark() {
         let mut b = dataset.clone();
         if b_activates {
             b.migrate_to_non_reusable_field_ids().await.unwrap();
+        } else if b_does == "append" {
+            b = Dataset::write(
+                rows(100..110),
+                dataset.uri(),
+                Some(WriteParams {
+                    mode: WriteMode::Append,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
         } else {
             b.add_columns(
                 NewColumnTransform::SqlExpressions(vec![("j".to_string(), "i + 1".to_string())]),
@@ -1037,7 +1072,7 @@ async fn a_stale_first_submission_activates_at_the_landing_mark() {
         let expected_mark = if b_activates {
             b.manifest().max_allocated_field_id.unwrap()
         } else {
-            b.schema().field("j").unwrap().id
+            b.manifest().max_field_id()
         };
 
         let landed = commit(
@@ -1051,11 +1086,129 @@ async fn a_stale_first_submission_activates_at_the_landing_mark() {
         assert_eq!(
             landed.manifest().max_allocated_field_id,
             Some(expected_mark),
-            "b_activates={b_activates}"
+            "{b_does}"
         );
         assert_ne!(
             landed.manifest().writer_feature_flags & FLAG_NON_REUSABLE_FIELD_IDS,
             0
+        );
+    }
+}
+
+/// Writer A resolves its key field in a reusable-id snapshot; before A lands,
+/// writer B replaces the schema in a way that can hand A's key id to another
+/// column: an overwrite, a drop followed by an add, the same with the original
+/// name and type (the final shape hides the change), or a replacement followed
+/// by an explicit activation. Every such transaction in A's window is a
+/// conflict, and A publishes nothing. Once the table is under the contract,
+/// B's columns get fresh ids and A's stale key simply no longer exists, which
+/// the allocation's own schema check refuses.
+#[rstest]
+#[case::overwrite("overwrite")]
+#[case::drop_then_add("drop_add")]
+#[case::drop_then_readd_same_name("drop_readd")]
+#[case::overwrite_same_shape("overwrite_same")]
+#[case::drop_add_then_activate("drop_add_activate")]
+#[tokio::test]
+async fn a_stale_allocation_cannot_cross_a_field_identity_change(#[case] race: &'static str) {
+    async fn replace(uri: &str, read: &Dataset, race: &str) {
+        let mut b = read.clone();
+        let add = |b: &Dataset, name: &str| {
+            let expression = vec![(name.to_string(), "a * 2".to_string())];
+            let mut b = b.clone();
+            async move {
+                b.add_columns(NewColumnTransform::SqlExpressions(expression), None, None)
+                    .await
+                    .unwrap();
+                b
+            }
+        };
+        match race {
+            "overwrite" => {
+                write_named_columns(uri, &["x", "user_id"], WriteMode::Overwrite).await;
+            }
+            "overwrite_same" => {
+                write_named_columns(uri, &["a", "region"], WriteMode::Overwrite).await;
+            }
+            "drop_add" | "drop_add_activate" => {
+                b.drop_columns(&["region"]).await.unwrap();
+                let mut b = add(&b, "price").await;
+                if race == "drop_add_activate" {
+                    b.migrate_to_non_reusable_field_ids().await.unwrap();
+                }
+            }
+            "drop_readd" => {
+                b.drop_columns(&["region"]).await.unwrap();
+                add(&b, "region").await;
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    // Reusable ids: the key is the highest id and lives in its own data file,
+    // so a drop releases it to the next column; an overwrite numbers from zero.
+    let dir = TempStrDir::default();
+    let read = with_region_column(write_named_column(&dir, "a", WriteMode::Create).await).await;
+    let key_id = read.schema().field("region").unwrap().id;
+    let planned_at = read.manifest().version;
+    replace(&dir, &read, race).await;
+    let latest = Dataset::open(&dir).await.unwrap();
+    let now_named = latest
+        .schema()
+        .field_by_id(key_id)
+        .map(|field| field.name.clone());
+    match race {
+        "overwrite" => assert_eq!(now_named.as_deref(), Some("user_id")),
+        "drop_readd" | "overwrite_same" => assert_eq!(now_named.as_deref(), Some("region")),
+        _ => assert_eq!(now_named.as_deref(), Some("price")),
+    }
+    let stale = ClusteringDefinition {
+        columns: vec![key_id],
+        ..definition(1)
+    };
+    let error = commit(&read, submission(planned_at, vec![stale], vec![]))
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("may have given one of those ids to another column"),
+        "{race}: {error}"
+    );
+    let reopened = Dataset::open(&dir).await.unwrap();
+    assert_eq!(
+        reopened.manifest().version,
+        latest.manifest().version,
+        "{race}: A landed nothing"
+    );
+    assert!(reopened.manifest().clustering.is_empty(), "{race}");
+    assert_eq!(reopened.manifest().max_clustering_id, 0, "{race}");
+    assert_eq!(
+        reopened.manifest().uses_non_reusable_field_ids(),
+        race == "drop_add_activate",
+        "{race}: only B's own activation may be present"
+    );
+
+    // Under the contract from the start, the same race leaves A's key without
+    // a field; nothing in the window can give its id to another column.
+    if matches!(race, "overwrite" | "drop_add") {
+        let dir = TempStrDir::default();
+        let mut read =
+            with_region_column(write_named_column(&dir, "a", WriteMode::Create).await).await;
+        read.migrate_to_non_reusable_field_ids().await.unwrap();
+        let key_id = read.schema().field("region").unwrap().id;
+        let planned_at = read.manifest().version;
+        replace(&dir, &read, race).await;
+        let stale = ClusteringDefinition {
+            columns: vec![key_id],
+            ..definition(1)
+        };
+        let error = commit(&read, submission(planned_at, vec![stale], vec![]))
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("not in the schema"),
+            "{race}: {error}"
         );
     }
 }

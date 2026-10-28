@@ -10,6 +10,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use lance_core::datatypes::Schema;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
 
@@ -329,6 +330,53 @@ pub fn apply_complete_clustering_definitions(
     manifest.clustering = retained;
     manifest.clustering.extend(added);
     manifest.max_clustering_id = next;
+    Ok(())
+}
+
+/// Refuse to allocate a definition whose key fields are not the fields the
+/// writer planned against.
+///
+/// A definition keys on field ids. The writer resolved its key columns in the
+/// snapshot it read; a rebased attempt lands on a later schema, and on a table
+/// with reusable field ids an id may by then name another column (a dropped
+/// key replaced by a new column, or an overwrite that numbered a new schema
+/// from zero). Allocating would freeze that binding, so each key field of a
+/// new definition must be the same field in both schemas: same name, same
+/// parent, same type. A field the landing schema lacks is left to the
+/// allocation's own schema check. Only definitions new to `manifest` are
+/// checked, so a retained list costs nothing here.
+pub fn refuse_key_fields_that_changed_identity(
+    read_schema: &Schema,
+    landing: &Manifest,
+    desired: &[ClusteringDefinition],
+    commit_version: u64,
+) -> Result<()> {
+    let current_ids: HashSet<u32> = landing.clustering.iter().map(|c| c.id).collect();
+    for definition in desired.iter().filter(|d| !current_ids.contains(&d.id)) {
+        for column in &definition.columns {
+            let (Some(planned), Some(landed)) = (
+                read_schema.field_by_id(*column),
+                landing.schema.field_by_id(*column),
+            ) else {
+                continue;
+            };
+            if planned.name != landed.name
+                || planned.parent_id != landed.parent_id
+                || planned.data_type() != landed.data_type()
+            {
+                return Err(Error::commit_conflict_source(
+                    commit_version,
+                    format!(
+                        "clustering definition {} is keyed on field id {column}, which named {:?} \
+                         when the writer read the table and names {:?} now; reload the manifest \
+                         and rebuild the list",
+                        definition.id, planned.name, landed.name
+                    )
+                    .into(),
+                ));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -798,6 +846,56 @@ mod tests {
             507,
             "three removed ids: still one pass each"
         );
+    }
+
+    /// A rebased allocation is refused when its key field id names a
+    /// different column than the writer read; a same-identity field, a field
+    /// the landing schema lacks, and a retained definition are all left alone.
+    #[test]
+    fn a_key_field_that_changed_identity_refuses_the_allocation() {
+        let schema_of = |name: &str, data_type: arrow_schema::DataType| {
+            lance_core::datatypes::Schema::try_from(&arrow_schema::Schema::new(vec![
+                arrow_schema::Field::new(name, data_type, false),
+            ]))
+            .unwrap()
+        };
+        let read = schema_of("region", arrow_schema::DataType::Int32);
+        let mut landing = manifest_with(vec![], 0);
+        landing.schema = schema_of("user_id", arrow_schema::DataType::Int32);
+        let error = refuse_key_fields_that_changed_identity(&read, &landing, &[definition(1)], 3)
+            .unwrap_err();
+        assert!(matches!(error, Error::CommitConflict { .. }), "{error:?}");
+        assert!(
+            error.to_string().contains("named \"region\"")
+                && error.to_string().contains("names \"user_id\""),
+            "{error}"
+        );
+
+        landing.schema = schema_of("region", arrow_schema::DataType::Int64);
+        let error = refuse_key_fields_that_changed_identity(&read, &landing, &[definition(1)], 3)
+            .unwrap_err();
+        assert!(error.to_string().contains("field id 0"), "{error}");
+
+        landing.schema = schema_of("region", arrow_schema::DataType::Int32);
+        refuse_key_fields_that_changed_identity(&read, &landing, &[definition(1)], 3).unwrap();
+
+        // A retained definition is not re-checked, whatever the field became.
+        landing.schema = schema_of("user_id", arrow_schema::DataType::Int32);
+        landing.clustering = vec![definition(1)];
+        landing.max_clustering_id = 1;
+        refuse_key_fields_that_changed_identity(&read, &landing, &[definition(1)], 3).unwrap();
+
+        // A key the landing schema lacks is the allocation check's business.
+        landing.clustering = vec![];
+        landing.max_clustering_id = 0;
+        landing.schema = lance_core::datatypes::Schema::try_from(&arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("x", arrow_schema::DataType::Int32, false),
+        ]))
+        .unwrap();
+        for field in landing.schema.fields.iter_mut() {
+            field.id = 9;
+        }
+        refuse_key_fields_that_changed_identity(&read, &landing, &[definition(1)], 3).unwrap();
     }
 
     fn ids(manifest: &Manifest) -> Vec<u32> {

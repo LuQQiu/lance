@@ -30,7 +30,10 @@ use crate::format::{
     DataFile, DataStorageFormat, Fragment, IndexMetadata, Manifest, ManifestBuildConfig, RowIdMeta,
     overlay::DataOverlayFile,
 };
-use crate::format::{apply_complete_clustering_definitions, merge_clustering_definitions};
+use crate::format::{
+    apply_complete_clustering_definitions, merge_clustering_definitions,
+    refuse_key_fields_that_changed_identity,
+};
 use crate::io::{
     commit::CommitHandler,
     manifest::{read_manifest, read_manifest_indexes},
@@ -2004,13 +2007,22 @@ impl Transaction {
                         .map(|state| state.manifest.clustering.as_slice())
                         .or_else(|| current_manifest.map(|m| m.clustering.as_slice()))
                         .unwrap_or(&[]);
+                    let commit_version = current_manifest.map(|m| m.version + 1).unwrap_or(1);
+                    if let Some(state) = read_version_state {
+                        refuse_key_fields_that_changed_identity(
+                            &state.manifest.schema,
+                            &manifest,
+                            desired,
+                            commit_version,
+                        )?;
+                    }
                     let mark_before = manifest.max_clustering_id;
                     apply_complete_clustering_definitions(
                         &mut manifest,
                         desired,
                         read_definitions,
                         &final_indices,
-                        current_manifest.map(|m| m.version + 1).unwrap_or(1),
+                        commit_version,
                     )?;
                     if manifest.max_clustering_id > mark_before {
                         Self::activate_field_identity_for_clustering(&mut manifest)?;
@@ -7214,6 +7226,65 @@ mod tests {
                 .contains("fragment 0 stores field id 0 in more than one data file"),
             "{error}"
         );
+    }
+
+    /// On the real build path, a rebased allocation whose key field now names
+    /// another column is refused, and one whose field kept its identity lands.
+    #[test]
+    fn a_rebased_allocation_is_refused_when_its_key_field_changed_identity() {
+        let definition = crate::format::ClusteringDefinition {
+            id: 1,
+            columns: vec![0],
+            provider: "org.example.cluster".into(),
+            version: 1,
+        };
+        let schema_named = |name: &str| {
+            LanceSchema::try_from(&ArrowSchema::new(vec![ArrowField::new(
+                name,
+                DataType::Int32,
+                false,
+            )]))
+            .unwrap()
+        };
+        let mut read = sample_manifest();
+        read.schema = schema_named("region");
+        let mut landing = sample_manifest();
+        landing.schema = schema_named("user_id");
+        landing.version = read.version + 1;
+
+        let (transaction, config) = definitions_update(&read, vec![definition.clone()]);
+        let error = transaction
+            .build_manifest_with_read_version(
+                Some(&landing),
+                vec![],
+                "txn",
+                &config,
+                Some(ReadVersionState {
+                    manifest: &read,
+                    indices: &[],
+                }),
+            )
+            .unwrap_err();
+        assert!(matches!(error, Error::CommitConflict { .. }), "{error:?}");
+        assert!(
+            error.to_string().contains("names \"user_id\" now"),
+            "{error}"
+        );
+
+        landing.schema = schema_named("region");
+        let (result, _) = transaction
+            .build_manifest_with_read_version(
+                Some(&landing),
+                vec![],
+                "txn",
+                &config,
+                Some(ReadVersionState {
+                    manifest: &read,
+                    indices: &[],
+                }),
+            )
+            .unwrap();
+        assert_eq!(result.clustering, vec![definition]);
     }
 
     /// The non-contiguous path appends its outputs instead of splicing them;
