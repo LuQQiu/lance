@@ -1096,13 +1096,64 @@ async fn a_stale_first_submission_activates_at_the_landing_mark() {
     }
 }
 
+/// A key that was already absent when the writer read the table is history,
+/// not a changed dependency: a list that retains such a definition, allocates
+/// another and removes an unreferenced one still lands.
+#[tokio::test]
+async fn a_historical_absence_is_not_a_changed_dependency() {
+    let dir = TempStrDir::default();
+    let read = with_region_column(write_named_column(&dir, "a", WriteMode::Create).await).await;
+    let key_id = read.schema().field("region").unwrap().id;
+    let a_id = read.schema().field("a").unwrap().id;
+    let on_region = ClusteringDefinition {
+        columns: vec![key_id],
+        ..definition(1)
+    };
+    let stale = ClusteringDefinition {
+        columns: vec![key_id],
+        ..definition(2)
+    };
+    let read = commit(
+        &read,
+        submission(
+            read.manifest().version,
+            vec![on_region.clone(), stale.clone()],
+            vec![],
+        ),
+    )
+    .await
+    .unwrap();
+    let mut read = read;
+    read.drop_columns(&["region"]).await.unwrap();
+    assert!(read.schema().field_by_id(key_id).is_none());
+
+    let on_a = ClusteringDefinition {
+        columns: vec![a_id],
+        ..definition(3)
+    };
+    let landed = commit(
+        &read,
+        submission(
+            read.manifest().version,
+            vec![on_region.clone(), on_a.clone()],
+            vec![],
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(landed.manifest().clustering, vec![on_region, on_a]);
+    assert_eq!(landed.manifest().max_clustering_id, 3);
+}
+
 /// A definitions list is the writer's read dependency on the key fields of
 /// every definition it names, retained ones included. A writer that carries
-/// the unchanged list after another writer renamed or retyped a key lands
-/// nothing, and the same list planned again from the landing snapshot lands.
+/// the unchanged list after another writer renamed, retyped or dropped a key
+/// lands nothing, and the same list planned again from the landing snapshot
+/// lands.
 #[rstest]
 #[case::rename("rename")]
 #[case::cast("cast")]
+#[case::drop("drop")]
 #[tokio::test]
 async fn a_retained_definitions_key_change_refuses_the_list(#[case] change: &'static str) {
     let dir = TempStrDir::default();
@@ -1121,12 +1172,20 @@ async fn a_retained_definitions_key_change_refuses_the_list(#[case] change: &'st
     let planned_at = read.manifest().version;
 
     let mut b = Dataset::open(&dir).await.unwrap();
-    let alteration = match change {
-        "rename" => crate::dataset::ColumnAlteration::new("region".into()).rename("zone".into()),
-        _ => crate::dataset::ColumnAlteration::new("region".into())
-            .cast_to(arrow_schema::DataType::Int64),
-    };
-    b.alter_columns(&[alteration]).await.unwrap();
+    match change {
+        "drop" => b.drop_columns(&["region"]).await.unwrap(),
+        "rename" => b
+            .alter_columns(&[
+                crate::dataset::ColumnAlteration::new("region".into()).rename("zone".into())
+            ])
+            .await
+            .unwrap(),
+        _ => b
+            .alter_columns(&[crate::dataset::ColumnAlteration::new("region".into())
+                .cast_to(arrow_schema::DataType::Int64)])
+            .await
+            .unwrap(),
+    }
 
     let note = ("org.example.note".to_string(), Some("x".to_string()));
     let error = commit(
