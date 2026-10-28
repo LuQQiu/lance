@@ -1309,6 +1309,88 @@ async fn the_fence_follows_the_read_version_not_the_handle(
     }
 }
 
+/// A definitions list rides only an `UpdateConfig`. A shallow clone into a
+/// destination that does not exist yet is committed by a path that never
+/// reaches the manifest builder, so the refusal happens before any path is
+/// chosen and nothing is written to the destination.
+#[tokio::test]
+async fn definitions_on_a_clone_are_refused_before_anything_is_written() {
+    let dir = TempStrDir::default();
+    let dataset = write_dataset(&dir).await;
+    let target = TempStrDir::default();
+    let target_uri = format!("{}/cloned", target.as_str());
+    let transaction = Transaction::new(
+        dataset.manifest().version,
+        Operation::Clone {
+            is_shallow: true,
+            ref_name: dataset.manifest().branch.clone(),
+            ref_version: dataset.manifest().version,
+            ref_path: dataset.uri().to_string(),
+            branch_name: None,
+        },
+        None,
+    );
+    let error = CommitBuilder::new(target_uri.as_str())
+        .with_clustering_definitions(vec![definition(1)])
+        .execute(transaction)
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("only be committed with UpdateConfig"),
+        "{error}"
+    );
+    assert!(
+        Dataset::open(&target_uri).await.is_err(),
+        "nothing was cloned"
+    );
+}
+
+/// Allocating the first definition on a reusable-id table activates the
+/// non-reusable field-id contract, and that contract refuses restoring any
+/// version from before activation. The old version stays readable.
+#[tokio::test]
+async fn the_first_allocation_makes_earlier_versions_unrestorable_but_readable() {
+    let dir = TempStrDir::default();
+    let dataset = write_dataset(&dir).await;
+    let before = dataset.manifest().version;
+    let dataset = commit(&dataset, submission(before, vec![definition(1)], vec![]))
+        .await
+        .unwrap();
+    assert!(dataset.manifest().uses_non_reusable_field_ids());
+
+    let mut earlier = dataset.checkout_version(before).await.unwrap();
+    assert_eq!(
+        earlier.count_rows(None).await.unwrap(),
+        100,
+        "still readable"
+    );
+    let error = earlier.restore().await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("non-reusable field IDs were activated after that version"),
+        "{error}"
+    );
+
+    // A version from after activation restores as usual.
+    let activated_at = dataset.manifest().version;
+    let dataset = commit(
+        &dataset,
+        submission(activated_at, vec![definition(1), definition(2)], vec![]),
+    )
+    .await
+    .unwrap();
+    let mut restored = dataset.checkout_version(activated_at).await.unwrap();
+    restored.restore().await.unwrap();
+    assert_eq!(
+        ids(&restored),
+        vec![1, 2],
+        "restore keeps every allocated definition"
+    );
+}
+
 /// A detached commit is outside the version chain; it cannot carry a
 /// definitions list.
 #[tokio::test]
