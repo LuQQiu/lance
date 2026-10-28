@@ -1641,7 +1641,7 @@ pub async fn compact_files_with_planner(
         return Ok(CompactionMetrics::default());
     }
     for task in compaction_plan.tasks() {
-        refuse_undefined_output_clustering(&dataset.manifest, task)?;
+        refuse_stale_output_clustering(&dataset.manifest, task)?;
     }
 
     let dataset_ref = &dataset.clone();
@@ -3605,34 +3605,38 @@ pub(crate) async fn live_source_row_addrs(
     Ok(addrs)
 }
 
-/// Rewrite the files in a single task.
-///
-/// This assumes that the dataset is the correct read version to be compacted.
-/// Refuse a task whose output clustering id names no definition the manifest
-/// holds, before the task rewrites anything. The commit makes the same check
-/// against the landing manifest, which is the one that counts; this one only
-/// saves a planner that holds a stale id from rewriting every task's data to
-/// have the result refused.
-fn refuse_undefined_output_clustering(
+/// Refuse a task whose output clustering id can never resolve, before the
+/// task rewrites anything: an id at or below the manifest's
+/// `max_clustering_id` that the manifest no longer holds, since definition ids
+/// are never reused. An id above the watermark may have been allocated after
+/// this snapshot was read and is left to the commit, which checks every id
+/// against the landing manifest; that check is the one that counts, this one
+/// only saves a planner that holds a stale id from rewriting every task's
+/// data to have the result refused.
+fn refuse_stale_output_clustering(
     manifest: &lance_table::format::Manifest,
     task: &TaskData,
 ) -> Result<()> {
     let Some(id) = task.output_clustering_id else {
         return Ok(());
     };
-    if manifest
-        .clustering
-        .iter()
-        .any(|definition| definition.id == id)
+    if id > manifest.max_clustering_id
+        || manifest
+            .clustering
+            .iter()
+            .any(|definition| definition.id == id)
     {
         return Ok(());
     }
     Err(Error::invalid_input(format!(
         "compaction task outputs would carry clustering definition {id}, which the table \
-         does not define"
+         no longer defines"
     )))
 }
 
+/// Rewrite the files in a single task.
+///
+/// This assumes that the dataset is the correct read version to be compacted.
 async fn rewrite_files(
     dataset: Cow<'_, Dataset>,
     task: TaskData,
@@ -3644,7 +3648,7 @@ async fn rewrite_files(
         dataset.manifest.data_storage_format.lance_file_format(),
         write_version,
     )?;
-    refuse_undefined_output_clustering(&dataset.manifest, &task)?;
+    refuse_stale_output_clustering(&dataset.manifest, &task)?;
 
     if task.fragments.is_empty() {
         return Ok(RewriteResult {
@@ -5503,51 +5507,88 @@ mod tests {
         assert_outputs(&dataset, Some(1), &[]);
 
         // Serialized tasks carry both properties and omit them when unset.
-        let plan = stamping(Some(1), &[("k", "v")])
-            .plan(&dataset)
-            .await
-            .unwrap();
-        let json = serde_json::to_string(&plan.tasks[0]).unwrap();
+        let fragments = dataset.manifest.fragments.as_ref().clone();
+        let task = TaskData {
+            fragments: fragments.clone(),
+            output_clustering_id: Some(1),
+            output_metadata: [("k".to_string(), "v".to_string())].into(),
+        };
+        let json = serde_json::to_string(&task).unwrap();
         assert!(json.contains("\"output_clustering_id\":1"), "{json}");
         assert!(json.contains("\"output_metadata\""), "{json}");
         let back: TaskData = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, plan.tasks[0]);
-        let plain = stamping(None, &[]).plan(&dataset).await.unwrap();
-        let json = serde_json::to_string(&plain.tasks[0]).unwrap();
+        assert_eq!(back, task);
+        let plain = TaskData {
+            fragments,
+            output_clustering_id: None,
+            output_metadata: HashMap::new(),
+        };
+        let json = serde_json::to_string(&plain).unwrap();
         assert!(!json.contains("output_"), "{json}");
 
-        // An id whose definition the manifest does not hold is refused before
-        // any task rewrites data: no file is staged and no version is added.
+        // A stale id, one at or below the watermark that the table no longer
+        // defines, is refused before any task rewrites data: no file is staged
+        // and no version is added. Definition 1 is allocated, then cleared.
         let dir = TempStrDir::default();
-        let mut dataset = three_fragments(&dir).await;
+        let dataset = with_definition(three_fragments(&dir).await, 1).await;
+        let mut dataset = CommitBuilder::new(Arc::new(dataset.clone()))
+            .with_clustering_definitions(Vec::new())
+            .execute(Transaction::new(
+                dataset.manifest.version,
+                Operation::UpdateConfig {
+                    config_updates: None,
+                    table_metadata_updates: None,
+                    schema_metadata_updates: None,
+                    field_metadata_updates: HashMap::new(),
+                },
+                None,
+            ))
+            .await
+            .unwrap();
+        assert!(dataset.manifest.clustering.is_empty());
+        assert_eq!(dataset.manifest.max_clustering_id, 1);
         let version = dataset.manifest.version;
-        let error = compact_files_with_planner(&mut dataset, None, &stamping(Some(9), &[]))
+        let error = compact_files_with_planner(&mut dataset, None, &stamping(Some(1), &[]))
             .await
             .unwrap_err();
         assert!(
             error
                 .to_string()
-                .contains("definition 9, which the table does not define"),
+                .contains("definition 1, which the table no longer defines"),
             "{error}"
         );
         let reopened = Dataset::open(&dir).await.unwrap();
         assert_eq!(reopened.manifest.version, version);
         assert_eq!(reopened.fragments().len(), 3);
         assert_outputs(&reopened, None, &[]);
-        assert_eq!(reopened.count_rows(None).await.unwrap(), 300);
         // A worker given such a task refuses it the same way.
         let error = rewrite_files(
             Cow::Borrowed(&reopened),
             TaskData {
                 fragments: reopened.manifest.fragments.as_ref().clone(),
-                output_clustering_id: Some(9),
+                output_clustering_id: Some(1),
                 output_metadata: HashMap::new(),
             },
             &CompactionOptions::default(),
         )
         .await
         .unwrap_err();
-        assert!(error.to_string().contains("does not define"), "{error}");
+        assert!(error.to_string().contains("no longer defines"), "{error}");
+
+        // An id above the watermark may have been allocated after this
+        // snapshot was read, so it is left to the commit, which refuses it
+        // against the landing manifest: no replacement is published, though
+        // the id reservation may have advanced the version and output files
+        // may have been staged.
+        let error = compact_files_with_planner(&mut dataset, None, &stamping(Some(9), &[]))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("clustering"), "{error}");
+        let reopened = Dataset::open(&dir).await.unwrap();
+        assert!(reopened.manifest.version <= version + 1);
+        assert_eq!(reopened.fragments().len(), 3);
+        assert_outputs(&reopened, None, &[]);
+        assert_eq!(reopened.count_rows(None).await.unwrap(), 300);
     }
 
     /// Compacting explicitly chosen, non-adjacent fragments replaces exactly
