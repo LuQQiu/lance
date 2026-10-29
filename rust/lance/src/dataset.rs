@@ -784,6 +784,35 @@ impl Dataset {
             _ => e,
         })?;
 
+        let manifest_size = object_reader.size().await.map_err(|err| match err {
+            object_store::Error::NotFound { path, source } => {
+                Error::dataset_not_found(path, source)
+            }
+            _ => Error::io(format!(
+                "failed to read manifest {}: {}",
+                manifest_location.path, err
+            )),
+        })?;
+        if manifest_size < 16 {
+            if manifest_location.size.is_some() {
+                let manifest_location = ManifestLocation {
+                    size: None,
+                    ..manifest_location.clone()
+                };
+                return Box::pin(Self::load_manifest(
+                    object_store,
+                    &manifest_location,
+                    uri,
+                    session,
+                ))
+                .await;
+            }
+            return Err(Error::corrupt_file(
+                manifest_location.path.clone(),
+                format!("Invalid format: manifest is only {manifest_size} bytes (minimum 16)"),
+            ));
+        }
+
         let last_block =
             read_last_block(object_reader.as_ref())
                 .await
@@ -791,7 +820,10 @@ impl Dataset {
                     object_store::Error::NotFound { path, source } => {
                         Error::dataset_not_found(path, source)
                     }
-                    _ => Error::io_source(err.into()),
+                    _ => Error::io(format!(
+                        "failed to read manifest {}: {}",
+                        manifest_location.path, err
+                    )),
                 })?;
 
         // A stale cached size yields a bogus footer offset. Detect it (the block
@@ -2682,23 +2714,6 @@ impl Dataset {
         index: &IndexMetadata,
     ) -> Result<Arc<ObjectStore>> {
         self.object_store(index.base_id).await
-    }
-
-    /// This table as a reader of `manifest`, another manifest of it, sees its
-    /// files: through that manifest's base paths, with base stores opened
-    /// afresh when those differ, since `base_object_stores` caches by id alone.
-    pub(crate) fn with_manifest_view(&self, manifest: Arc<Manifest>) -> Self {
-        let base_object_stores = if manifest.base_paths == self.manifest.base_paths {
-            self.base_object_stores.clone()
-        } else {
-            Default::default()
-        };
-        Self {
-            fragment_bitmap: Arc::new(manifest.fragments.iter().map(|f| f.id as u32).collect()),
-            manifest,
-            base_object_stores,
-            ..self.clone()
-        }
     }
 
     pub(crate) fn dataset_dir_for_deletion(&self, deletion_file: &DeletionFile) -> Result<Path> {
