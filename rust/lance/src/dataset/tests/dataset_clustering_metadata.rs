@@ -1181,6 +1181,12 @@ async fn an_unknown_clustering_dependency_is_refused_before_publication() {
     .await
     .unwrap();
     let version = read.manifest().version;
+    let transaction_files = || {
+        std::fs::read_dir(format!("{}/_transactions", dir.as_str()))
+            .map(|entries| entries.count())
+            .unwrap_or(0)
+    };
+    let before = transaction_files();
     let note = ("org.example.note".to_string(), Some("x".to_string()));
     let error = commit_depending_on(
         &read,
@@ -1194,6 +1200,11 @@ async fn an_unknown_clustering_dependency_is_refused_before_publication() {
         "{error:?}"
     );
     assert!(error.to_string().contains("definition 7"), "{error}");
+    assert_eq!(
+        transaction_files(),
+        before,
+        "refused before any transaction file was written"
+    );
     let reopened = Dataset::open(&dir).await.unwrap();
     assert_eq!(reopened.manifest().version, version, "nothing landed");
     assert!(

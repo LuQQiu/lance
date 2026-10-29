@@ -405,6 +405,19 @@ impl<'a> CommitBuilder<'a> {
                 "clustering dependencies need the complete clustering definitions list",
             ));
         }
+        // A dependency on a definition the list does not hold would guard
+        // nothing; refuse it here, before any transaction file is written.
+        if let (Some(dependencies), Some(definitions)) =
+            (&self.clustering_dependencies, &self.clustering_definitions)
+            && let Some(unknown) = dependencies
+                .iter()
+                .find(|id| !definitions.iter().any(|definition| definition.id == **id))
+        {
+            return Err(Error::invalid_input(format!(
+                "the submission depends on clustering definition {unknown}, which its definitions \
+                 list does not hold"
+            )));
+        }
         if matches!(
             transaction.operation,
             Operation::Clone {

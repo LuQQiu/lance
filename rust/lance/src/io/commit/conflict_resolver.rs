@@ -3501,6 +3501,52 @@ fn sorted_ids(ids: impl Iterator<Item = u64>) -> Vec<u64> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The first-activation fence judges each read field by its own identity:
+    /// a child added under a struct the writer read is fine, while a child of
+    /// that struct renamed, retyped or moved is not.
+    #[test]
+    fn additive_merge_keeps_every_read_field_but_a_changed_child_does_not() {
+        use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+        let schema = |children: Vec<Field>| {
+            lance_core::datatypes::Schema::try_from(&ArrowSchema::new(vec![
+                Field::new("a", DataType::Int64, false),
+                Field::new("info", DataType::Struct(children.into()), true),
+            ]))
+            .unwrap()
+        };
+        let zip = Field::new("zip", DataType::Int32, true);
+        let read = schema(vec![zip.clone()]);
+        // Added child under the read struct: every read field keeps its identity.
+        let added = schema(vec![zip, Field::new("note", DataType::Utf8, true)]);
+        assert!(keeps_every_field_identity(&read, &added));
+        // Renamed, retyped or missing child: not the same field any more.
+        assert!(!keeps_every_field_identity(
+            &read,
+            &schema(vec![Field::new("postcode", DataType::Int32, true)])
+        ));
+        assert!(!keeps_every_field_identity(
+            &read,
+            &schema(vec![Field::new("zip", DataType::Int64, true)])
+        ));
+        assert!(!keeps_every_field_identity(&read, &schema(vec![])));
+        // Moved: the same name and type under a different parent.
+        let moved = lance_core::datatypes::Schema::try_from(&ArrowSchema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("info", DataType::Struct(Vec::<Field>::new().into()), true),
+            Field::new("zip", DataType::Int32, true),
+        ]))
+        .unwrap();
+        let mut moved = moved;
+        // Give the moved column the read child's id so only its parent differs.
+        let read_zip = read.field("info.zip").unwrap().id;
+        for field in moved.fields.iter_mut() {
+            if field.name == "zip" {
+                field.id = read_zip;
+            }
+        }
+        assert!(!keeps_every_field_identity(&read, &moved));
+    }
     use std::{num::NonZero, sync::Arc};
 
     use crate::dataset::transaction::UpdateMode::{RewriteColumns, RewriteRows};
