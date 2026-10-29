@@ -5443,8 +5443,9 @@ mod tests {
 
     /// An index this build cannot read holds back only the sources a group
     /// actually selects: a covered member that candidacy leaves alone does not
-    /// stop the rest of its group, while a covered member that would be
-    /// rewritten refuses the plan before anything is written.
+    /// stop the rest of its group; covered members that would be rewritten
+    /// refuse the plan before anything is written; a covered member split off
+    /// on its own at the index boundary is left out, not rewritten.
     #[tokio::test]
     async fn grouped_compaction_checks_unreadable_coverage_on_selected_sources_only() {
         use crate::dataset::transaction::{Operation, Transaction};
@@ -5552,12 +5553,14 @@ mod tests {
             vec![0, 1]
         );
 
-        // The covered member is one that would be rewritten: refused before
-        // anything is written.
+        // Covered members that would be rewritten: refused before anything is
+        // written. Both small members are covered so they stay one bin; a
+        // covered member on its own is split off at the index boundary and,
+        // being a lone neighbours-only fragment, is simply left out.
         let dir = TempStrDir::default();
         let mut dataset = three_sizes(&dir).await;
         let before = dataset.manifest.fragments.as_ref().clone();
-        plant_unreadable_index(&mut dataset, &[0]).await;
+        plant_unreadable_index(&mut dataset, &[0, 1]).await;
         let version = dataset.manifest.version;
         let error = planner
             .plan_groups(
@@ -5575,6 +5578,23 @@ mod tests {
             "{error}"
         );
         assert_eq!(dataset.manifest.version, version);
+
+        let dir = TempStrDir::default();
+        let mut dataset = three_sizes(&dir).await;
+        let before = dataset.manifest.fragments.as_ref().clone();
+        plant_unreadable_index(&mut dataset, &[0]).await;
+        let plan = planner
+            .plan_groups(
+                &dataset,
+                vec![CompactionGroup {
+                    fragments: before[..2].to_vec(),
+                    output_clustering_id: None,
+                    output_metadata: HashMap::new(),
+                }],
+            )
+            .await
+            .unwrap();
+        assert!(plan.tasks.is_empty(), "{:?}", plan.tasks);
     }
 
     /// With stable row ids and deferred remapping, a non-adjacent group's
