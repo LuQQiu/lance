@@ -3387,15 +3387,26 @@ pub(crate) fn refuse_field_identity_change(
 }
 
 /// Every field of `read` is still the same field under the same id in
-/// `landing`: same path of names and logical types from the root. Added
-/// fields are fine; a missing, renamed, moved or retyped one is not, while
-/// metadata and nullability edits are.
+/// `landing`: same name, logical type and parent. Since every read field is
+/// checked, a parent's own identity covers the path above it, and a child's
+/// covers the shape below. Added fields are fine; a missing, renamed, moved
+/// or retyped one is not, while metadata and nullability edits are. One map
+/// of the landing fields keeps this linear on wide schemas.
 fn keeps_every_field_identity(
     read: &lance_core::datatypes::Schema,
     landing: &lance_core::datatypes::Schema,
 ) -> bool {
-    read.fields_pre_order()
-        .all(|field| lance_table::format::same_field_identity(read, landing, field.id))
+    let landed: HashMap<i32, &lance_core::datatypes::Field> = landing
+        .fields_pre_order()
+        .map(|field| (field.id, field))
+        .collect();
+    read.fields_pre_order().all(|field| {
+        landed.get(&field.id).is_some_and(|other| {
+            other.name == field.name
+                && other.logical_type == field.logical_type
+                && other.parent_id == field.parent_id
+        })
+    })
 }
 
 fn wrong_operation_err(op: &Operation) -> Error {

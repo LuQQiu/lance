@@ -1203,6 +1203,78 @@ async fn an_unknown_clustering_dependency_is_refused_before_publication() {
             .contains_key("org.example.note")
     );
 }
+/// The first-allocation fence judges the concurrent transaction, not the final
+/// shape: a Merge that only adds fields (a new column, a new struct column
+/// with its children) is compatible and the allocation rebases over it, while a Merge
+/// that renames a field the writer read is refused, since on a table with
+/// reusable field ids it may have moved a key's id.
+#[tokio::test]
+async fn a_first_allocation_rebases_over_an_additive_merge_but_not_a_rename() {
+    // Additive: a new top-level column and a new struct column with children.
+    let dir = TempStrDir::default();
+    let read = with_region_column(write_named_column(&dir, "a", WriteMode::Create).await).await;
+    let mut b = read.clone();
+    b.add_columns(
+        NewColumnTransform::SqlExpressions(vec![
+            ("price".to_string(), "a * 2".to_string()),
+            (
+                "info".to_string(),
+                "named_struct('zip', a, 'note', a)".to_string(),
+            ),
+        ]),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let key_id = read.schema().field("region").unwrap().id;
+    let landed = commit(
+        &read,
+        submission(
+            read.manifest().version,
+            vec![ClusteringDefinition {
+                columns: vec![key_id],
+                ..definition(1)
+            }],
+            vec![],
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ids(&landed), vec![1]);
+    assert!(landed.schema().field("price").is_some());
+    assert!(landed.schema().field("info").is_some());
+
+    // A rename through a Merge in the window is refused: the renamed field is
+    // one the writer read, and on this table its id could have moved.
+    let dir = TempStrDir::default();
+    let read = with_region_column(write_named_column(&dir, "a", WriteMode::Create).await).await;
+    let mut b = Dataset::open(&dir).await.unwrap();
+    b.alter_columns(&[crate::dataset::ColumnAlteration::new("a".into()).rename("b".into())])
+        .await
+        .unwrap();
+    let key_id = read.schema().field("region").unwrap().id;
+    let error = commit(
+        &read,
+        submission(
+            read.manifest().version,
+            vec![ClusteringDefinition {
+                columns: vec![key_id],
+                ..definition(1)
+            }],
+            vec![],
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("may have given one of those ids to another column"),
+        "{error}"
+    );
+}
+
 /// A submission depends on the key fields of the definitions it publishes
 /// for, not on every retained definition's. An unchanged list with unrelated
 /// metadata lands over another writer's rename, retype or drop of a retained
