@@ -1213,20 +1213,6 @@ impl DefaultCompactionPlanner {
             );
         }
 
-        for (index, covered) in &unreadable_coverage {
-            if let Some(fragment) = all_tasks
-                .iter()
-                .flat_map(|(task, _)| &task.fragments)
-                .find(|fragment| u32::try_from(fragment.id).is_ok_and(|id| covered.contains(id)))
-            {
-                return Err(Error::invalid_input(format!(
-                    "compaction group selects fragment {} for rewriting, which is covered by \
-                     index '{index}' that this build cannot read and so cannot remap",
-                    fragment.id
-                )));
-            }
-        }
-
         // Only the selected sources change identity, so `max_source_fragments`
         // bounds them directly: tasks are kept in group order until the next
         // would exceed it, as the row and byte budgets are applied below.
@@ -1252,6 +1238,23 @@ impl DefaultCompactionPlanner {
             all_tasks
         };
         let tasks = limit_tasks_to_source_budget(&self.options, dataset.schema(), all_tasks)?;
+
+        // Checked last, over the tasks the budgets kept: only a source that
+        // will really be rewritten can refuse the plan, the same set the
+        // commit's safeguard checks.
+        for (index, covered) in &unreadable_coverage {
+            if let Some(fragment) = tasks
+                .iter()
+                .flat_map(|task| &task.fragments)
+                .find(|fragment| u32::try_from(fragment.id).is_ok_and(|id| covered.contains(id)))
+            {
+                return Err(Error::invalid_input(format!(
+                    "compaction group selects fragment {} for rewriting, which is covered by \
+                     index '{index}' that this build cannot read and so cannot remap",
+                    fragment.id
+                )));
+            }
+        }
 
         let mut options = self.options.clone();
         options.data_storage_version = Some(write_version.to_selector());
@@ -5578,6 +5581,63 @@ mod tests {
             "{error}"
         );
         assert_eq!(dataset.manifest.version, version);
+
+        // A covered task the source budget drops must not refuse the valid
+        // tasks kept before it: two groups of two small members each, the
+        // second group covered, a budget of two sources keeps only the first.
+        let dir = TempStrDir::default();
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from_iter_values(0..400))],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &dir,
+            Some(WriteParams {
+                max_rows_per_file: 100,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let four = dataset.manifest.fragments.as_ref().clone();
+        plant_unreadable_index(&mut dataset, &[2, 3]).await;
+        let groups = vec![
+            CompactionGroup {
+                fragments: four[..2].to_vec(),
+                output_clustering_id: None,
+                output_metadata: HashMap::new(),
+            },
+            CompactionGroup {
+                fragments: four[2..].to_vec(),
+                output_clustering_id: None,
+                output_metadata: HashMap::new(),
+            },
+        ];
+        let budgeted = DefaultCompactionPlanner::new(CompactionOptions {
+            target_rows_per_fragment: 1_000,
+            max_source_fragments: Some(2),
+            ..Default::default()
+        })
+        .unwrap();
+        let plan = budgeted
+            .plan_groups(&dataset, groups.clone())
+            .await
+            .unwrap();
+        assert_eq!(plan.tasks.len(), 1, "{:?}", plan.tasks);
+        assert_eq!(
+            plan.tasks[0]
+                .fragments
+                .iter()
+                .map(|f| f.id)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        // Without the budget the covered group is selected, and refused.
+        let error = planner.plan_groups(&dataset, groups).await.unwrap_err();
+        assert!(error.to_string().contains("fragment 2"), "{error}");
 
         let dir = TempStrDir::default();
         let mut dataset = three_sizes(&dir).await;
