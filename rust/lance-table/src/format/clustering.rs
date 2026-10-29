@@ -423,13 +423,15 @@ fn same_typed_subtree(planned: &Field, landed: &Field) -> bool {
 /// names are not part of a field's identity here. A key the writer's own
 /// snapshot already lacked is history, not a change.
 ///
-/// The dependency is scoped to what the submission uses: with `depends_on`,
-/// exactly those definition ids; without it, the definitions the list
-/// allocates (present in `desired`, absent from `read_definitions`). A
-/// retained definition the submission does not publish for is not a
+/// The dependency is scoped to what the submission uses: the definitions the
+/// list allocates (present in `desired`, absent from `read_definitions`) are
+/// always checked, and `depends_on` adds retained definitions the submission
+/// publishes for. A retained definition the submission does not name is not a
 /// prerequisite, so an unrelated schema edit to one of its keys does not stop
-/// the submission. Allocation, removal and identity races on the list itself
-/// are checked separately when the list is applied.
+/// the submission. A dependency on an id the list does not hold is refused as
+/// invalid input: it would establish no guard. Allocation, removal and
+/// identity races on the list itself are checked separately when the list is
+/// applied.
 pub fn refuse_key_fields_that_changed_identity(
     read_schema: &Schema,
     landing: &Manifest,
@@ -444,9 +446,18 @@ pub fn refuse_key_fields_that_changed_identity(
             .unwrap_or_else(|_| format!("field id {id}"))
     };
     let read_ids: HashSet<u32> = read_definitions.iter().map(|d| d.id).collect();
-    let in_scope = |definition: &ClusteringDefinition| match depends_on {
-        Some(ids) => ids.contains(&definition.id),
-        None => !read_ids.contains(&definition.id),
+    let desired_ids: HashSet<u32> = desired.iter().map(|d| d.id).collect();
+    let explicit: HashSet<u32> = depends_on
+        .map(|ids| ids.iter().copied().collect())
+        .unwrap_or_default();
+    if let Some(unknown) = explicit.iter().find(|id| !desired_ids.contains(id)) {
+        return Err(Error::invalid_input(format!(
+            "the submission depends on clustering definition {unknown}, which its definitions \
+             list does not hold"
+        )));
+    }
+    let in_scope = |definition: &ClusteringDefinition| {
+        !read_ids.contains(&definition.id) || explicit.contains(&definition.id)
     };
     for definition in desired.iter().filter(|d| in_scope(d)) {
         for column in &definition.columns {
@@ -1040,8 +1051,38 @@ mod tests {
         refuse(&landing, &retained, None).unwrap();
         let error = refuse(&landing, &retained, Some(&[1])).unwrap_err();
         assert!(matches!(error, Error::CommitConflict { .. }), "{error:?}");
-        // A dependency on a definition the list does not name checks nothing.
-        refuse(&landing, &retained, Some(&[7])).unwrap();
+        // A dependency on a definition the list does not hold would guard
+        // nothing: refused as invalid input, not as a conflict.
+        let error = refuse(&landing, &retained, Some(&[7])).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(error.to_string().contains("definition 7"), "{error}");
+        // Explicit dependencies add to the allocations, never replace them:
+        // an empty list still checks a new allocation, and a list naming a
+        // retained definition checks both.
+        landing.schema = schema_of("region", arrow_schema::DataType::Int64);
+        let error = refuse(&landing, &[], Some(&[])).unwrap_err();
+        assert!(matches!(error, Error::CommitConflict { .. }), "{error:?}");
+        let two = [definition(1), definition(2)];
+        let error = refuse_key_fields_that_changed_identity(
+            &read,
+            &landing,
+            &two,
+            &retained,
+            Some(&[1]),
+            3,
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::CommitConflict { .. }), "{error:?}");
+        let error = refuse_key_fields_that_changed_identity(
+            &read,
+            &landing,
+            &two,
+            &retained,
+            Some(&[1, 1]),
+            3,
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::CommitConflict { .. }), "{error:?}");
 
         // A key the landing schema no longer has (dropped, or cast under a
         // new id) refuses a dependent submission; a key the writer's own

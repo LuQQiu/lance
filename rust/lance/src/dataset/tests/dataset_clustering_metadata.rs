@@ -1163,6 +1163,46 @@ async fn a_historical_absence_is_not_a_changed_dependency() {
     assert_eq!(landed.manifest().max_clustering_id, 3);
 }
 
+/// A dependency on a definition the list does not hold is refused as invalid
+/// input before anything lands: it would protect nothing.
+#[tokio::test]
+async fn an_unknown_clustering_dependency_is_refused_before_publication() {
+    let dir = TempStrDir::default();
+    let read = with_region_column(write_named_column(&dir, "a", WriteMode::Create).await).await;
+    let key_id = read.schema().field("region").unwrap().id;
+    let configured = ClusteringDefinition {
+        columns: vec![key_id],
+        ..definition(1)
+    };
+    let read = commit(
+        &read,
+        submission(read.manifest().version, vec![configured.clone()], vec![]),
+    )
+    .await
+    .unwrap();
+    let version = read.manifest().version;
+    let note = ("org.example.note".to_string(), Some("x".to_string()));
+    let error = commit_depending_on(
+        &read,
+        submission(version, vec![configured.clone()], vec![note]),
+        vec![7],
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(error, crate::Error::InvalidInput { .. }),
+        "{error:?}"
+    );
+    assert!(error.to_string().contains("definition 7"), "{error}");
+    let reopened = Dataset::open(&dir).await.unwrap();
+    assert_eq!(reopened.manifest().version, version, "nothing landed");
+    assert!(
+        !reopened
+            .manifest()
+            .table_metadata
+            .contains_key("org.example.note")
+    );
+}
 /// A submission depends on the key fields of the definitions it publishes
 /// for, not on every retained definition's. An unchanged list with unrelated
 /// metadata lands over another writer's rename, retype or drop of a retained
