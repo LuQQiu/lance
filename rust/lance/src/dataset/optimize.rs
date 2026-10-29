@@ -1080,6 +1080,7 @@ impl DefaultCompactionPlanner {
         // Metrics for every member of every group, read with the same bounded
         // parallelism as ordinary planning; `buffered` keeps input order, so
         // the results line up with the groups.
+        let present = &present;
         let members = groups
             .iter()
             .enumerate()
