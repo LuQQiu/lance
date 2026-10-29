@@ -5743,6 +5743,136 @@ mod tests {
         assert_eq!(rows_by_id(&dataset).await, expected);
     }
 
+    /// Between planning and commit, an unrelated append lands alongside grouped
+    /// results and keeps its own fragment, while a change to one of the
+    /// group's own sources is refused and no deleted row comes back.
+    #[tokio::test]
+    async fn grouped_compaction_commit_lands_with_an_append_and_refuses_a_source_change() {
+        async fn four_fragments(uri: &str) -> Dataset {
+            let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int64Array::from_iter_values(0..400))],
+            )
+            .unwrap();
+            Dataset::write(
+                RecordBatchIterator::new(vec![Ok(batch)], schema),
+                uri,
+                Some(WriteParams {
+                    max_rows_per_file: 100,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap()
+        }
+
+        async fn plan_and_execute(dataset: &Dataset) -> (CompactionPlan, Vec<RewriteResult>) {
+            let before = dataset.manifest.fragments.as_ref().clone();
+            let plan = DefaultCompactionPlanner::new(CompactionOptions {
+                target_rows_per_fragment: 1_000,
+                ..Default::default()
+            })
+            .unwrap()
+            .plan_groups(
+                dataset,
+                vec![CompactionGroup {
+                    fragments: vec![before[0].clone(), before[2].clone()],
+                    output_clustering_id: None,
+                    output_metadata: HashMap::new(),
+                }],
+            )
+            .await
+            .unwrap();
+            assert_eq!(plan.tasks.len(), 1);
+            let mut results = Vec::new();
+            for task in plan.compaction_tasks() {
+                results.push(task.execute(dataset).await.unwrap());
+            }
+            (plan, results)
+        }
+
+        // A harmless append between plan and commit: both land.
+        let dir = TempStrDir::default();
+        let planned = four_fragments(&dir).await;
+        let (plan, results) = plan_and_execute(&planned).await;
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        let appended = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from_iter_values(400..450))],
+        )
+        .unwrap();
+        let other = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(appended)], schema),
+            &dir,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let appended_fragment = other.manifest.fragments.last().unwrap().clone();
+        assert_eq!(appended_fragment.id, 4);
+        let mut committer = Dataset::open(&dir).await.unwrap();
+        commit_compaction(
+            &mut committer,
+            results,
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &plan.options,
+        )
+        .await
+        .unwrap();
+        let after = committer.manifest.fragments.as_ref().clone();
+        assert_eq!(
+            after.iter().map(|f| f.id).collect::<Vec<_>>(),
+            vec![1, 3, 4, 5]
+        );
+        assert_eq!(after[2], appended_fragment, "the append keeps its fragment");
+        assert_eq!(after[3].physical_rows, Some(200));
+        assert_eq!(committer.count_rows(None).await.unwrap(), 450);
+
+        // A delete on one of the group's sources between plan and commit: the
+        // commit is refused and the deleted rows stay deleted.
+        let dir = TempStrDir::default();
+        let planned = four_fragments(&dir).await;
+        let (plan, results) = plan_and_execute(&planned).await;
+        let mut other = Dataset::open(&dir).await.unwrap();
+        other.delete("a < 10").await.unwrap();
+        let mut committer = Dataset::open(&dir).await.unwrap();
+        let error = commit_compaction(
+            &mut committer,
+            results,
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &plan.options,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("retryable")
+                || error.contains("conflict")
+                || error.contains("preempted"),
+            "{error}"
+        );
+        let latest = Dataset::open(&dir).await.unwrap();
+        assert_eq!(
+            latest
+                .manifest
+                .fragments
+                .iter()
+                .map(|f| f.id)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2, 3],
+            "no rewrite landed"
+        );
+        assert_eq!(
+            latest.count_rows(Some("a < 10".to_string())).await.unwrap(),
+            0
+        );
+        assert_eq!(latest.count_rows(None).await.unwrap(), 390);
+    }
+
     #[rstest]
     #[tokio::test]
     async fn test_compact_empty(
