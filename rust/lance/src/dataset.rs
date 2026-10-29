@@ -4411,7 +4411,6 @@ pub(crate) struct ManifestWriteConfig {
     /// The writer's complete desired clustering definitions list for an
     /// `UpdateConfig` commit; see `ManifestBuildConfig::clustering_definitions`.
     clustering_definitions: Option<Vec<ClusteringDefinition>>, // default None
-    clustering_dependencies: Option<Vec<u32>>, // default None
 }
 
 impl Default for ManifestWriteConfig {
@@ -4427,7 +4426,6 @@ impl Default for ManifestWriteConfig {
             activate_non_reusable_field_ids: false,
             tagged_frag_reuse_trim: false,
             clustering_definitions: None,
-            clustering_dependencies: None,
         }
     }
 }
@@ -4487,7 +4485,6 @@ impl ManifestWriteConfig {
             migration_next_row_id: self.migration_next_row_id,
             activate_non_reusable_field_ids: self.activate_non_reusable_field_ids,
             clustering_definitions: self.clustering_definitions.clone(),
-            clustering_dependencies: self.clustering_dependencies.clone(),
             spilled_row_lineage: Default::default(),
         }
     }

@@ -2015,8 +2015,7 @@ impl Transaction {
                             &state.manifest.schema,
                             &manifest,
                             desired,
-                            read_definitions,
-                            config.clustering_dependencies.as_deref(),
+                            state.manifest.max_clustering_id,
                             commit_version,
                         )?;
                     }
@@ -7229,17 +7228,13 @@ mod tests {
         );
     }
 
-    /// On the real build path, a rebased list whose key field now names
-    /// another column is refused, allocation or retained, and one whose field
-    /// kept its identity lands.
     /// On the build path a rebased submission is checked against the landing
     /// schema from its read schema: an allocation whose key was retyped is
     /// refused, one whose key was renamed lands, an unchanged list carried
-    /// over a retained key's rename or retype lands too, and a submission
-    /// that depends on a retained definition is refused when that key was
-    /// retyped.
+    /// over a retained key's rename or retype lands too, and of several
+    /// allocations in one submission a retyped key on any refuses them all.
     #[test]
-    fn a_rebased_submission_is_refused_only_when_a_dependent_key_changed_type() {
+    fn a_rebased_submission_is_refused_only_when_an_allocated_key_changed_type() {
         let definition = crate::format::ClusteringDefinition {
             id: 1,
             columns: vec![0],
@@ -7301,15 +7296,43 @@ mod tests {
             assert_eq!(result.clustering, vec![definition.clone()]);
         }
 
-        // Named as a dependency, the retained definition's key is checked:
-        // its rename lands, its retype is refused.
-        let (transaction, mut config) = definitions_update(&read, vec![definition]);
-        config.clustering_dependencies = Some(vec![1]);
-        landing.schema = schema_of("user_id", DataType::Int32);
-        build(&transaction, &config, &read, &landing).unwrap();
-        landing.schema = schema_of("region", DataType::Int64);
+        // Two allocations at once over the retyped key: the lower one is
+        // keyed on it, and its conflict refuses the whole submission even
+        // though the higher one's key is untouched.
+        let two_fields = |region: DataType| {
+            LanceSchema::try_from(&ArrowSchema::new(vec![
+                ArrowField::new("region", region, false),
+                ArrowField::new("amount", DataType::Int32, false),
+            ]))
+            .unwrap()
+        };
+        read.schema = two_fields(DataType::Int32);
+        landing.schema = two_fields(DataType::Int64);
+        let on_amount = crate::format::ClusteringDefinition {
+            id: 3,
+            columns: vec![1],
+            ..definition.clone()
+        };
+        let (transaction, config) = definitions_update(
+            &read,
+            vec![
+                definition.clone(),
+                crate::format::ClusteringDefinition {
+                    id: 2,
+                    ..definition.clone()
+                },
+                on_amount,
+            ],
+        );
         let error = build(&transaction, &config, &read, &landing).unwrap_err();
         assert!(matches!(error, Error::CommitConflict { .. }), "{error:?}");
+        assert!(
+            error
+                .to_string()
+                .contains("definition 2 is keyed on field id 0"),
+            "{error}"
+        );
+        assert_eq!(landing.clustering, vec![definition], "nothing landed");
     }
 
     /// The non-contiguous path appends its outputs instead of splicing them;

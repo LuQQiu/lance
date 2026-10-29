@@ -117,7 +117,6 @@ async fn commit_edited_manifest(
             activate_non_reusable_field_ids: false,
             tagged_frag_reuse_trim: false,
             clustering_definitions: None,
-            clustering_dependencies: None,
         },
         dataset.manifest_location.naming_scheme,
         None,
@@ -766,18 +765,6 @@ async fn commit(
         .await
 }
 
-async fn commit_depending_on(
-    dataset: &Dataset,
-    (desired, transaction): (Vec<ClusteringDefinition>, Transaction),
-    definition_ids: Vec<u32>,
-) -> crate::Result<Dataset> {
-    CommitBuilder::new(Arc::new(dataset.clone()))
-        .with_clustering_definitions(desired)
-        .with_clustering_dependencies(definition_ids)
-        .execute(transaction)
-        .await
-}
-
 fn ids(dataset: &Dataset) -> Vec<u32> {
     dataset.manifest().clustering.iter().map(|d| d.id).collect()
 }
@@ -1163,57 +1150,6 @@ async fn a_historical_absence_is_not_a_changed_dependency() {
     assert_eq!(landed.manifest().max_clustering_id, 3);
 }
 
-/// A dependency on a definition the list does not hold is refused as invalid
-/// input before anything lands: it would protect nothing.
-#[tokio::test]
-async fn an_unknown_clustering_dependency_is_refused_before_publication() {
-    let dir = TempStrDir::default();
-    let read = with_region_column(write_named_column(&dir, "a", WriteMode::Create).await).await;
-    let key_id = read.schema().field("region").unwrap().id;
-    let configured = ClusteringDefinition {
-        columns: vec![key_id],
-        ..definition(1)
-    };
-    let read = commit(
-        &read,
-        submission(read.manifest().version, vec![configured.clone()], vec![]),
-    )
-    .await
-    .unwrap();
-    let version = read.manifest().version;
-    let transaction_files = || {
-        std::fs::read_dir(format!("{}/_transactions", dir.as_str()))
-            .map(|entries| entries.count())
-            .unwrap_or(0)
-    };
-    let before = transaction_files();
-    let note = ("org.example.note".to_string(), Some("x".to_string()));
-    let error = commit_depending_on(
-        &read,
-        submission(version, vec![configured.clone()], vec![note]),
-        vec![7],
-    )
-    .await
-    .unwrap_err();
-    assert!(
-        matches!(error, crate::Error::InvalidInput { .. }),
-        "{error:?}"
-    );
-    assert!(error.to_string().contains("definition 7"), "{error}");
-    assert_eq!(
-        transaction_files(),
-        before,
-        "refused before any transaction file was written"
-    );
-    let reopened = Dataset::open(&dir).await.unwrap();
-    assert_eq!(reopened.manifest().version, version, "nothing landed");
-    assert!(
-        !reopened
-            .manifest()
-            .table_metadata
-            .contains_key("org.example.note")
-    );
-}
 /// The first-allocation fence judges the concurrent transaction, not the final
 /// shape: a Merge that only adds fields (a new column, a new struct column
 /// with its children) is compatible and the allocation rebases over it, while a Merge
@@ -1286,21 +1222,22 @@ async fn a_first_allocation_rebases_over_an_additive_merge_but_not_a_rename() {
     );
 }
 
-/// A submission depends on the key fields of the definitions it publishes
-/// for, not on every retained definition's. An unchanged list with unrelated
+/// A submission depends on the key fields of the definitions it allocates,
+/// not on every retained definition's. An unchanged list with unrelated
 /// metadata lands over another writer's rename, retype or drop of a retained
-/// key. A submission that depends on that definition lands over the rename
-/// and is refused over the retype or drop, and the same submission planned
-/// again from the landing snapshot lands.
+/// key. A submission allocating two more definitions, the lower one keyed on
+/// that field, lands over the rename and is refused as a whole over the
+/// retype or drop; planned again from the landing snapshot, it lands.
 #[rstest]
 #[case::rename("rename")]
 #[case::cast("cast")]
 #[case::drop("drop")]
 #[tokio::test]
-async fn a_retained_keys_change_blocks_only_a_dependent_submission(#[case] change: &'static str) {
+async fn a_retained_keys_change_blocks_only_a_new_allocation_on_it(#[case] change: &'static str) {
     let dir = TempStrDir::default();
     let read = with_region_column(write_named_column(&dir, "a", WriteMode::Create).await).await;
     let key_id = read.schema().field("region").unwrap().id;
+    let a_id = read.schema().field("a").unwrap().id;
     let configured = ClusteringDefinition {
         columns: vec![key_id],
         ..definition(1)
@@ -1342,20 +1279,33 @@ async fn a_retained_keys_change_blocks_only_a_dependent_submission(#[case] chang
         "{change}: the unrelated submission landed"
     );
 
-    // Depending on the definition: a rename keeps the key, a retype or a
-    // drop refuses the submission and nothing of it lands.
-    let spec = ("org.example.spec.1".to_string(), Some("{}".to_string()));
-    let result = commit_depending_on(
+    // Allocating on the changed key (definition 2) and on an untouched one
+    // (definition 3) at once: a rename keeps the key, a retype or a drop
+    // refuses the submission for definition 2 and nothing of it lands.
+    let on_region = ClusteringDefinition {
+        columns: vec![key_id],
+        ..definition(2)
+    };
+    let on_a = ClusteringDefinition {
+        columns: vec![a_id],
+        ..definition(3)
+    };
+    let spec = ("org.example.spec.2".to_string(), Some("{}".to_string()));
+    let result = commit(
         &read,
-        submission(planned_at, vec![configured.clone()], vec![spec.clone()]),
-        vec![1],
+        submission(
+            planned_at,
+            vec![configured.clone(), on_region.clone(), on_a.clone()],
+            vec![spec.clone()],
+        ),
     )
     .await;
     let reopened = Dataset::open(&dir).await.unwrap();
     if change == "rename" {
-        result.unwrap();
+        let landed = result.unwrap();
+        assert_eq!(ids(&landed), vec![1, 2, 3]);
         assert_eq!(
-            reopened.manifest().table_metadata["org.example.spec.1"],
+            reopened.manifest().table_metadata["org.example.spec.2"],
             "{}"
         );
     } else {
@@ -1365,29 +1315,40 @@ async fn a_retained_keys_change_blocks_only_a_dependent_submission(#[case] chang
             "{change}: {error:?}"
         );
         assert!(
-            error.to_string().contains("rebuild the list"),
+            error
+                .to_string()
+                .contains(&format!("definition 2 is keyed on field id {key_id}")),
             "{change}: {error}"
         );
+        assert_eq!(ids(&reopened), vec![1], "{change}: no allocation landed");
         assert!(
             !reopened
                 .manifest()
                 .table_metadata
-                .contains_key("org.example.spec.1"),
-            "{change}: the dependent submission landed nothing"
+                .contains_key("org.example.spec.2"),
+            "{change}: the refused submission landed nothing"
         );
-        // Planned again from the landing snapshot, it lands.
-        let landed = commit_depending_on(
+        // Planned again from the landing snapshot, with the key as it is
+        // now (or without it, once dropped), it lands; ids continue the mark.
+        let mut replanned = vec![configured.clone()];
+        if let Some(region) = reopened.schema().field("region") {
+            replanned.push(ClusteringDefinition {
+                columns: vec![region.id],
+                ..definition(2)
+            });
+        }
+        replanned.push(ClusteringDefinition {
+            columns: vec![a_id],
+            ..definition(replanned.len() as u32 + 1)
+        });
+        let landed = commit(
             &reopened,
-            submission(
-                reopened.manifest().version,
-                vec![configured.clone()],
-                vec![spec],
-            ),
-            vec![1],
+            submission(reopened.manifest().version, replanned.clone(), vec![spec]),
         )
         .await
         .unwrap();
-        assert_eq!(landed.manifest().clustering, vec![configured]);
+        assert_eq!(landed.manifest().clustering, replanned);
+        assert_eq!(landed.manifest().table_metadata["org.example.spec.2"], "{}");
     }
 }
 

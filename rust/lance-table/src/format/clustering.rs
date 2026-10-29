@@ -423,21 +423,21 @@ fn same_typed_subtree(planned: &Field, landed: &Field) -> bool {
 /// names are not part of a field's identity here. A key the writer's own
 /// snapshot already lacked is history, not a change.
 ///
-/// The dependency is scoped to what the submission uses: the definitions the
-/// list allocates (present in `desired`, absent from `read_definitions`) are
-/// always checked, and `depends_on` adds retained definitions the submission
-/// publishes for. A retained definition the submission does not name is not a
-/// prerequisite, so an unrelated schema edit to one of its keys does not stop
-/// the submission. A dependency on an id the list does not hold is refused as
-/// invalid input: it would establish no guard. Allocation, removal and
-/// identity races on the list itself are checked separately when the list is
+/// The submission depends on the definitions it allocates: every definition
+/// in `desired` whose id lies above `read_max_clustering_id`, the allocation
+/// mark of the manifest the writer read, is checked, whether or not it is the
+/// highest. The mark, not the largest definition still present, decides: ids
+/// are never reused, so a removed definition's id stays below it. A retained
+/// definition is not a prerequisite, so an unrelated schema edit to one of
+/// its keys does not stop a submission that keeps it. Allocation, removal and
+/// identity races on the list itself, including an id at or below the mark
+/// that the read list did not hold, are checked separately when the list is
 /// applied.
 pub fn refuse_key_fields_that_changed_identity(
     read_schema: &Schema,
     landing: &Manifest,
     desired: &[ClusteringDefinition],
-    read_definitions: &[ClusteringDefinition],
-    depends_on: Option<&[u32]>,
+    read_max_clustering_id: u32,
     commit_version: u64,
 ) -> Result<()> {
     let path = |schema: &Schema, id: i32| {
@@ -445,21 +445,7 @@ pub fn refuse_key_fields_that_changed_identity(
             .field_path(id)
             .unwrap_or_else(|_| format!("field id {id}"))
     };
-    let read_ids: HashSet<u32> = read_definitions.iter().map(|d| d.id).collect();
-    let desired_ids: HashSet<u32> = desired.iter().map(|d| d.id).collect();
-    let explicit: HashSet<u32> = depends_on
-        .map(|ids| ids.iter().copied().collect())
-        .unwrap_or_default();
-    if let Some(unknown) = explicit.iter().find(|id| !desired_ids.contains(id)) {
-        return Err(Error::invalid_input(format!(
-            "the submission depends on clustering definition {unknown}, which its definitions \
-             list does not hold"
-        )));
-    }
-    let in_scope = |definition: &ClusteringDefinition| {
-        !read_ids.contains(&definition.id) || explicit.contains(&definition.id)
-    };
-    for definition in desired.iter().filter(|d| in_scope(d)) {
+    for definition in desired.iter().filter(|d| d.id > read_max_clustering_id) {
         for column in &definition.columns {
             if read_schema.field_by_id(*column).is_none() {
                 continue;
@@ -964,12 +950,13 @@ mod tests {
         );
     }
 
-    /// A dependent definition's key must still be the same typed field in
+    /// An allocated definition's key must still be the same typed field in
     /// the landing schema: a retype or a drop refuses the submission, a
     /// rename does not, and a key the writer's snapshot never had is history.
-    /// Only the definitions the submission depends on are checked.
+    /// Every definition above the read allocation mark is checked, none of
+    /// the retained ones.
     #[test]
-    fn a_dependent_keys_type_change_refuses_the_submission_and_a_rename_does_not() {
+    fn an_allocated_keys_type_change_refuses_the_submission_and_a_rename_does_not() {
         let schema_of = |name: &str, data_type: arrow_schema::DataType| {
             lance_core::datatypes::Schema::try_from(&arrow_schema::Schema::new(vec![
                 arrow_schema::Field::new(name, data_type, false),
@@ -978,22 +965,21 @@ mod tests {
         };
         let read = schema_of("region", arrow_schema::DataType::Int32);
         let mut landing = manifest_with(vec![], 0);
-        let refuse = |landing: &Manifest, read_definitions: &[ClusteringDefinition], depends_on| {
+        let refuse = |landing: &Manifest, read_max_clustering_id: u32| {
             refuse_key_fields_that_changed_identity(
                 &read,
                 landing,
                 &[definition(1)],
-                read_definitions,
-                depends_on,
+                read_max_clustering_id,
                 3,
             )
         };
 
         // A new allocation: renamed key accepted, retyped key refused.
         landing.schema = schema_of("user_id", arrow_schema::DataType::Int32);
-        refuse(&landing, &[], None).unwrap();
+        refuse(&landing, 0).unwrap();
         landing.schema = schema_of("region", arrow_schema::DataType::Int64);
-        let error = refuse(&landing, &[], None).unwrap_err();
+        let error = refuse(&landing, 0).unwrap_err();
         assert!(matches!(error, Error::CommitConflict { .. }), "{error:?}");
         assert!(
             error.to_string().contains("field id 0")
@@ -1001,7 +987,7 @@ mod tests {
             "{error}"
         );
         landing.schema = schema_of("region", arrow_schema::DataType::Int32);
-        refuse(&landing, &[], None).unwrap();
+        refuse(&landing, 0).unwrap();
 
         // A timestamp's unit and timezone are part of its type.
         let ts = |unit, tz: Option<&str>| {
@@ -1020,73 +1006,68 @@ mod tests {
             ("no timezone", ts(arrow_schema::TimeUnit::Microsecond, None)),
         ] {
             landing.schema = changed;
-            let error = refuse_key_fields_that_changed_identity(
-                &read_ts,
-                &landing,
-                &[definition(1)],
-                &[],
-                None,
-                3,
-            )
-            .unwrap_err();
+            let error =
+                refuse_key_fields_that_changed_identity(&read_ts, &landing, &[definition(1)], 0, 3)
+                    .unwrap_err();
             assert!(
                 matches!(error, Error::CommitConflict { .. }),
                 "{what}: {error:?}"
             );
         }
         landing.schema = ts(arrow_schema::TimeUnit::Microsecond, Some("UTC"));
-        refuse_key_fields_that_changed_identity(&read_ts, &landing, &[definition(1)], &[], None, 3)
+        refuse_key_fields_that_changed_identity(&read_ts, &landing, &[definition(1)], 0, 3)
             .unwrap();
 
-        // A retained definition the submission does not publish for is not a
-        // prerequisite: its key may be renamed, retyped or dropped underneath
-        // an unrelated submission. Named as a dependency, it is checked.
+        // A retained definition is not a prerequisite: its key may be renamed
+        // or retyped underneath a submission that keeps it.
         landing.clustering = vec![definition(1)];
         landing.max_clustering_id = 1;
-        let retained = [definition(1)];
         landing.schema = schema_of("user_id", arrow_schema::DataType::Int32);
-        refuse(&landing, &retained, None).unwrap();
-        refuse(&landing, &retained, Some(&[1])).unwrap();
+        refuse(&landing, 1).unwrap();
         landing.schema = schema_of("region", arrow_schema::DataType::Int64);
-        refuse(&landing, &retained, None).unwrap();
-        let error = refuse(&landing, &retained, Some(&[1])).unwrap_err();
+        refuse(&landing, 1).unwrap();
+
+        // Every definition above the read mark is checked, not only the
+        // highest: with field 0 retyped, allocating 2 (on field 0) and 3 (on
+        // field 1) is refused for definition 2. Above a mark that already
+        // covers both, neither is this submission's dependency.
+        let two_fields = |region: arrow_schema::DataType| {
+            lance_core::datatypes::Schema::try_from(&arrow_schema::Schema::new(vec![
+                arrow_schema::Field::new("region", region, false),
+                arrow_schema::Field::new("amount", arrow_schema::DataType::Int32, false),
+            ]))
+            .unwrap()
+        };
+        let read_two = two_fields(arrow_schema::DataType::Int32);
+        landing.schema = two_fields(arrow_schema::DataType::Int64);
+        let on_amount = ClusteringDefinition {
+            columns: vec![1],
+            ..definition(3)
+        };
+        let three = [definition(1), definition(2), on_amount];
+        let error =
+            refuse_key_fields_that_changed_identity(&read_two, &landing, &three, 1, 3).unwrap_err();
         assert!(matches!(error, Error::CommitConflict { .. }), "{error:?}");
-        // A dependency on a definition the list does not hold would guard
-        // nothing: refused as invalid input, not as a conflict.
-        let error = refuse(&landing, &retained, Some(&[7])).unwrap_err();
-        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
-        assert!(error.to_string().contains("definition 7"), "{error}");
-        // Explicit dependencies add to the allocations, never replace them:
-        // an empty list still checks a new allocation, and a list naming a
-        // retained definition checks both.
-        landing.schema = schema_of("region", arrow_schema::DataType::Int64);
-        let error = refuse(&landing, &[], Some(&[])).unwrap_err();
-        assert!(matches!(error, Error::CommitConflict { .. }), "{error:?}");
-        let two = [definition(1), definition(2)];
-        let error = refuse_key_fields_that_changed_identity(
-            &read,
-            &landing,
-            &two,
-            &retained,
-            Some(&[1]),
-            3,
-        )
-        .unwrap_err();
-        assert!(matches!(error, Error::CommitConflict { .. }), "{error:?}");
-        let error = refuse_key_fields_that_changed_identity(
-            &read,
-            &landing,
-            &two,
-            &retained,
-            Some(&[1, 1]),
-            3,
-        )
-        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("definition 2 is keyed on field id 0"),
+            "{error}"
+        );
+        refuse_key_fields_that_changed_identity(&read_two, &landing, &three, 3, 3).unwrap();
+        // The mark decides, not the largest definition still present: with
+        // definitions 2..5 removed since, a reused id 4 is not an allocation
+        // here (the list application refuses it), while 6 is.
+        let reused = [definition(1), definition(4)];
+        refuse_key_fields_that_changed_identity(&read_two, &landing, &reused, 5, 3).unwrap();
+        let fresh = [definition(1), definition(6)];
+        let error =
+            refuse_key_fields_that_changed_identity(&read_two, &landing, &fresh, 5, 3).unwrap_err();
         assert!(matches!(error, Error::CommitConflict { .. }), "{error:?}");
 
         // A key the landing schema no longer has (dropped, or cast under a
-        // new id) refuses a dependent submission; a key the writer's own
-        // snapshot already lacked is history.
+        // new id) refuses an allocation on it, not a retained definition; a
+        // key the writer's own snapshot already lacked is history.
         landing.schema = lance_core::datatypes::Schema::try_from(&arrow_schema::Schema::new(vec![
             arrow_schema::Field::new("x", arrow_schema::DataType::Int32, false),
         ]))
@@ -1094,26 +1075,17 @@ mod tests {
         for field in landing.schema.fields.iter_mut() {
             field.id = 9;
         }
-        let error = refuse(&landing, &retained, Some(&[1])).unwrap_err();
-        assert!(error.to_string().contains("no longer exists"), "{error}");
-        refuse(&landing, &retained, None).unwrap();
+        refuse(&landing, 1).unwrap();
         landing.clustering = vec![];
         landing.max_clustering_id = 0;
-        let error = refuse(&landing, &[], None).unwrap_err();
-        assert!(matches!(error, Error::CommitConflict { .. }), "{error:?}");
+        let error = refuse(&landing, 0).unwrap_err();
+        assert!(error.to_string().contains("no longer exists"), "{error}");
         let mut never_had_it = schema_of("other", arrow_schema::DataType::Int32);
         for field in never_had_it.fields.iter_mut() {
             field.id = 9;
         }
-        refuse_key_fields_that_changed_identity(
-            &never_had_it,
-            &landing,
-            &[definition(1)],
-            &[],
-            None,
-            3,
-        )
-        .unwrap();
+        refuse_key_fields_that_changed_identity(&never_had_it, &landing, &[definition(1)], 0, 3)
+            .unwrap();
     }
 
     /// A nested key is identified by its path of ids and types and, for a
@@ -1154,8 +1126,7 @@ mod tests {
                 &read,
                 landing,
                 std::slice::from_ref(definition),
-                &[],
-                None,
+                0,
                 3,
             )
         };

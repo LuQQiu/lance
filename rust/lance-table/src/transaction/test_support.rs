@@ -32,7 +32,6 @@ pub fn default_build_config() -> ManifestBuildConfig {
         migration_next_row_id: None,
         activate_non_reusable_field_ids: false,
         clustering_definitions: None,
-        clustering_dependencies: None,
         spilled_row_lineage: Default::default(),
     }
 }

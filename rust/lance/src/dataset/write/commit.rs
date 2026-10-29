@@ -62,9 +62,6 @@ pub struct CommitBuilder<'a> {
     /// The complete desired clustering definitions list for an `UpdateConfig`
     /// commit; see [`ManifestBuildConfig::clustering_definitions`].
     clustering_definitions: Option<Vec<ClusteringDefinition>>,
-    /// Ids of the definitions this commit publishes for; see
-    /// [`Self::with_clustering_dependencies`].
-    clustering_dependencies: Option<Vec<u32>>,
 }
 
 /// Default timeout applied to [`CommitBuilder::execute`] when none is set.
@@ -93,7 +90,6 @@ impl<'a> CommitBuilder<'a> {
             deep_clone_files_copied: false,
             inherited_field_ids: false,
             clustering_definitions: None,
-            clustering_dependencies: None,
         }
     }
 
@@ -175,14 +171,15 @@ impl<'a> CommitBuilder<'a> {
     ///
     /// The list is applied against the landing manifest on every attempt: a
     /// definition allocated or removed underneath it, or one whose identity
-    /// changed, refuses the commit so the writer plans again. Each definition
-    /// the list allocates is checked against the landing schema from the
+    /// changed, refuses the commit so the writer plans again. Every definition
+    /// the list allocates (each id above the read manifest's allocation mark,
+    /// not only the highest) is checked against the landing schema from the
     /// schema the writer read: every key field must still be the same typed
     /// field by id (same logical type along its path and in its subtree, a
     /// timestamp's unit and timezone included). A same-id rename keeps a key;
-    /// a retype, a drop or a cast under a new id refuses the commit. Retained
-    /// definitions are not checked unless named through
-    /// [`Self::with_clustering_dependencies`].
+    /// a retype, a drop or a cast under a new id refuses the commit, and with
+    /// it every other allocation in the list. Retained definitions are not
+    /// checked.
     ///
     /// Definitions key on schema field ids, so allocating the first one on a
     /// table with reusable field ids activates non-reusable field ids in the
@@ -198,18 +195,6 @@ impl<'a> CommitBuilder<'a> {
     /// unaffected.
     pub fn with_clustering_definitions(mut self, definitions: Vec<ClusteringDefinition>) -> Self {
         self.clustering_definitions = Some(definitions);
-        self
-    }
-
-    /// Name the clustering definitions whose key values this commit publishes
-    /// for (a spec derived from them, typically). Their key fields must still
-    /// be the same typed fields, by id, in the manifest the commit lands on;
-    /// a rename keeps a key, a retype or a drop refuses the commit with a
-    /// conflict so the writer plans again. Without this, the definitions the
-    /// list allocates are the dependency and retained definitions are not.
-    /// Only meaningful with [`Self::with_clustering_definitions`]; not stored.
-    pub fn with_clustering_dependencies(mut self, definition_ids: Vec<u32>) -> Self {
-        self.clustering_dependencies = Some(definition_ids);
         self
     }
 
@@ -400,24 +385,6 @@ impl<'a> CommitBuilder<'a> {
                 "a complete clustering definitions list can only be committed with UpdateConfig",
             ));
         }
-        if self.clustering_dependencies.is_some() && self.clustering_definitions.is_none() {
-            return Err(Error::invalid_input(
-                "clustering dependencies need the complete clustering definitions list",
-            ));
-        }
-        // A dependency on a definition the list does not hold would guard
-        // nothing; refuse it here, before any transaction file is written.
-        if let (Some(dependencies), Some(definitions)) =
-            (&self.clustering_dependencies, &self.clustering_definitions)
-            && let Some(unknown) = dependencies
-                .iter()
-                .find(|id| !definitions.iter().any(|definition| definition.id == **id))
-        {
-            return Err(Error::invalid_input(format!(
-                "the submission depends on clustering definition {unknown}, which its definitions \
-                 list does not hold"
-            )));
-        }
         if matches!(
             transaction.operation,
             Operation::Clone {
@@ -548,7 +515,6 @@ impl<'a> CommitBuilder<'a> {
             migration_next_row_id: self.migration_next_row_id,
             activate_non_reusable_field_ids: self.activate_non_reusable_field_ids,
             clustering_definitions: self.clustering_definitions.clone(),
-            clustering_dependencies: self.clustering_dependencies.clone(),
             ..Default::default()
         };
 

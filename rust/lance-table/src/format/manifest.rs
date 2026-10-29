@@ -848,10 +848,6 @@ pub struct ManifestBuildConfig {
     /// on a table with reusable field ids activates non-reusable field ids in
     /// the same commit, since definitions key on field ids.
     pub clustering_definitions: Option<Vec<ClusteringDefinition>>,
-    /// Ids of the clustering definitions this commit publishes for: their key
-    /// fields must still be the same typed fields in the landing schema. Unset,
-    /// the definitions the list allocates are the dependency.
-    pub clustering_dependencies: Option<Vec<u32>>,
     /// Row lineage sequences of the current manifest's fragments that live
     /// outside the manifest, read ahead of the build. An update that rewrites
     /// rows needs the existing row ids and created-at versions to carry each
