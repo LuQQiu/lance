@@ -372,24 +372,70 @@ fn same_subtree(planned: &Field, landed: &Field) -> bool {
             .all(|(p, l)| same_field_shallow(p, l) && same_subtree(p, l))
 }
 
-/// Refuse a definitions list whose key fields are not the fields the writer
+/// Whether field `id` still holds the same values in `landing` as in `read`:
+/// present in both with the same id and logical type at every level from the
+/// root down to the field, and the same shape below it (every descendant's id
+/// and logical type, in order). Names are not part of this: a column keeps
+/// its field id across a rename, so a renamed key, or a renamed ancestor or
+/// child, is the same key. A logical type carries a timestamp's unit and
+/// timezone, so those changes are type changes. Metadata and nullability
+/// edits change nothing.
+pub fn same_field_type_identity(read: &Schema, landing: &Schema, id: i32) -> bool {
+    match (
+        read.field_ancestry_by_id(id),
+        landing.field_ancestry_by_id(id),
+    ) {
+        (Some(planned), Some(landed)) => {
+            planned.len() == landed.len()
+                && planned
+                    .iter()
+                    .zip(&landed)
+                    .all(|(p, l)| same_field_type(p, l))
+                && same_typed_subtree(planned[planned.len() - 1], landed[landed.len() - 1])
+        }
+        _ => false,
+    }
+}
+
+fn same_field_type(planned: &Field, landed: &Field) -> bool {
+    planned.id == landed.id && planned.logical_type == landed.logical_type
+}
+
+fn same_typed_subtree(planned: &Field, landed: &Field) -> bool {
+    planned.children.len() == landed.children.len()
+        && planned
+            .children
+            .iter()
+            .zip(&landed.children)
+            .all(|(p, l)| same_field_type(p, l) && same_typed_subtree(p, l))
+}
+
+/// Refuse a submission whose key fields are no longer the fields it was
 /// planned against.
 ///
 /// A definition keys on field ids. The writer resolved its key columns in the
-/// snapshot it read; a rebased attempt lands on a later schema, where an id
-/// may by then name another column (a dropped key replaced by a new column on
-/// a table with reusable field ids, an overwrite that numbered a new schema
-/// from zero), the same column renamed, retyped or moved, or no column at all
-/// (dropped, or cast under a new id). The list is the writer's read
-/// dependency on those fields: whatever it publishes alongside the list (an
-/// allocation, a removal, metadata derived from the keys) was planned against
-/// the fields as read, so each key field of every listed definition must be
-/// the same field in both schemas, by its whole path. A key the writer's own
+/// snapshot it read; a rebased attempt lands on a later schema, where a key
+/// may have been dropped, cast under a new id, or retyped under the same id.
+/// Whatever the submission publishes about a definition (its allocation, or
+/// a spec derived from its key values) was planned against the keys as read,
+/// so for every definition the submission depends on, each key must still be
+/// the same typed field in the landing schema, by id. A rename keeps the key:
+/// names are not part of a field's identity here. A key the writer's own
 /// snapshot already lacked is history, not a change.
+///
+/// The dependency is scoped to what the submission uses: with `depends_on`,
+/// exactly those definition ids; without it, the definitions the list
+/// allocates (present in `desired`, absent from `read_definitions`). A
+/// retained definition the submission does not publish for is not a
+/// prerequisite, so an unrelated schema edit to one of its keys does not stop
+/// the submission. Allocation, removal and identity races on the list itself
+/// are checked separately when the list is applied.
 pub fn refuse_key_fields_that_changed_identity(
     read_schema: &Schema,
     landing: &Manifest,
     desired: &[ClusteringDefinition],
+    read_definitions: &[ClusteringDefinition],
+    depends_on: Option<&[u32]>,
     commit_version: u64,
 ) -> Result<()> {
     let path = |schema: &Schema, id: i32| {
@@ -397,7 +443,12 @@ pub fn refuse_key_fields_that_changed_identity(
             .field_path(id)
             .unwrap_or_else(|_| format!("field id {id}"))
     };
-    for definition in desired {
+    let read_ids: HashSet<u32> = read_definitions.iter().map(|d| d.id).collect();
+    let in_scope = |definition: &ClusteringDefinition| match depends_on {
+        Some(ids) => ids.contains(&definition.id),
+        None => !read_ids.contains(&definition.id),
+    };
+    for definition in desired.iter().filter(|d| in_scope(d)) {
         for column in &definition.columns {
             if read_schema.field_by_id(*column).is_none() {
                 continue;
@@ -415,13 +466,13 @@ pub fn refuse_key_fields_that_changed_identity(
                     .into(),
                 ));
             }
-            if !same_field_identity(read_schema, &landing.schema, *column) {
+            if !same_field_type_identity(read_schema, &landing.schema, *column) {
                 return Err(Error::commit_conflict_source(
                     commit_version,
                     format!(
                         "clustering definition {} is keyed on field id {column}, which named {:?} \
-                         when the writer read the table and names {:?} now; reload the manifest \
-                         and rebuild the list",
+                         when the writer read the table and has changed type or shape since \
+                         (now {:?}); reload the manifest and rebuild the list",
                         definition.id,
                         path(read_schema, *column),
                         path(&landing.schema, *column)
@@ -902,11 +953,12 @@ mod tests {
         );
     }
 
-    /// A rebased list is refused when a listed definition's key field id names
-    /// a different column than the writer read, new or retained; a
-    /// same-identity field and a field the landing schema lacks are left alone.
+    /// A dependent definition's key must still be the same typed field in
+    /// the landing schema: a retype or a drop refuses the submission, a
+    /// rename does not, and a key the writer's snapshot never had is history.
+    /// Only the definitions the submission depends on are checked.
     #[test]
-    fn a_key_field_that_changed_identity_refuses_the_allocation() {
+    fn a_dependent_keys_type_change_refuses_the_submission_and_a_rename_does_not() {
         let schema_of = |name: &str, data_type: arrow_schema::DataType| {
             lance_core::datatypes::Schema::try_from(&arrow_schema::Schema::new(vec![
                 arrow_schema::Field::new(name, data_type, false),
@@ -915,39 +967,85 @@ mod tests {
         };
         let read = schema_of("region", arrow_schema::DataType::Int32);
         let mut landing = manifest_with(vec![], 0);
+        let refuse = |landing: &Manifest, read_definitions: &[ClusteringDefinition], depends_on| {
+            refuse_key_fields_that_changed_identity(
+                &read,
+                landing,
+                &[definition(1)],
+                read_definitions,
+                depends_on,
+                3,
+            )
+        };
+
+        // A new allocation: renamed key accepted, retyped key refused.
         landing.schema = schema_of("user_id", arrow_schema::DataType::Int32);
-        let error = refuse_key_fields_that_changed_identity(&read, &landing, &[definition(1)], 3)
-            .unwrap_err();
+        refuse(&landing, &[], None).unwrap();
+        landing.schema = schema_of("region", arrow_schema::DataType::Int64);
+        let error = refuse(&landing, &[], None).unwrap_err();
         assert!(matches!(error, Error::CommitConflict { .. }), "{error:?}");
         assert!(
-            error.to_string().contains("named \"region\"")
-                && error.to_string().contains("names \"user_id\""),
+            error.to_string().contains("field id 0")
+                && error.to_string().contains("changed type or shape"),
             "{error}"
         );
-
-        landing.schema = schema_of("region", arrow_schema::DataType::Int64);
-        let error = refuse_key_fields_that_changed_identity(&read, &landing, &[definition(1)], 3)
-            .unwrap_err();
-        assert!(error.to_string().contains("field id 0"), "{error}");
-
         landing.schema = schema_of("region", arrow_schema::DataType::Int32);
-        refuse_key_fields_that_changed_identity(&read, &landing, &[definition(1)], 3).unwrap();
+        refuse(&landing, &[], None).unwrap();
 
-        // A retained definition is the writer's dependency too: the list is
-        // refused when its key was renamed under it, and passes while the key
-        // kept its identity.
-        landing.schema = schema_of("user_id", arrow_schema::DataType::Int32);
+        // A timestamp's unit and timezone are part of its type.
+        let ts = |unit, tz: Option<&str>| {
+            schema_of(
+                "region",
+                arrow_schema::DataType::Timestamp(unit, tz.map(Into::into)),
+            )
+        };
+        let read_ts = ts(arrow_schema::TimeUnit::Microsecond, Some("UTC"));
+        for (what, changed) in [
+            ("unit", ts(arrow_schema::TimeUnit::Millisecond, Some("UTC"))),
+            (
+                "timezone",
+                ts(arrow_schema::TimeUnit::Microsecond, Some("+08:00")),
+            ),
+            ("no timezone", ts(arrow_schema::TimeUnit::Microsecond, None)),
+        ] {
+            landing.schema = changed;
+            let error = refuse_key_fields_that_changed_identity(
+                &read_ts,
+                &landing,
+                &[definition(1)],
+                &[],
+                None,
+                3,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(error, Error::CommitConflict { .. }),
+                "{what}: {error:?}"
+            );
+        }
+        landing.schema = ts(arrow_schema::TimeUnit::Microsecond, Some("UTC"));
+        refuse_key_fields_that_changed_identity(&read_ts, &landing, &[definition(1)], &[], None, 3)
+            .unwrap();
+
+        // A retained definition the submission does not publish for is not a
+        // prerequisite: its key may be renamed, retyped or dropped underneath
+        // an unrelated submission. Named as a dependency, it is checked.
         landing.clustering = vec![definition(1)];
         landing.max_clustering_id = 1;
-        let error = refuse_key_fields_that_changed_identity(&read, &landing, &[definition(1)], 3)
-            .unwrap_err();
+        let retained = [definition(1)];
+        landing.schema = schema_of("user_id", arrow_schema::DataType::Int32);
+        refuse(&landing, &retained, None).unwrap();
+        refuse(&landing, &retained, Some(&[1])).unwrap();
+        landing.schema = schema_of("region", arrow_schema::DataType::Int64);
+        refuse(&landing, &retained, None).unwrap();
+        let error = refuse(&landing, &retained, Some(&[1])).unwrap_err();
         assert!(matches!(error, Error::CommitConflict { .. }), "{error:?}");
-        landing.schema = schema_of("region", arrow_schema::DataType::Int32);
-        refuse_key_fields_that_changed_identity(&read, &landing, &[definition(1)], 3).unwrap();
+        // A dependency on a definition the list does not name checks nothing.
+        refuse(&landing, &retained, Some(&[7])).unwrap();
 
         // A key the landing schema no longer has (dropped, or cast under a
-        // new id) is refused for a retained and for a new definition alike;
-        // a key the writer's own snapshot already lacked is history.
+        // new id) refuses a dependent submission; a key the writer's own
+        // snapshot already lacked is history.
         landing.schema = lance_core::datatypes::Schema::try_from(&arrow_schema::Schema::new(vec![
             arrow_schema::Field::new("x", arrow_schema::DataType::Int32, false),
         ]))
@@ -955,29 +1053,34 @@ mod tests {
         for field in landing.schema.fields.iter_mut() {
             field.id = 9;
         }
-        let error = refuse_key_fields_that_changed_identity(&read, &landing, &[definition(1)], 3)
-            .unwrap_err();
+        let error = refuse(&landing, &retained, Some(&[1])).unwrap_err();
         assert!(error.to_string().contains("no longer exists"), "{error}");
+        refuse(&landing, &retained, None).unwrap();
         landing.clustering = vec![];
         landing.max_clustering_id = 0;
-        let error = refuse_key_fields_that_changed_identity(&read, &landing, &[definition(1)], 3)
-            .unwrap_err();
+        let error = refuse(&landing, &[], None).unwrap_err();
         assert!(matches!(error, Error::CommitConflict { .. }), "{error:?}");
-        let never_had_it = schema_of("other", arrow_schema::DataType::Int32);
-        let mut never_had_it = never_had_it;
+        let mut never_had_it = schema_of("other", arrow_schema::DataType::Int32);
         for field in never_had_it.fields.iter_mut() {
             field.id = 9;
         }
-        refuse_key_fields_that_changed_identity(&never_had_it, &landing, &[definition(1)], 3)
-            .unwrap();
+        refuse_key_fields_that_changed_identity(
+            &never_had_it,
+            &landing,
+            &[definition(1)],
+            &[],
+            None,
+            3,
+        )
+        .unwrap();
     }
 
-    /// A nested key is identified by its whole path and, for a composite
-    /// key, its whole subtree: renaming its parent struct changes the column
-    /// it names, a child of a struct key changing shape changes its value,
-    /// while metadata on a sibling child does not.
+    /// A nested key is identified by its path of ids and types and, for a
+    /// composite key, its whole typed subtree: renaming its parent struct or
+    /// a child keeps the key, a retyped, added or removed child changes its
+    /// value, and metadata on a sibling child changes nothing.
     #[test]
-    fn a_nested_keys_identity_includes_its_ancestors() {
+    fn a_nested_keys_identity_is_its_typed_path_and_subtree() {
         let nested = |parent: &str, sibling_metadata: Option<(&str, &str)>| {
             let mut sibling = arrow_schema::Field::new("zip", arrow_schema::DataType::Int32, true);
             if let Some((k, v)) = sibling_metadata {
@@ -1005,27 +1108,22 @@ mod tests {
             ..definition(1)
         };
         let mut landing = manifest_with(vec![], 0);
+        let check = |landing: &Manifest, definition: &ClusteringDefinition| {
+            refuse_key_fields_that_changed_identity(
+                &read,
+                landing,
+                std::slice::from_ref(definition),
+                &[],
+                None,
+                3,
+            )
+        };
+        // The parent renamed: same ids and types all the way down.
         landing.schema = nested("meta", None);
-        let error = refuse_key_fields_that_changed_identity(
-            &read,
-            &landing,
-            std::slice::from_ref(&keyed),
-            3,
-        )
-        .unwrap_err();
-        assert!(
-            error.to_string().contains("named \"info.region\"")
-                && error.to_string().contains("names \"meta.region\" now"),
-            "{error}"
-        );
+        check(&landing, &keyed).unwrap();
         landing.schema = nested("info", Some(("note", "x")));
-        refuse_key_fields_that_changed_identity(&read, &landing, std::slice::from_ref(&keyed), 3)
-            .unwrap();
+        check(&landing, &keyed).unwrap();
 
-        // A key that is itself the struct depends on its children's shape:
-        // a retyped, renamed, added or removed child is a change; metadata
-        // on a child is not. A primitive key inside the struct does not
-        // depend on its siblings.
         let struct_id = read.field("info").unwrap().id;
         let on_struct = ClusteringDefinition {
             columns: vec![struct_id],
@@ -1043,26 +1141,19 @@ mod tests {
         };
         let region = |dt: arrow_schema::DataType| arrow_schema::Field::new("region", dt, true);
         let zip = arrow_schema::Field::new("zip", arrow_schema::DataType::Int32, true);
-        let same = with_children(vec![region(arrow_schema::DataType::Utf8), zip.clone()]);
-        landing.schema = same;
-        refuse_key_fields_that_changed_identity(
-            &read,
-            &landing,
-            std::slice::from_ref(&on_struct),
-            3,
-        )
-        .unwrap();
+        landing.schema = with_children(vec![region(arrow_schema::DataType::Utf8), zip.clone()]);
+        check(&landing, &on_struct).unwrap();
+        // A renamed child keeps the struct's value.
+        landing.schema = with_children(vec![
+            arrow_schema::Field::new("area", arrow_schema::DataType::Utf8, true),
+            zip.clone(),
+        ]);
+        check(&landing, &on_struct).unwrap();
+        check(&landing, &keyed).unwrap();
         for (what, changed) in [
             (
                 "retyped child",
                 with_children(vec![region(arrow_schema::DataType::Int64), zip.clone()]),
-            ),
-            (
-                "renamed child",
-                with_children(vec![
-                    arrow_schema::Field::new("area", arrow_schema::DataType::Utf8, true),
-                    zip.clone(),
-                ]),
             ),
             (
                 "removed child",
@@ -1078,30 +1169,16 @@ mod tests {
             ),
         ] {
             landing.schema = changed;
-            let error = refuse_key_fields_that_changed_identity(
-                &read,
-                &landing,
-                std::slice::from_ref(&on_struct),
-                3,
-            )
-            .unwrap_err();
+            let error = check(&landing, &on_struct).unwrap_err();
             assert!(
                 matches!(error, Error::CommitConflict { .. }),
                 "{what}: {error:?}"
             );
             // The primitive key inside the struct is unaffected by its siblings.
-            if what != "renamed child" && what != "retyped child" {
-                refuse_key_fields_that_changed_identity(
-                    &read,
-                    &landing,
-                    std::slice::from_ref(&keyed),
-                    3,
-                )
-                .unwrap();
+            if what != "retyped child" {
+                check(&landing, &keyed).unwrap();
             }
         }
-        landing.schema = nested("info", Some(("note", "x")));
-        refuse_key_fields_that_changed_identity(&read, &landing, &[on_struct], 3).unwrap();
     }
 
     fn ids(manifest: &Manifest) -> Vec<u32> {

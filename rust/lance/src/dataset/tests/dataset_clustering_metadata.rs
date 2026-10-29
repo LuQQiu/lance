@@ -117,6 +117,7 @@ async fn commit_edited_manifest(
             activate_non_reusable_field_ids: false,
             tagged_frag_reuse_trim: false,
             clustering_definitions: None,
+            clustering_dependencies: None,
         },
         dataset.manifest_location.naming_scheme,
         None,
@@ -765,6 +766,18 @@ async fn commit(
         .await
 }
 
+async fn commit_depending_on(
+    dataset: &Dataset,
+    (desired, transaction): (Vec<ClusteringDefinition>, Transaction),
+    definition_ids: Vec<u32>,
+) -> crate::Result<Dataset> {
+    CommitBuilder::new(Arc::new(dataset.clone()))
+        .with_clustering_definitions(desired)
+        .with_clustering_dependencies(definition_ids)
+        .execute(transaction)
+        .await
+}
+
 fn ids(dataset: &Dataset) -> Vec<u32> {
     dataset.manifest().clustering.iter().map(|d| d.id).collect()
 }
@@ -1150,17 +1163,18 @@ async fn a_historical_absence_is_not_a_changed_dependency() {
     assert_eq!(landed.manifest().max_clustering_id, 3);
 }
 
-/// A definitions list is the writer's read dependency on the key fields of
-/// every definition it names, retained ones included. A writer that carries
-/// the unchanged list after another writer renamed, retyped or dropped a key
-/// lands nothing, and the same list planned again from the landing snapshot
-/// lands.
+/// A submission depends on the key fields of the definitions it publishes
+/// for, not on every retained definition's. An unchanged list with unrelated
+/// metadata lands over another writer's rename, retype or drop of a retained
+/// key. A submission that depends on that definition lands over the rename
+/// and is refused over the retype or drop, and the same submission planned
+/// again from the landing snapshot lands.
 #[rstest]
 #[case::rename("rename")]
 #[case::cast("cast")]
 #[case::drop("drop")]
 #[tokio::test]
-async fn a_retained_definitions_key_change_refuses_the_list(#[case] change: &'static str) {
+async fn a_retained_keys_change_blocks_only_a_dependent_submission(#[case] change: &'static str) {
     let dir = TempStrDir::default();
     let read = with_region_column(write_named_column(&dir, "a", WriteMode::Create).await).await;
     let key_id = read.schema().field("region").unwrap().id;
@@ -1175,7 +1189,6 @@ async fn a_retained_definitions_key_change_refuses_the_list(#[case] change: &'st
     .await
     .unwrap();
     let planned_at = read.manifest().version;
-
     let mut b = Dataset::open(&dir).await.unwrap();
     match change {
         "drop" => b.drop_columns(&["region"]).await.unwrap(),
@@ -1191,50 +1204,68 @@ async fn a_retained_definitions_key_change_refuses_the_list(#[case] change: &'st
             .await
             .unwrap(),
     }
-
+    // Unrelated to the retained definition: lands over any of the changes.
     let note = ("org.example.note".to_string(), Some("x".to_string()));
-    let error = commit(
+    let landed = commit(
         &read,
         submission(planned_at, vec![configured.clone()], vec![note.clone()]),
     )
     .await
-    .unwrap_err();
-    assert!(
-        matches!(error, crate::Error::CommitConflict { .. }),
-        "{change}: {error:?}"
-    );
-    assert!(
-        error.to_string().contains("rebuild the list"),
-        "{change}: {error}"
-    );
-    let reopened = Dataset::open(&dir).await.unwrap();
+    .unwrap();
+    assert_eq!(landed.manifest().clustering, vec![configured.clone()]);
     assert_eq!(
-        reopened.manifest().version,
-        b.manifest().version,
-        "{change}: A landed nothing"
-    );
-    assert!(
-        !reopened
-            .manifest()
-            .table_metadata
-            .contains_key("org.example.note")
+        landed.manifest().table_metadata["org.example.note"],
+        "x",
+        "{change}: the unrelated submission landed"
     );
 
-    let landed = commit(
-        &reopened,
-        submission(
-            reopened.manifest().version,
-            vec![configured.clone()],
-            vec![note],
-        ),
+    // Depending on the definition: a rename keeps the key, a retype or a
+    // drop refuses the submission and nothing of it lands.
+    let spec = ("org.example.spec.1".to_string(), Some("{}".to_string()));
+    let result = commit_depending_on(
+        &read,
+        submission(planned_at, vec![configured.clone()], vec![spec.clone()]),
+        vec![1],
     )
-    .await
-    .unwrap();
-    assert_eq!(landed.manifest().clustering, vec![configured]);
-    assert_eq!(
-        landed.manifest().table_metadata.get("org.example.note"),
-        Some(&"x".to_string())
-    );
+    .await;
+    let reopened = Dataset::open(&dir).await.unwrap();
+    if change == "rename" {
+        result.unwrap();
+        assert_eq!(
+            reopened.manifest().table_metadata["org.example.spec.1"],
+            "{}"
+        );
+    } else {
+        let error = result.unwrap_err();
+        assert!(
+            matches!(error, crate::Error::CommitConflict { .. }),
+            "{change}: {error:?}"
+        );
+        assert!(
+            error.to_string().contains("rebuild the list"),
+            "{change}: {error}"
+        );
+        assert!(
+            !reopened
+                .manifest()
+                .table_metadata
+                .contains_key("org.example.spec.1"),
+            "{change}: the dependent submission landed nothing"
+        );
+        // Planned again from the landing snapshot, it lands.
+        let landed = commit_depending_on(
+            &reopened,
+            submission(
+                reopened.manifest().version,
+                vec![configured.clone()],
+                vec![spec],
+            ),
+            vec![1],
+        )
+        .await
+        .unwrap();
+        assert_eq!(landed.manifest().clustering, vec![configured]);
+    }
 }
 
 /// Writer A resolves its key field in a reusable-id snapshot; before A lands,

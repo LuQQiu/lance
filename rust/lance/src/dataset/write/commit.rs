@@ -62,6 +62,9 @@ pub struct CommitBuilder<'a> {
     /// The complete desired clustering definitions list for an `UpdateConfig`
     /// commit; see [`ManifestBuildConfig::clustering_definitions`].
     clustering_definitions: Option<Vec<ClusteringDefinition>>,
+    /// Ids of the definitions this commit publishes for; see
+    /// [`Self::with_clustering_dependencies`].
+    clustering_dependencies: Option<Vec<u32>>,
 }
 
 /// Default timeout applied to [`CommitBuilder::execute`] when none is set.
@@ -90,6 +93,7 @@ impl<'a> CommitBuilder<'a> {
             deep_clone_files_copied: false,
             inherited_field_ids: false,
             clustering_definitions: None,
+            clustering_dependencies: None,
         }
     }
 
@@ -190,6 +194,18 @@ impl<'a> CommitBuilder<'a> {
     /// readable). A table already under the contract is unaffected.
     pub fn with_clustering_definitions(mut self, definitions: Vec<ClusteringDefinition>) -> Self {
         self.clustering_definitions = Some(definitions);
+        self
+    }
+
+    /// Name the clustering definitions whose key values this commit publishes
+    /// for (a spec derived from them, typically). Their key fields must still
+    /// be the same typed fields, by id, in the manifest the commit lands on;
+    /// a rename keeps a key, a retype or a drop refuses the commit with a
+    /// conflict so the writer plans again. Without this, the definitions the
+    /// list allocates are the dependency and retained definitions are not.
+    /// Only meaningful with [`Self::with_clustering_definitions`]; not stored.
+    pub fn with_clustering_dependencies(mut self, definition_ids: Vec<u32>) -> Self {
+        self.clustering_dependencies = Some(definition_ids);
         self
     }
 
@@ -380,6 +396,11 @@ impl<'a> CommitBuilder<'a> {
                 "a complete clustering definitions list can only be committed with UpdateConfig",
             ));
         }
+        if self.clustering_dependencies.is_some() && self.clustering_definitions.is_none() {
+            return Err(Error::invalid_input(
+                "clustering dependencies need the complete clustering definitions list",
+            ));
+        }
         if matches!(
             transaction.operation,
             Operation::Clone {
@@ -510,6 +531,7 @@ impl<'a> CommitBuilder<'a> {
             migration_next_row_id: self.migration_next_row_id,
             activate_non_reusable_field_ids: self.activate_non_reusable_field_ids,
             clustering_definitions: self.clustering_definitions.clone(),
+            clustering_dependencies: self.clustering_dependencies.clone(),
             ..Default::default()
         };
 

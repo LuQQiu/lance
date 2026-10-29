@@ -2015,6 +2015,8 @@ impl Transaction {
                             &state.manifest.schema,
                             &manifest,
                             desired,
+                            read_definitions,
+                            config.clustering_dependencies.as_deref(),
                             commit_version,
                         )?;
                     }
@@ -7230,82 +7232,83 @@ mod tests {
     /// On the real build path, a rebased list whose key field now names
     /// another column is refused, allocation or retained, and one whose field
     /// kept its identity lands.
+    /// On the build path a rebased submission is checked against the landing
+    /// schema from its read schema: an allocation whose key was retyped is
+    /// refused, one whose key was renamed lands, an unchanged list carried
+    /// over a retained key's rename or retype lands too, and a submission
+    /// that depends on a retained definition is refused when that key was
+    /// retyped.
     #[test]
-    fn a_rebased_allocation_is_refused_when_its_key_field_changed_identity() {
+    fn a_rebased_submission_is_refused_only_when_a_dependent_key_changed_type() {
         let definition = crate::format::ClusteringDefinition {
             id: 1,
             columns: vec![0],
             provider: "org.example.cluster".into(),
             version: 1,
         };
-        let schema_named = |name: &str| {
+        let schema_of = |name: &str, data_type: DataType| {
             LanceSchema::try_from(&ArrowSchema::new(vec![ArrowField::new(
-                name,
-                DataType::Int32,
-                false,
+                name, data_type, false,
             )]))
             .unwrap()
         };
         let mut read = sample_manifest();
-        read.schema = schema_named("region");
+        read.schema = schema_of("region", DataType::Int32);
         let mut landing = sample_manifest();
-        landing.schema = schema_named("user_id");
         landing.version = read.version + 1;
-
-        let (transaction, config) = definitions_update(&read, vec![definition.clone()]);
-        let error = transaction
-            .build_manifest_with_read_version(
-                Some(&landing),
+        let build = |transaction: &Transaction,
+                     config: &ManifestBuildConfig,
+                     read: &Manifest,
+                     landing: &Manifest| {
+            transaction.build_manifest_with_read_version(
+                Some(landing),
                 vec![],
                 "txn",
-                &config,
+                config,
                 Some(ReadVersionState {
-                    manifest: &read,
+                    manifest: read,
                     indices: &[],
                 }),
             )
-            .unwrap_err();
+        };
+
+        // A new allocation over a retyped key is refused; over a rename it lands.
+        landing.schema = schema_of("region", DataType::Int64);
+        let (transaction, config) = definitions_update(&read, vec![definition.clone()]);
+        let error = build(&transaction, &config, &read, &landing).unwrap_err();
         assert!(matches!(error, Error::CommitConflict { .. }), "{error:?}");
         assert!(
-            error.to_string().contains("names \"user_id\" now"),
+            error.to_string().contains("changed type or shape"),
             "{error}"
         );
-
-        landing.schema = schema_named("region");
-        let (result, _) = transaction
-            .build_manifest_with_read_version(
-                Some(&landing),
-                vec![],
-                "txn",
-                &config,
-                Some(ReadVersionState {
-                    manifest: &read,
-                    indices: &[],
-                }),
-            )
-            .unwrap();
+        landing.schema = schema_of("user_id", DataType::Int32);
+        let (result, _) = build(&transaction, &config, &read, &landing).unwrap();
         assert_eq!(result.clustering, vec![definition.clone()]);
 
-        // The same list carried unchanged over a rename of its key is refused
-        // too: the list is the writer's read dependency on the key fields.
+        // An unchanged list carried over a retained key's rename or retype
+        // lands: the retained definition is not this submission's dependency.
         read.clustering = vec![definition.clone()];
         read.max_clustering_id = 1;
         landing.clustering = vec![definition.clone()];
         landing.max_clustering_id = 1;
-        landing.schema = schema_named("user_id");
-        let (transaction, config) = definitions_update(&read, vec![definition]);
-        let error = transaction
-            .build_manifest_with_read_version(
-                Some(&landing),
-                vec![],
-                "txn",
-                &config,
-                Some(ReadVersionState {
-                    manifest: &read,
-                    indices: &[],
-                }),
-            )
-            .unwrap_err();
+        let (transaction, config) = definitions_update(&read, vec![definition.clone()]);
+        for schema in [
+            schema_of("user_id", DataType::Int32),
+            schema_of("region", DataType::Int64),
+        ] {
+            landing.schema = schema;
+            let (result, _) = build(&transaction, &config, &read, &landing).unwrap();
+            assert_eq!(result.clustering, vec![definition.clone()]);
+        }
+
+        // Named as a dependency, the retained definition's key is checked:
+        // its rename lands, its retype is refused.
+        let (transaction, mut config) = definitions_update(&read, vec![definition]);
+        config.clustering_dependencies = Some(vec![1]);
+        landing.schema = schema_of("user_id", DataType::Int32);
+        build(&transaction, &config, &read, &landing).unwrap();
+        landing.schema = schema_of("region", DataType::Int64);
+        let error = build(&transaction, &config, &read, &landing).unwrap_err();
         assert!(matches!(error, Error::CommitConflict { .. }), "{error:?}");
     }
 
