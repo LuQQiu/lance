@@ -192,6 +192,36 @@ impl<'a> CommitBuilder<'a> {
     /// the definitions does not undo it, and under that contract the versions
     /// from before the activating commit can no longer be restored (they stay
     /// readable). A table already under the contract is unaffected.
+    /// Commit the complete list of clustering definitions this writer wants
+    /// the table to hold, planned against the manifest it read. Only an
+    /// `UpdateConfig` may carry it: the list rides alongside the metadata it
+    /// publishes and the commit stays a plain `UpdateConfig`; the manifest is
+    /// the durable record of the definitions. Any other operation refuses this
+    /// input, and so does a detached commit.
+    ///
+    /// The list is applied against the landing manifest on every attempt: a
+    /// definition allocated or removed underneath it, or one whose identity
+    /// changed, refuses the commit so the writer plans again. Each definition
+    /// the list allocates is checked against the landing schema from the
+    /// schema the writer read: every key field must still be the same typed
+    /// field by id (same logical type along its path and in its subtree, a
+    /// timestamp's unit and timezone included). A same-id rename keeps a key;
+    /// a retype, a drop or a cast under a new id refuses the commit. Retained
+    /// definitions are not checked unless named through
+    /// [`Self::with_clustering_dependencies`].
+    ///
+    /// Definitions key on schema field ids, so allocating the first one on a
+    /// table with reusable field ids activates non-reusable field ids in the
+    /// same commit (see [`Dataset::migrate_to_non_reusable_field_ids`]): a
+    /// dropped key field's id is never handed to a later column, and an
+    /// overwrite assigns ids above the mark. Until that activation lands, a
+    /// stricter fence in the conflict resolver refuses concurrent schema
+    /// replacements that could reassign a key's id; it compares names too and
+    /// is deliberately separate from the typed check above. Activation is
+    /// permanent: clearing the definitions does not undo it, and under that
+    /// contract the versions from before the activating commit can no longer
+    /// be restored (they stay readable). A table already under the contract is
+    /// unaffected.
     pub fn with_clustering_definitions(mut self, definitions: Vec<ClusteringDefinition>) -> Self {
         self.clustering_definitions = Some(definitions);
         self
