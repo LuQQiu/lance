@@ -166,32 +166,6 @@ impl<'a> CommitBuilder<'a> {
         self
     }
 
-    /// Commit, together with an `UpdateConfig` transaction, the COMPLETE list of
-    /// clustering definitions the next manifest must hold: the target list.
-    /// A current definition the list keeps is unchanged, one it omits is
-    /// removed, and the new ones continue `max_clustering_id` in order; the
-    /// watermark never moves backwards. A definition can be removed only while
-    /// no fragment or index segment in the manifest the commit lands on
-    /// references it; otherwise the whole commit is refused. Applied against
-    /// that landing manifest, so a list built from a stale snapshot is a
-    /// non-retryable commit conflict (reload, rebuild the list, resubmit); a
-    /// list identical to the current one is a no-op. The transaction file
-    /// stays a plain `UpdateConfig`; the manifest is the durable record of the
-    /// definitions. Any other operation refuses this input, and so does a
-    /// detached commit. The list is also the writer's read dependency on the
-    /// key fields of every definition it names: a key renamed, retyped or
-    /// re-parented between the snapshot the writer read and the landing
-    /// manifest refuses the commit the same way, so metadata derived from
-    /// those keys is never published against a schema it was not planned on.
-    ///
-    /// Definitions key on schema field ids, so allocating the first one on a
-    /// table with reusable field ids activates non-reusable field ids in the
-    /// same commit (see [`Dataset::migrate_to_non_reusable_field_ids`]): a
-    /// dropped key field's id is never handed to a later column, and an
-    /// overwrite assigns ids above the mark. Activation is permanent: clearing
-    /// the definitions does not undo it, and under that contract the versions
-    /// from before the activating commit can no longer be restored (they stay
-    /// readable). A table already under the contract is unaffected.
     /// Commit the complete list of clustering definitions this writer wants
     /// the table to hold, planned against the manifest it read. Only an
     /// `UpdateConfig` may carry it: the list rides alongside the metadata it
