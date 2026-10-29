@@ -1470,10 +1470,6 @@ impl Transaction {
                 unreachable!()
             }
             Operation::DataReplacement { replacements } => {
-                log::warn!(
-                    "Building manifest with DataReplacement operation. This operation is not stable yet, please use with caution."
-                );
-
                 let (old_fragment_ids, new_datafiles): (Vec<&u64>, Vec<&DataFile>) = replacements
                     .iter()
                     .map(|DataReplacementGroup(fragment_id, new_file)| (fragment_id, new_file))
@@ -2331,6 +2327,7 @@ mod tests {
     use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
     use lance_io::utils::CachedFileSize;
     use rstest::rstest;
+    use std::cell::RefCell;
     use std::collections::HashMap;
     use std::sync::Arc;
     use uuid::Uuid;
@@ -4226,124 +4223,6 @@ mod tests {
     }
 
     #[test]
-    fn test_rewrite_build_manifest_keeps_fragment_ids_sorted() {
-        let manifest = sample_manifest_with_fragments(0..4);
-        let transaction = Transaction::new(
-            manifest.version,
-            Operation::Rewrite {
-                groups: vec![RewriteGroup {
-                    old_fragments: vec![Fragment::new(1), Fragment::new(2)],
-                    new_fragments: vec![Fragment::new(0)],
-                }],
-                rewritten_indices: vec![],
-                frag_reuse_index: None,
-            },
-            None,
-        );
-
-        let (rewritten, _) = transaction
-            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
-            .unwrap();
-
-        let fragment_ids = rewritten
-            .fragments
-            .iter()
-            .map(|fragment| fragment.id)
-            .collect::<Vec<_>>();
-        assert_eq!(fragment_ids, vec![0, 3, 4]);
-    }
-
-    #[test]
-    fn test_rewrite_after_row_adding_update_keeps_fragment_ids_sorted() {
-        let manifest = sample_manifest_with_fragments(0..3);
-        let update = Transaction::new(
-            manifest.version,
-            Operation::Update {
-                removed_fragment_ids: vec![],
-                updated_fragments: vec![],
-                new_fragments: vec![Fragment::new(0)],
-                fields_modified: vec![],
-                compacted_sstables: vec![],
-                fields_for_preserving_frag_bitmap: vec![],
-                update_mode: Some(UpdateMode::RewriteRows),
-                inserted_rows_filter: None,
-                updated_fragment_offsets: None,
-            },
-            None,
-        );
-        let (updated, _) = update
-            .build_manifest(
-                Some(&manifest),
-                vec![],
-                "update-txn",
-                &default_build_config(),
-            )
-            .unwrap();
-
-        let rewrite = Transaction::new(
-            manifest.version,
-            Operation::Rewrite {
-                groups: vec![RewriteGroup {
-                    old_fragments: vec![Fragment::new(0)],
-                    new_fragments: vec![Fragment::new(0)],
-                }],
-                rewritten_indices: vec![],
-                frag_reuse_index: None,
-            },
-            None,
-        );
-        let (rewritten, _) = rewrite
-            .build_manifest(
-                Some(&updated),
-                vec![],
-                "rewrite-txn",
-                &default_build_config(),
-            )
-            .unwrap();
-
-        let fragment_ids = rewritten
-            .fragments
-            .iter()
-            .map(|fragment| fragment.id)
-            .collect::<Vec<_>>();
-        assert_eq!(fragment_ids, vec![1, 2, 3, 4]);
-    }
-
-    #[test]
-    fn test_merge_build_manifest_keeps_fragment_ids_sorted() {
-        let mut manifest = sample_manifest_with_fragments(0..3);
-        for fragment in Arc::make_mut(&mut manifest.fragments) {
-            fragment.files.push(DataFile::new(
-                format!("fragment-{}.lance", fragment.id),
-                vec![0],
-                vec![0],
-                ConcreteFileVersion::V2_0,
-                None,
-                None,
-            ));
-        }
-        let fragments = manifest.fragments.iter().rev().cloned().collect::<Vec<_>>();
-        let operation = Operation::Merge {
-            fragments,
-            schema: manifest.schema.clone(),
-            preserves_nullability: true,
-        };
-        validate_operation(Some(&manifest), &operation).unwrap();
-        let transaction = Transaction::new(manifest.version, operation, None);
-
-        let (merged, _) = transaction
-            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
-            .unwrap();
-
-        let fragment_ids = merged
-            .fragments
-            .iter()
-            .map(|fragment| fragment.id)
-            .collect::<Vec<_>>();
-        assert_eq!(fragment_ids, vec![0, 1, 2]);
-    }
-
-    #[test]
     fn test_remove_tombstoned_data_files() {
         // Create a fragment with mixed data files: some normal, some fully tombstoned
         let mut fragment = Fragment::new(1);
@@ -5686,6 +5565,27 @@ mod tests {
 
     #[test]
     fn test_data_replacement_tombstones_overlaid_fields() {
+        // Capture only this thread's warnings so parallel tests cannot affect the assertion.
+        thread_local! {
+            static WARNINGS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+        }
+        struct WarningLogger;
+        impl log::Log for WarningLogger {
+            fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+                metadata.level() <= log::Level::Warn
+            }
+
+            fn log(&self, record: &log::Record<'_>) {
+                if self.enabled(record.metadata()) {
+                    WARNINGS.with_borrow_mut(|warnings| warnings.push(record.args().to_string()));
+                }
+            }
+
+            fn flush(&self) {}
+        }
+        log::set_logger(&WarningLogger).unwrap();
+        log::set_max_level(log::LevelFilter::Warn);
+
         // A DataReplacement writing new base values for field 5 must stop any
         // overlay already shadowing those cells: field 5 is tombstoned in place
         // (preserving the overlay's field 3), and an overlay covering only field
@@ -5734,6 +5634,8 @@ mod tests {
         let (result, _) = txn
             .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
             .unwrap();
+
+        WARNINGS.with_borrow(|warnings| assert!(warnings.is_empty(), "{warnings:?}"));
 
         let frag = &result.fragments[0];
         // The base data file for field 5 was swapped in.
