@@ -681,23 +681,6 @@ impl RowAddrTreeMap {
             .retain(|frag_id, _| frag_id_set.contains(frag_id));
     }
 
-    /// Keep only the fragments in `fragments`; no intermediate set is built.
-    ///
-    /// ```
-    /// use lance_select::{RowAddrTreeMap, RowSetOps};
-    /// use roaring::RoaringBitmap;
-    ///
-    /// let mut rows = RowAddrTreeMap::new();
-    /// rows.insert_fragment(1);
-    /// rows.insert(2 << 32 | 7);
-    /// rows.retain_fragments_in(&RoaringBitmap::from_iter([2, 3]));
-    /// assert!(rows.get(&1).is_none());
-    /// assert!(rows.contains(2 << 32 | 7));
-    /// ```
-    pub fn retain_fragments_in(&mut self, fragments: &RoaringBitmap) {
-        self.inner.retain(|frag_id, _| fragments.contains(*frag_id));
-    }
-
     /// Optimize partial fragment selections for compact serialization.
     ///
     /// ```

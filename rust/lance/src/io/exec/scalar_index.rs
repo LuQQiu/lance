@@ -249,8 +249,12 @@ impl ScalarIndexExec {
     /// positive set is the whole universe of the output: rows of other
     /// fragments, of fragments the snapshot no longer has, and rows deleted
     /// in the scoped fragments are all outside it. Exactness is kept, as is
-    /// the NULL handling (a NULL row never matches, before or after), and
-    /// `fragments_covered` is intersected with the scope too. Both bounds
+    /// the predicate's own NULL semantics (an `IS NULL` leaf still selects
+    /// the null-valued rows of the scope, a NULL comparison still selects
+    /// nothing), and `fragments_covered` is intersected with the scope too.
+    /// The scanner's own callers keep loading-only selection
+    /// ([`Self::with_loading_scope`]); this contract is for callers that
+    /// consume the raw masks. Both bounds
     /// come out as allow lists. An empty scope, or one naming only fragments
     /// the snapshot lacks, yields an exact empty allow list; without a scope
     /// the output is unrestricted and the node behaves as before.
@@ -2136,7 +2140,10 @@ mod tests {
     #[tokio::test]
     async fn fragment_scope_confines_multi_index_negation_with_nulls() {
         let test_dir = TempStrDir::default();
-        let a = Int32Array::from_iter((0..40).map(|i| (i % 5 != 0).then_some(i % 7)));
+        // `a` is NULL on every fifth row and throughout fragment 2 (rows 20..29).
+        let a = Int32Array::from_iter(
+            (0..40).map(|i| (i % 5 != 0 && !(20..30).contains(&i)).then_some(i % 7)),
+        );
         let b = Int32Array::from_iter((0..40).map(|i| (i % 13 != 0).then_some(i % 11)));
         let batch = RecordBatch::try_from_iter(vec![
             ("a", Arc::new(a) as ArrayRef),
@@ -2177,7 +2184,14 @@ mod tests {
             )
         };
         let eq3 = |x: Option<i64>, v: i64| x.map(|x| x == v);
+        let is_null = |column: &str| search(column, "BTree", SargableQuery::IsNull());
         let cases: Vec<(ScalarIndexExpr, Pred)> = vec![
+            (is_null("a"), Box::new(|r| Some(r[0].is_none()))),
+            (not(is_null("a")), Box::new(|r| not3(Some(r[0].is_none())))),
+            (
+                and(is_null("a"), eq("b", 7)),
+                Box::new(move |r| and3(Some(r[0].is_none()), eq3(r[1], 7))),
+            ),
             (
                 not(or(eq("a", 5), eq("b", 7))),
                 Box::new(move |r| not3(or3(eq3(r[0], 5), eq3(r[1], 7)))),
@@ -2191,15 +2205,33 @@ mod tests {
                 Box::new(move |r| or3(eq3(r[0], 5), not3(eq3(r[1], 7)))),
             ),
         ];
+        let mut matched = std::collections::HashMap::new();
         for (expr, pred) in &cases {
-            for scope in [None, Some(scope([1])), Some(scope([0, 2])), Some(scope([]))] {
+            for scope in [
+                None,
+                Some(scope([1])),
+                Some(scope([2])),
+                Some(scope([0, 2])),
+                Some(scope([])),
+            ] {
                 let (result, _) = run_scoped(&dataset, expr.clone(), scope.as_ref()).await;
                 assert!(result.is_exact(), "{expr}");
                 let matches = check_confined(&result, &rows, scope.as_ref(), pred.as_ref());
-                if scope.as_ref().is_none_or(|scope| !scope.is_empty()) {
-                    assert!(matches > 0, "{expr} with {scope:?} should keep some rows");
-                }
+                matched.insert((expr.to_string(), format!("{scope:?}")), matches);
             }
+        }
+        let key = |expr: &ScalarIndexExpr, scope: RoaringBitmap| {
+            (expr.to_string(), format!("{:?}", Some(scope)))
+        };
+        // Not vacuous: the all-null fragment is selected whole by IS NULL and
+        // not at all by its negation, and the other cases keep rows in scope.
+        assert_eq!(matched[&key(&is_null("a"), scope([2]))], 10);
+        assert_eq!(matched[&key(&not(is_null("a")), scope([2]))], 0);
+        for (expr, _) in &cases {
+            assert!(
+                matched[&key(expr, scope([0, 2]))] > 0,
+                "{expr} over fragments 0 and 2 should keep some rows"
+            );
         }
         // A NULL operand in scope: `a` is NULL at row 10 (fragment 1) and `b` is
         // 10 there, so NOT (a = 5 OR b = 7) is NULL and the row is not selected.
@@ -2254,10 +2286,19 @@ mod tests {
     #[tokio::test]
     async fn fragment_scope_confines_stable_row_id_results() {
         let test_dir = TempStrDir::default();
-        let batch = RecordBatch::try_from_iter(vec![(
-            "id",
-            Arc::new(Int32Array::from((0..30).collect::<Vec<_>>())) as ArrayRef,
-        )])
+        // `n` is NULL on every third row and throughout fragment 5 (rows 25..29).
+        let batch = RecordBatch::try_from_iter(vec![
+            (
+                "id",
+                Arc::new(Int32Array::from((0..30).collect::<Vec<_>>())) as ArrayRef,
+            ),
+            (
+                "n",
+                Arc::new(Int32Array::from_iter(
+                    (0..30).map(|i| (i % 3 != 0 && !(25..30).contains(&i)).then_some(i)),
+                )) as ArrayRef,
+            ),
+        ])
         .unwrap();
         let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
         let mut dataset = Dataset::write(
@@ -2271,19 +2312,22 @@ mod tests {
         )
         .await
         .unwrap();
-        dataset
-            .create_index(
-                &["id"],
-                IndexType::BTree,
-                None,
-                &ScalarIndexParams::default(),
-                true,
-            )
-            .await
-            .unwrap();
+        for column in ["id", "n"] {
+            dataset
+                .create_index(
+                    &[column],
+                    IndexType::BTree,
+                    None,
+                    &ScalarIndexParams::default(),
+                    true,
+                )
+                .await
+                .unwrap();
+        }
         assert_eq!(dataset.fragments().len(), 6);
         let i = |v: i32| ScalarValue::Int32(Some(v));
         let lt = |v: i64| move |row: &[Option<i64>]| row[0].map(|x| x < v);
+        let n_is_null = || search("n", "BTree", SargableQuery::IsNull());
         let cases: Vec<(ScalarIndexExpr, Pred)> = vec![
             (below("id", i(12)), Box::new(lt(12))),
             (not(below("id", i(12))), Box::new(move |r| not3(lt(12)(r)))),
@@ -2291,11 +2335,13 @@ mod tests {
                 or(below("id", i(4)), not(below("id", i(26)))),
                 Box::new(move |r| or3(lt(4)(r), not3(lt(26)(r)))),
             ),
+            (n_is_null(), Box::new(|r| Some(r[1].is_none()))),
+            (not(n_is_null()), Box::new(|r| not3(Some(r[1].is_none())))),
         ];
         let check_all = |dataset: Arc<Dataset>, scopes: Vec<Option<RoaringBitmap>>| {
             let cases = &cases;
             async move {
-                let rows = rows_of(&dataset, &["id"]).await;
+                let rows = rows_of(&dataset, &["id", "n"]).await;
                 // Row ids and addresses differ for every fragment but the first.
                 assert!(rows.iter().any(|(id, addr, _)| *id != u64::from(*addr)));
                 for (expr, pred) in cases {
@@ -2312,9 +2358,10 @@ mod tests {
             dataset.clone(),
             vec![
                 None,
-                // Fewer fragments inside than outside, and the reverse.
+                // A small scope, a large one, the all-null fragment, nothing.
                 Some(scope([1, 2])),
                 Some(scope([0, 1, 2, 3, 4])),
+                Some(scope([5])),
                 Some(scope([])),
             ],
         )
