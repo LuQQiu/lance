@@ -9904,6 +9904,15 @@ mod tests {
                     ]),
                 )
                 .col(
+                    "text2",
+                    lance_datagen::array::cycle_utf8_literals(&[
+                        "hello again",
+                        "other words",
+                        "hello there",
+                        "nothing",
+                    ]),
+                )
+                .col(
                     "userid",
                     lance_datagen::array::step_custom::<arrow::datatypes::UInt64Type>(start, 1),
                 )
@@ -9920,16 +9929,18 @@ mod tests {
         )
         .await
         .unwrap();
-        dataset
-            .create_index(
-                &["text"],
-                IndexType::Inverted,
-                None,
-                &InvertedIndexParams::default().with_position(true),
-                true,
-            )
-            .await
-            .unwrap();
+        for column in ["text", "text2"] {
+            dataset
+                .create_index(
+                    &[column],
+                    IndexType::Inverted,
+                    None,
+                    &InvertedIndexParams::default().with_position(true),
+                    true,
+                )
+                .await
+                .unwrap();
+        }
         for segment in 1..num_segments {
             dataset
                 .append(make((segment * rows_per_segment) as u64), None)
@@ -10009,7 +10020,13 @@ mod tests {
         // the scanner derives its statistics from the segments it searches and
         // therefore keeps them all (the prepared arms are covered separately).
         let queries: Vec<(&str, FullTextSearchQuery, bool)> = vec![
-            ("match", FullTextSearchQuery::new("hello".to_string()), true),
+            // Explicit column: with two indexed text columns a bare term would
+            // become a multi-column match.
+            (
+                "match",
+                FullTextSearchQuery::new_query(FtsQuery::Match(text("hello"))),
+                true,
+            ),
             (
                 "phrase",
                 FullTextSearchQuery::new_query(FtsQuery::Phrase(
@@ -10025,6 +10042,19 @@ mod tests {
                     FtsQuery::Match(text("hello")),
                 )]))),
                 false,
+            ),
+            // Two target columns, each with its own segments: every excluded
+            // segment of either column is skipped, so the count doubles.
+            (
+                "combined_fields",
+                FullTextSearchQuery::new_query(FtsQuery::CombinedFields(
+                    lance_index::scalar::inverted::query::CombinedFieldsQuery::try_new(
+                        "hello".to_string(),
+                        vec!["text".to_string(), "text2".to_string()],
+                    )
+                    .unwrap(),
+                )),
+                true,
             ),
         ];
         for (kind, query, prunes) in &queries {
@@ -10044,12 +10074,13 @@ mod tests {
                     assert!(!pruned.is_empty(), "{kind}: the fixture has hits");
                 }
                 let counts = stats.consume().all_counts;
+                let columns = if *kind == "combined_fields" { 2 } else { 1 };
                 assert_eq!(
                     counts
                         .get(INDEX_SEGMENTS_SKIPPED_METRIC)
                         .copied()
                         .unwrap_or_default(),
-                    if *prunes { excluded } else { 0 },
+                    if *prunes { excluded * columns } else { 0 },
                     "{kind}: {filter}"
                 );
             }

@@ -527,6 +527,66 @@ impl PreFilter for DatasetPreFilter {
 #[cfg(test)]
 mod test {
     use lance_select::RowSetOps;
+
+    /// Emptiness is proven only from the mask and a known row set or, in
+    /// the address domain, known coverage; unknown coverage, a row-id mask
+    /// without a row set, or a block list keep the segment.
+    #[test]
+    fn segment_match_proof_is_conservative() {
+        use super::prefilter_may_match_segment;
+        use lance_select::{RowAddrMask, RowAddrTreeMap};
+        use roaring::RoaringBitmap;
+        let mut allow = RowAddrTreeMap::new();
+        allow.insert((3u64 << 32) | 4);
+        let allow = RowAddrMask::from_allowed(allow);
+        let others = RoaringBitmap::from_iter([0u32, 1]);
+        let here = RoaringBitmap::from_iter([1u32, 3]);
+        assert!(!prefilter_may_match_segment(
+            &allow,
+            None,
+            Some(&others),
+            true
+        ));
+        assert!(prefilter_may_match_segment(&allow, None, Some(&here), true));
+        assert!(prefilter_may_match_segment(&allow, None, None, true));
+        assert!(prefilter_may_match_segment(
+            &allow,
+            None,
+            Some(&others),
+            false
+        ));
+        let mut rows = RowAddrTreeMap::new();
+        rows.insert((3u64 << 32) | 9);
+        let rows = RowAddrMask::from_allowed(rows);
+        assert!(!prefilter_may_match_segment(
+            &allow,
+            Some(&rows),
+            Some(&here),
+            false
+        ));
+        let mut rows = RowAddrTreeMap::new();
+        rows.insert((3u64 << 32) | 4);
+        let rows = RowAddrMask::from_allowed(rows);
+        assert!(prefilter_may_match_segment(
+            &allow,
+            Some(&rows),
+            Some(&others),
+            false
+        ));
+        let block = RowAddrMask::all_rows();
+        assert!(prefilter_may_match_segment(
+            &block,
+            None,
+            Some(&others),
+            true
+        ));
+        assert!(!prefilter_may_match_segment(
+            &RowAddrMask::allow_nothing(),
+            None,
+            None,
+            false
+        ));
+    }
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
     use rstest::rstest;
 

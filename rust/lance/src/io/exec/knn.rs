@@ -1838,6 +1838,20 @@ impl PreFilter for SegmentPreFilter {
 
 /// The cached [`SegmentOwnershipMaskKey`] entry of `index` at the dataset's
 /// version; `None` when the segment needs no restriction.
+/// Whether an already available prefilter proves that a delta covering
+/// `coverage` holds no selectable row. A prefilter that is still loading
+/// proves nothing here: the delta's early search then starts as usual and
+/// the late search asks again once the prefilter is complete.
+fn prefilter_excludes_delta_now(
+    prefilter: &dyn PreFilter,
+    coverage: Option<&RoaringBitmap>,
+    address_domain: bool,
+) -> bool {
+    prefilter
+        .ready_mask()
+        .is_some_and(|mask| !prefilter_may_match_segment(&mask, None, coverage, address_domain))
+}
+
 async fn segment_ownership_mask(
     dataset: &Arc<Dataset>,
     index: &IndexMetadata,
@@ -2491,14 +2505,11 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                         // search asks again at the barrier, where it is complete.
                         let coverage = index_metadata.fragment_bitmap.clone();
                         let address_domain = !ds.manifest.uses_stable_row_ids();
-                        if let Some(mask) = segment_pre_filter.ready_mask()
-                            && !prefilter_may_match_segment(
-                                &mask,
-                                None,
-                                coverage.as_ref(),
-                                address_domain,
-                            )
-                        {
+                        if prefilter_excludes_delta_now(
+                            segment_pre_filter.as_ref(),
+                            coverage.as_ref(),
+                            address_domain,
+                        ) {
                             metrics.segments_skipped.add(1);
                             return DataFusionResult::Ok(Self::skipped_delta(state).boxed());
                         }
@@ -5868,6 +5879,52 @@ mod tests {
         }
     }
 
+    /// A prefilter whose mask is known only after `wait_for_ready`.
+    struct DelayedPreFilter(Arc<RowAddrMask>);
+
+    #[async_trait::async_trait]
+    impl PreFilter for DelayedPreFilter {
+        async fn wait_for_ready(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn is_empty(&self) -> bool {
+            false
+        }
+
+        fn mask(&self) -> Arc<RowAddrMask> {
+            self.0.clone()
+        }
+
+        fn filter_row_ids<'a>(&self, row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64> {
+            self.0.selected_indices(row_ids)
+        }
+    }
+
+    /// The pre-open skip fires only for a prefilter that is already
+    /// available and excludes the delta's coverage; a delayed prefilter, a
+    /// selectable fragment, unknown coverage or a row-id mask all let the
+    /// delta start its index work.
+    #[test]
+    fn pre_open_skip_needs_an_available_excluding_prefilter() {
+        let mut allow = lance_select::RowAddrTreeMap::new();
+        allow.insert_fragment(3);
+        let mask = Arc::new(RowAddrMask::from_allowed(allow));
+        let ready = FixedPreFilter(mask.clone());
+        let delayed = DelayedPreFilter(mask);
+        let others = RoaringBitmap::from_iter([0u32, 1]);
+        let mixed = RoaringBitmap::from_iter([1u32, 3]);
+        assert!(prefilter_excludes_delta_now(&ready, Some(&others), true));
+        assert!(!prefilter_excludes_delta_now(&delayed, Some(&others), true));
+        assert!(!prefilter_excludes_delta_now(&ready, Some(&mixed), true));
+        assert!(!prefilter_excludes_delta_now(&ready, None, true));
+        assert!(!prefilter_excludes_delta_now(&ready, Some(&others), false));
+        let empty = FixedPreFilter(Arc::new(RowAddrMask::allow_nothing()));
+        assert!(prefilter_excludes_delta_now(&empty, None, false));
+        let block = FixedPreFilter(Arc::new(RowAddrMask::all_rows()));
+        assert!(!prefilter_excludes_delta_now(&block, Some(&others), true));
+    }
+
     /// The late search drops a delta whose coverage the prefilter cannot
     /// select from, after passing the barrier; coverage is ignored for
     /// row-id masks, and a delta with a selectable fragment is searched.
@@ -6090,6 +6147,53 @@ mod tests {
                 searched <= 2 * (4 - early),
                 "{filter}: a delta skipped early probes nothing ({searched} partitions)"
             );
+        }
+        // After a delete and a compaction the deltas' coverage is remapped to
+        // the new fragments; the pruned search must still agree with the
+        // exhaustive flat search, and no delta is counted twice.
+        let mut dataset = dataset;
+        dataset.delete("userid % 7 = 0").await.unwrap();
+        crate::dataset::optimize::compact_files(
+            &mut dataset,
+            crate::dataset::optimize::CompactionOptions {
+                target_rows_per_fragment: 100,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let deltas = dataset
+            .load_indices_by_name("vector_idx")
+            .await
+            .unwrap()
+            .len();
+        for filter in [
+            "userid < 50",
+            "userid >= 100 AND userid < 150",
+            "userid > 1000",
+        ] {
+            let stats = StatsHolder::default();
+            let pruned = knn_rows(&dataset, query.as_ref(), filter, true, Some(&stats)).await;
+            let flat = knn_rows(&dataset, query.as_ref(), filter, false, None).await;
+            assert_eq!(
+                pruned.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                flat.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                "after compaction, {filter}"
+            );
+            let counts = stats.consume().all_counts;
+            let early = counts
+                .get(INDEX_SEGMENTS_SKIPPED_METRIC)
+                .copied()
+                .unwrap_or_default();
+            let late = counts
+                .get(INDEX_SEGMENTS_SKIPPED_LATE_METRIC)
+                .copied()
+                .unwrap_or_default();
+            assert!(early + late <= deltas, "after compaction, {filter}");
+            if filter == "userid > 1000" {
+                assert_eq!(early + late, deltas, "after compaction, {filter}");
+            }
         }
     }
 }
