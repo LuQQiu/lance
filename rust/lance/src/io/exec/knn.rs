@@ -49,7 +49,8 @@ use lance_core::{
 };
 use lance_datafusion::utils::{
     DELTAS_SEARCHED_METRIC, ExecutionPlanMetricsSetExt, FIND_PARTITIONS_ELAPSED_METRIC,
-    INDEX_SEGMENTS_SKIPPED_METRIC, PARTITIONS_RANKED_METRIC, PARTITIONS_SEARCHED_METRIC,
+    INDEX_SEGMENTS_SKIPPED_LATE_METRIC, INDEX_SEGMENTS_SKIPPED_METRIC, PARTITIONS_RANKED_METRIC,
+    PARTITIONS_SEARCHED_METRIC,
 };
 use lance_index::metrics::{IndexTimer, IndexTiming, MetricsCollector};
 use lance_index::prefilter::PreFilter;
@@ -116,6 +117,7 @@ pub struct AnnIndexMetrics {
     index_metrics: IndexMetrics,
     partitions_searched: Count,
     segments_skipped: Count,
+    segments_skipped_late: Count,
     baseline_metrics: BaselineMetrics,
 }
 
@@ -125,6 +127,7 @@ impl AnnIndexMetrics {
             index_metrics: IndexMetrics::new(metrics, partition),
             partitions_searched: metrics.new_count(PARTITIONS_SEARCHED_METRIC, partition),
             segments_skipped: metrics.new_count(INDEX_SEGMENTS_SKIPPED_METRIC, partition),
+            segments_skipped_late: metrics.new_count(INDEX_SEGMENTS_SKIPPED_LATE_METRIC, partition),
             baseline_metrics: BaselineMetrics::new(metrics, partition),
         }
     }
@@ -2055,7 +2058,7 @@ impl ANNIvfSubIndexExec {
                 coverage.as_ref(),
                 address_domain,
             ) {
-                metrics.segments_skipped.add(1);
+                metrics.segments_skipped_late.add(1);
                 return futures::stream::empty().boxed();
             }
             if max_nprobes <= min_nprobes {
@@ -5614,11 +5617,28 @@ mod tests {
         assert_eq!(results.num_rows(), 0);
 
         let stats = stats_holder.consume();
-        // We still do the early search because we don't wait for the prefilter to execute
-        // We skip the late search because by then we know there are no results
+        // The prefilter excludes every delta. A delta whose prefilter was
+        // already available at its start did no initial search at all; the
+        // others ran their initial probes and skipped the late search at
+        // the barrier. Either way every delta is accounted for exactly once.
+        let early = stats
+            .all_counts
+            .get(INDEX_SEGMENTS_SKIPPED_METRIC)
+            .copied()
+            .unwrap_or_default();
+        let late = stats
+            .all_counts
+            .get(INDEX_SEGMENTS_SKIPPED_LATE_METRIC)
+            .copied()
+            .unwrap_or_default();
+        assert_eq!(early + late, num_deltas);
         assert_eq!(
-            stats.all_counts.get(PARTITIONS_SEARCHED_METRIC).unwrap(),
-            &(initial_nprobes * num_deltas)
+            stats
+                .all_counts
+                .get(PARTITIONS_SEARCHED_METRIC)
+                .copied()
+                .unwrap_or_default(),
+            initial_nprobes * (num_deltas - early)
         );
         assert_find_partitions_elapsed_recorded(&stats);
     }
@@ -5710,11 +5730,28 @@ mod tests {
 
         let stats = stats_holder.consume();
 
-        // We should only search minimum_nprobes before we look at the prefilter and realize
-        // we can cheaply stop early.
+        // Only the first delta holds rows below 20. The others are skipped
+        // before their index opens when the prefilter is already available,
+        // or after their minimum probes at the barrier; the first delta
+        // searches its minimum probes and then stops early.
+        let early = stats
+            .all_counts
+            .get(INDEX_SEGMENTS_SKIPPED_METRIC)
+            .copied()
+            .unwrap_or_default();
+        let late = stats
+            .all_counts
+            .get(INDEX_SEGMENTS_SKIPPED_LATE_METRIC)
+            .copied()
+            .unwrap_or_default();
+        assert_eq!(early + late, num_deltas - 1);
         assert_eq!(
-            stats.all_counts.get(PARTITIONS_SEARCHED_METRIC).unwrap(),
-            &(initial_nprobes * num_deltas)
+            stats
+                .all_counts
+                .get(PARTITIONS_SEARCHED_METRIC)
+                .copied()
+                .unwrap_or_default(),
+            initial_nprobes * (num_deltas - early)
         );
         assert_find_partitions_elapsed_recorded(&stats);
         assert_eq!(results.num_rows(), 20);
@@ -5874,7 +5911,7 @@ mod tests {
                 .try_collect::<Vec<_>>()
                 .await
                 .unwrap();
-                (late.len(), metrics.segments_skipped.value())
+                (late.len(), metrics.segments_skipped_late.value())
             }
         };
         let (batches, skipped) = run(Some(RoaringBitmap::from_iter([0u32, 1])), true).await;
@@ -5990,7 +6027,7 @@ mod tests {
         let mut rows: Vec<(u64, f32)> = (0..batch.num_rows())
             .map(|i| (ids.value(i), distances.value(i)))
             .collect();
-        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        rows.sort_by_key(|row| row.0);
         rows
     }
 
@@ -6033,14 +6070,25 @@ mod tests {
                     "{filter}"
                 );
             }
+            // Skipped before the index open when the prefilter was already
+            // available, otherwise at the barrier: together they are exact.
             let counts = stats.consume().all_counts;
-            assert_eq!(
-                counts
-                    .get(INDEX_SEGMENTS_SKIPPED_METRIC)
-                    .copied()
-                    .unwrap_or_default(),
-                expected_skipped,
-                "{filter}"
+            let early = counts
+                .get(INDEX_SEGMENTS_SKIPPED_METRIC)
+                .copied()
+                .unwrap_or_default();
+            let late = counts
+                .get(INDEX_SEGMENTS_SKIPPED_LATE_METRIC)
+                .copied()
+                .unwrap_or_default();
+            assert_eq!(early + late, expected_skipped, "{filter}");
+            let searched = counts
+                .get(PARTITIONS_SEARCHED_METRIC)
+                .copied()
+                .unwrap_or_default();
+            assert!(
+                searched <= 2 * (4 - early),
+                "{filter}: a delta skipped early probes nothing ({searched} partitions)"
             );
         }
     }

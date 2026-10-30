@@ -1871,6 +1871,11 @@ impl ExecutionPlan for CompoundQueryExec {
                         &metrics,
                     )
                     .await;
+                    if indices.is_empty() {
+                        return Ok::<_, DataFusionError>(RecordBatch::new_empty(
+                            FTS_SCHEMA.clone(),
+                        ));
+                    }
                     compound_search_prepared_match(
                         &indices,
                         &query,
@@ -1891,6 +1896,11 @@ impl ExecutionPlan for CompoundQueryExec {
                         &metrics,
                     )
                     .await;
+                    if indices.is_empty() {
+                        return Ok::<_, DataFusionError>(RecordBatch::new_empty(
+                            FTS_SCHEMA.clone(),
+                        ));
+                    }
                     let mut documents = search_prepared_segments(
                         &indices,
                         prepared.clone(),
@@ -2007,6 +2017,11 @@ impl ExecutionPlan for CompoundQueryExec {
                 match (preset_prepared_match, base_scorer) {
                     (Some(prepared_match), _) => {
                         let indices = candidate_indices.await?;
+                        if indices.is_empty() {
+                            return Ok::<_, DataFusionError>(RecordBatch::new_empty(
+                                FTS_SCHEMA.clone(),
+                            ));
+                        }
                         compound_search_prepared_match(
                             &indices,
                             &query,
@@ -2018,7 +2033,10 @@ impl ExecutionPlan for CompoundQueryExec {
                         .await?
                     }
                     (None, Some(base_scorer)) => {
-                        let indices = candidate_indices.await?;
+                        // A scorer alone does not fix the vocabulary: fuzzy
+                        // expansion still runs over the segments handed in
+                        // here, so the candidate set stays complete.
+                        drop(candidate_indices);
                         compound_search_with_base_scorer(
                             &indices,
                             &query,
@@ -3669,6 +3687,8 @@ impl ExecutionPlan for MatchQueryExec {
                     .expect("prefilter just created")
                     .set_deleted_fragments(deleted_fragments);
             }
+            metrics
+                .record_parts_searched(indices.iter().map(|index| index.partition_count()).sum());
 
             let first_index = indices.first().ok_or(DataFusionError::Execution(format!(
                 "FTS index for column {} has no segments",
@@ -3724,8 +3744,6 @@ impl ExecutionPlan for MatchQueryExec {
                 &metrics,
             )
             .await;
-            metrics
-                .record_parts_searched(indices.iter().map(|index| index.partition_count()).sum());
             let mut documents =
                 search_prepared_segments(&indices, prepared, pre_filter, metrics.clone(), None)
                     .await?;
@@ -5959,6 +5977,8 @@ impl ExecutionPlan for PhraseQueryExec {
                     .expect("prefilter just created")
                     .set_deleted_fragments(deleted_fragments);
             }
+            metrics
+                .record_parts_searched(indices.iter().map(|index| index.partition_count()).sum());
 
             let first_index = indices.first().ok_or(DataFusionError::Execution(format!(
                 "FTS index for column {} has no segments",
@@ -5997,8 +6017,6 @@ impl ExecutionPlan for PhraseQueryExec {
                 &metrics,
             )
             .await;
-            metrics
-                .record_parts_searched(indices.iter().map(|index| index.partition_count()).sum());
             let tokens = Arc::new(tokens);
             let params = Arc::new(params);
             let documents = search_segments(
@@ -9907,7 +9925,7 @@ mod tests {
                 &["text"],
                 IndexType::Inverted,
                 None,
-                &InvertedIndexParams::default(),
+                &InvertedIndexParams::default().with_position(true),
                 true,
             )
             .await
@@ -9943,9 +9961,10 @@ mod tests {
         (dataset, dir)
     }
 
-    /// Every "hello" hit under `filter` as (row id, score), by row id.
+    /// Every hit of `query` under `filter` as (row id, score), by row id.
     async fn fts_rows(
         dataset: &Dataset,
+        query: FullTextSearchQuery,
         filter: &str,
         prefilter: bool,
         stats: Option<&StatsHolder>,
@@ -9955,7 +9974,7 @@ mod tests {
             .project(&["userid"])
             .unwrap()
             .with_row_id()
-            .full_text_search(FullTextSearchQuery::new("hello".to_string()).limit(Some(10_000)))
+            .full_text_search(query.limit(Some(10_000)))
             .unwrap()
             .filter(filter)
             .unwrap()
@@ -9971,7 +9990,7 @@ mod tests {
         let mut rows: Vec<(u64, f32)> = (0..batch.num_rows())
             .map(|i| (ids.value(i), scores.value(i)))
             .collect();
-        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        rows.sort_by_key(|row| row.0);
         rows
     }
 
@@ -9982,38 +10001,171 @@ mod tests {
     #[rstest]
     #[tokio::test]
     async fn prefilter_skips_fts_segments_it_excludes(#[values(false, true)] stable_row_ids: bool) {
+        use lance_index::scalar::inverted::query::{BooleanQuery, Occur};
         let (dataset, _dir) = fts_segment_fixture(3, 30, stable_row_ids).await;
-        let mut parts_searched = std::collections::HashMap::new();
-        for (filter, expected_skipped) in [
-            ("userid < 30", 2),
-            ("userid >= 60", 2),
-            ("userid >= 30", 1),
-            ("userid < 1000", 0),
-            ("userid > 1000", 3),
-            ("userid != 5", 0),
-        ] {
-            let stats = StatsHolder::default();
-            let pruned = fts_rows(&dataset, filter, true, Some(&stats)).await;
-            let oracle = fts_rows(&dataset, filter, false, None).await;
-            assert_eq!(pruned, oracle, "{filter}");
-            let counts = stats.consume().all_counts;
-            assert_eq!(
-                counts
-                    .get(INDEX_SEGMENTS_SKIPPED_METRIC)
-                    .copied()
-                    .unwrap_or_default(),
-                expected_skipped,
-                "{filter}"
-            );
-            parts_searched.insert(
-                filter,
-                counts
-                    .get(PARTITIONS_SEARCHED_METRIC)
-                    .copied()
-                    .unwrap_or_default(),
-            );
+        let text =
+            |terms: &str| MatchQuery::new(terms.to_string()).with_column(Some("text".to_string()));
+        // Match and Phrase prune their candidate search; a Boolean query from
+        // the scanner derives its statistics from the segments it searches and
+        // therefore keeps them all (the prepared arms are covered separately).
+        let queries: Vec<(&str, FullTextSearchQuery, bool)> = vec![
+            ("match", FullTextSearchQuery::new("hello".to_string()), true),
+            (
+                "phrase",
+                FullTextSearchQuery::new_query(FtsQuery::Phrase(
+                    PhraseQuery::new("hello world".to_string())
+                        .with_column(Some("text".to_string())),
+                )),
+                true,
+            ),
+            (
+                "boolean",
+                FullTextSearchQuery::new_query(FtsQuery::Boolean(BooleanQuery::new([(
+                    Occur::Must,
+                    FtsQuery::Match(text("hello")),
+                )]))),
+                false,
+            ),
+        ];
+        for (kind, query, prunes) in &queries {
+            for (filter, excluded) in [
+                ("userid < 30", 2),
+                ("userid >= 60", 2),
+                ("userid >= 30", 1),
+                ("userid < 1000", 0),
+                ("userid > 1000", 3),
+                ("userid != 5", 0),
+            ] {
+                let stats = StatsHolder::default();
+                let pruned = fts_rows(&dataset, query.clone(), filter, true, Some(&stats)).await;
+                let oracle = fts_rows(&dataset, query.clone(), filter, false, None).await;
+                assert_eq!(pruned, oracle, "{kind}: {filter}");
+                if filter == "userid < 1000" {
+                    assert!(!pruned.is_empty(), "{kind}: the fixture has hits");
+                }
+                let counts = stats.consume().all_counts;
+                assert_eq!(
+                    counts
+                        .get(INDEX_SEGMENTS_SKIPPED_METRIC)
+                        .copied()
+                        .unwrap_or_default(),
+                    if *prunes { excluded } else { 0 },
+                    "{kind}: {filter}"
+                );
+            }
         }
-        assert!(parts_searched["userid < 30"] < parts_searched["userid < 1000"]);
-        assert_eq!(parts_searched["userid > 1000"], 0);
+    }
+
+    /// The Compound prepared arms, driven directly: a complete prefilter that
+    /// excludes every segment yields an empty result rather than an error,
+    /// a partial one yields the oracle's rows, through the WAND certificate
+    /// path (with a limit) and the plain prepared-match arm (without); the
+    /// base-scorer arm stays unpruned and agrees.
+    #[tokio::test]
+    async fn compound_prepared_arms_handle_empty_and_partial_candidate_domains() {
+        use crate::io::exec::scalar_index::ScalarIndexExec;
+        use lance_index::scalar::SargableQuery;
+        use lance_index::scalar::expression::{ScalarIndexExpr, ScalarIndexSearch};
+        use std::ops::Bound;
+
+        let (dataset, _dir) = fts_segment_fixture(3, 30, false).await;
+        let dataset = Arc::new(dataset);
+        let segments = dataset.load_indices_by_name("text_idx").await.unwrap();
+        let metrics_set = ExecutionPlanMetricsSet::new();
+        let metrics = IndexMetrics::new(&metrics_set, 0);
+        let indices = open_fts_segments(&dataset, "text", &segments, &metrics)
+            .await
+            .unwrap();
+        let query = MatchQuery::new("hello".to_string()).with_column(Some("text".to_string()));
+        let mut tokenizer = tokenizer_for_match_query(&indices[0], query.fuzziness);
+        let tokens = collect_query_tokens(&query.terms, &mut tokenizer);
+        let userid = |query: SargableQuery| {
+            ScalarIndexExpr::Query(ScalarIndexSearch {
+                column: "userid".to_string(),
+                index_name: "userid_idx".to_string(),
+                index_type: "BTree".to_string(),
+                query: Arc::new(query),
+                needs_recheck: false,
+                fragment_bitmap: None,
+            })
+        };
+        let u = |v: u64| datafusion::scalar::ScalarValue::UInt64(Some(v));
+        let cases = [
+            (
+                userid(SargableQuery::Range(
+                    Bound::Excluded(u(1000)),
+                    Bound::Unbounded,
+                )),
+                "userid > 1000",
+            ),
+            (
+                userid(SargableQuery::Range(
+                    Bound::Unbounded,
+                    Bound::Excluded(u(30)),
+                )),
+                "userid < 30",
+            ),
+            (
+                userid(SargableQuery::Range(
+                    Bound::Unbounded,
+                    Bound::Excluded(u(1000)),
+                )),
+                "userid < 1000",
+            ),
+        ];
+        for (expr, filter) in cases {
+            let oracle = dataset
+                .scan()
+                .filter(&format!("{filter} AND text LIKE '%hello%'"))
+                .unwrap()
+                .with_row_id()
+                .project(&Vec::<String>::new())
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            let mut expected: Vec<u64> = oracle
+                .column_by_name(ROW_ID)
+                .unwrap()
+                .as_primitive::<UInt64Type>()
+                .values()
+                .to_vec();
+            expected.sort_unstable();
+            for limit in [Some(1000), None] {
+                let params = FtsSearchParams::default().with_limit(limit);
+                let prepared = Arc::new(
+                    prepare_bm25_query(&indices, tokens.clone(), &params, None, None)
+                        .await
+                        .unwrap(),
+                );
+                let prefilter = || {
+                    PreFilterSource::ScalarIndexQuery(Arc::new(ScalarIndexExec::new(
+                        dataset.clone(),
+                        expr.clone(),
+                        IndexExprResultWireFormat::default(),
+                    ))
+                        as Arc<dyn ExecutionPlan>)
+                };
+                let exec = |prepared_match: bool| {
+                    let exec = CompoundQueryExec::new_with_segments(
+                        dataset.clone(),
+                        FtsQuery::Match(query.clone()),
+                        params.clone(),
+                        prefilter(),
+                        segments.clone(),
+                    );
+                    if prepared_match {
+                        exec.with_prepared_match(prepared.clone())
+                    } else {
+                        exec.with_base_scorer(prepared.scorer().clone())
+                    }
+                };
+                for (arm, prepared_match) in [("prepared match", true), ("base scorer", false)] {
+                    let mut got = execute_row_ids(&exec(prepared_match)).await.unwrap();
+                    got.sort_unstable();
+                    assert_eq!(got, expected, "{arm}, limit {limit:?}, {filter}");
+                }
+            }
+        }
     }
 }
