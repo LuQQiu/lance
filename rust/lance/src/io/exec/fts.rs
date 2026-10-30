@@ -40,7 +40,10 @@ use lance_core::{
         tracing::StreamTracingExt,
     },
 };
-use lance_datafusion::utils::{ExecutionPlanMetricsSetExt, MetricsExt, PARTITIONS_SEARCHED_METRIC};
+use lance_datafusion::utils::{
+    ExecutionPlanMetricsSetExt, INDEX_SEGMENTS_SKIPPED_METRIC, MetricsExt,
+    PARTITIONS_SEARCHED_METRIC,
+};
 use lance_select::RowAddrMask;
 use lance_table::format::IndexMetadata;
 use rustc_hash::FxHashSet;
@@ -52,7 +55,7 @@ use super::utils::{
     build_prefilter, build_prefilter_restricted_to_fragments,
 };
 use crate::dataset::mem_wal::index::{QueryLocalFtsIndex, QueryLocalFtsStats};
-use crate::index::prefilter::DatasetPreFilter;
+use crate::index::prefilter::{DatasetPreFilter, prefilter_may_match_segment};
 use crate::index::scalar::inverted::{
     ResolvedFtsField, flatten_fts_document_column, fts_document_schema, load_segment_details,
     load_segments, transform_fts_document_stream,
@@ -342,6 +345,94 @@ async fn open_fts_segments(
         open_fts_segment(dataset, column, segment, coverage, metrics)
     }))
     .await
+}
+
+/// The segments whose candidate search the prefilter cannot rule out, in
+/// `indices` order; `segments` is their metadata in the same order and the
+/// prefilter must be ready.
+///
+/// Corpus statistics and vocabulary expansion were done over every segment
+/// before this point and are not affected: only the candidate search of a
+/// segment the complete prefilter provably excludes is skipped. Under stable
+/// row ids a segment restricted by the opener decides through its allowed
+/// rows; otherwise its resolved query coverage (not its stored provenance)
+/// decides by fragment key. When that coverage cannot be resolved, or the
+/// inputs do not line up, every segment is kept.
+async fn segments_the_prefilter_may_match(
+    dataset: &Dataset,
+    indices: &[Arc<InvertedIndex>],
+    segments: &[IndexMetadata],
+    pre_filter: &dyn PreFilter,
+    address_domain: bool,
+    metrics: &FtsIndexMetrics,
+) -> Vec<Arc<InvertedIndex>> {
+    if indices.len() != segments.len() {
+        return indices.to_vec();
+    }
+    let segment_refs: Vec<&IndexMetadata> = segments.iter().collect();
+    let coverages = if address_domain {
+        match crate::index::frag_reuse::resolve_query_segment_coverages(dataset, &segment_refs)
+            .await
+        {
+            Ok(coverages) => Some(coverages),
+            Err(err) => {
+                log::debug!("keeping every FTS segment: coverage unresolved ({err})");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let mask = pre_filter.mask();
+    let retained: Vec<Arc<InvertedIndex>> = indices
+        .iter()
+        .enumerate()
+        .filter(|(position, index)| {
+            prefilter_may_match_segment(
+                &mask,
+                index.allowed_rows().map(Arc::as_ref),
+                coverages.as_ref().map(|coverages| &coverages[*position]),
+                address_domain,
+            )
+        })
+        .map(|(_, index)| index.clone())
+        .collect();
+    metrics.record_segments_skipped(indices.len() - retained.len());
+    retained
+}
+
+/// [`segments_the_prefilter_may_match`] per target column of a combined
+/// fields scan, whose `segments` list every column's segments in column
+/// order. A column may end up with no segment to search.
+async fn combined_columns_the_prefilter_may_match(
+    dataset: &Dataset,
+    columns: Vec<CombinedFieldColumn>,
+    segments: &[IndexMetadata],
+    pre_filter: &dyn PreFilter,
+    address_domain: bool,
+    metrics: &FtsIndexMetrics,
+) -> Vec<CombinedFieldColumn> {
+    let total: usize = columns.iter().map(|column| column.indices.len()).sum();
+    if total != segments.len() {
+        return columns;
+    }
+    let mut offset = 0;
+    let mut retained = Vec::with_capacity(columns.len());
+    for column in columns {
+        let count = column.indices.len();
+        let indices = segments_the_prefilter_may_match(
+            dataset,
+            &column.indices,
+            &segments[offset..offset + count],
+            pre_filter,
+            address_domain,
+            metrics,
+        )
+        .await;
+        offset += count;
+        retained.push(CombinedFieldColumn { indices, ..column });
+    }
+    retained
 }
 
 async fn search_prepared_segments(
@@ -1655,6 +1746,8 @@ impl ExecutionPlan for CompoundQueryExec {
                 true
             };
             let _details = load_segment_details(&dataset, column, &segments).await?;
+            let address_domain = !dataset.manifest.uses_stable_row_ids();
+            let dataset_for_scope = dataset.clone();
             let indices =
                 open_fts_segments(&dataset, column, &segments, &metrics.index_metrics).await?;
             if let Some(first_index) = indices.first() {
@@ -1768,6 +1861,16 @@ impl ExecutionPlan for CompoundQueryExec {
                     let weight = prepared.query.scorer().query_weight(token);
                     !weight.is_finite() || weight <= 0.0
                 }) {
+                    prefilter.wait_for_ready().await?;
+                    let indices = segments_the_prefilter_may_match(
+                        &dataset_for_scope,
+                        &indices,
+                        &segments,
+                        prefilter.as_ref(),
+                        address_domain,
+                        &metrics,
+                    )
+                    .await;
                     compound_search_prepared_match(
                         &indices,
                         &query,
@@ -1779,6 +1882,15 @@ impl ExecutionPlan for CompoundQueryExec {
                     .await?
                 } else {
                     prefilter.wait_for_ready().await?;
+                    let indices = segments_the_prefilter_may_match(
+                        &dataset_for_scope,
+                        &indices,
+                        &segments,
+                        prefilter.as_ref(),
+                        address_domain,
+                        &metrics,
+                    )
+                    .await;
                     let mut documents = search_prepared_segments(
                         &indices,
                         prepared.clone(),
@@ -1874,8 +1986,27 @@ impl ExecutionPlan for CompoundQueryExec {
                     }
                 }
             } else {
+                // With statistics prepared elsewhere the candidate search can
+                // skip segments the prefilter excludes; without them the
+                // search derives its statistics from the segments it is given
+                // and must see all of them.
+                let candidate_indices = async {
+                    prefilter.wait_for_ready().await?;
+                    Ok::<_, DataFusionError>(
+                        segments_the_prefilter_may_match(
+                            &dataset_for_scope,
+                            &indices,
+                            &segments,
+                            prefilter.as_ref(),
+                            address_domain,
+                            &metrics,
+                        )
+                        .await,
+                    )
+                };
                 match (preset_prepared_match, base_scorer) {
                     (Some(prepared_match), _) => {
+                        let indices = candidate_indices.await?;
                         compound_search_prepared_match(
                             &indices,
                             &query,
@@ -1887,6 +2018,7 @@ impl ExecutionPlan for CompoundQueryExec {
                         .await?
                     }
                     (None, Some(base_scorer)) => {
+                        let indices = candidate_indices.await?;
                         compound_search_with_base_scorer(
                             &indices,
                             &query,
@@ -1898,6 +2030,7 @@ impl ExecutionPlan for CompoundQueryExec {
                         .await?
                     }
                     (None, None) => {
+                        drop(candidate_indices);
                         compound_search(&indices, &query, &params, prefilter, metrics.clone())
                             .await?
                     }
@@ -3011,6 +3144,7 @@ impl FtsSegmentSelection {
 pub struct FtsIndexMetrics {
     index_metrics: IndexMetrics,
     partitions_searched: Count,
+    segments_skipped: Count,
     /// Wall time (ms) of the exec-local `build_global_bm25_scorer`
     /// fallback; zero when a preset base scorer was injected.
     scorer_build_ms: Gauge,
@@ -3023,6 +3157,7 @@ impl FtsIndexMetrics {
         Self {
             index_metrics: IndexMetrics::new(metrics, partition),
             partitions_searched: metrics.new_count(PARTITIONS_SEARCHED_METRIC, partition),
+            segments_skipped: metrics.new_count(INDEX_SEGMENTS_SKIPPED_METRIC, partition),
             scorer_build_ms: metrics.new_gauge("scorer_build_ms", partition),
             segment_bind_duration: metrics.new_time(FTS_SEGMENT_BIND_DURATION_METRIC, partition),
             baseline_metrics: BaselineMetrics::new(metrics, partition),
@@ -3031,6 +3166,10 @@ impl FtsIndexMetrics {
 
     pub fn record_parts_searched(&self, num_parts: usize) {
         self.partitions_searched.add(num_parts);
+    }
+
+    pub fn record_segments_skipped(&self, num_segments: usize) {
+        self.segments_skipped.add(num_segments);
     }
 
     pub fn record_scorer_build(&self, elapsed: std::time::Duration) {
@@ -3501,6 +3640,8 @@ impl ExecutionPlan for MatchQueryExec {
             } else {
                 true
             };
+            let address_domain = !ds.manifest.uses_stable_row_ids();
+            let ds_for_scope = ds.clone();
             let indices =
                 open_fts_segments(&ds, &column, &segments, &metrics.index_metrics).await?;
 
@@ -3528,8 +3669,6 @@ impl ExecutionPlan for MatchQueryExec {
                     .expect("prefilter just created")
                     .set_deleted_fragments(deleted_fragments);
             }
-            metrics
-                .record_parts_searched(indices.iter().map(|index| index.partition_count()).sum());
 
             let first_index = indices.first().ok_or(DataFusionError::Execution(format!(
                 "FTS index for column {} has no segments",
@@ -3576,6 +3715,17 @@ impl ExecutionPlan for MatchQueryExec {
             };
 
             pre_filter.wait_for_ready().await?;
+            let indices = segments_the_prefilter_may_match(
+                &ds_for_scope,
+                &indices,
+                &segments,
+                pre_filter.as_ref(),
+                address_domain,
+                &metrics,
+            )
+            .await;
+            metrics
+                .record_parts_searched(indices.iter().map(|index| index.partition_count()).sum());
             let mut documents =
                 search_prepared_segments(&indices, prepared, pre_filter, metrics.clone(), None)
                     .await?;
@@ -3982,6 +4132,8 @@ impl ExecutionPlan for CombinedFieldsQueryExec {
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
         let stream = stream::once(async move {
             let _timer = metrics.baseline_metrics.elapsed_compute().timer();
+            let address_domain = !ds.manifest.uses_stable_row_ids();
+            let ds_for_scope = ds.clone();
 
             let CombinedFieldsScan {
                 columns,
@@ -4062,6 +4214,15 @@ impl ExecutionPlan for CombinedFieldsQueryExec {
             };
 
             pre_filter.wait_for_ready().await?;
+            let columns = combined_columns_the_prefilter_may_match(
+                &ds_for_scope,
+                columns,
+                &all_segments,
+                pre_filter.as_ref(),
+                address_domain,
+                &metrics,
+            )
+            .await;
             let (doc_ids, scores) = combined_fields_search(
                 &columns,
                 &tokens,
@@ -5769,6 +5930,8 @@ impl ExecutionPlan for PhraseQueryExec {
                     &metrics.segment_bind_duration,
                 )
                 .await?;
+            let address_domain = !ds.manifest.uses_stable_row_ids();
+            let ds_for_scope = ds.clone();
             let indices =
                 open_fts_segments(&ds, &column, &segments, &metrics.index_metrics).await?;
 
@@ -5796,8 +5959,6 @@ impl ExecutionPlan for PhraseQueryExec {
                     .expect("prefilter just created")
                     .set_deleted_fragments(deleted_fragments);
             }
-            metrics
-                .record_parts_searched(indices.iter().map(|index| index.partition_count()).sum());
 
             let first_index = indices.first().ok_or(DataFusionError::Execution(format!(
                 "FTS index for column {} has no segments",
@@ -5827,6 +5988,17 @@ impl ExecutionPlan for PhraseQueryExec {
             };
 
             pre_filter.wait_for_ready().await?;
+            let indices = segments_the_prefilter_may_match(
+                &ds_for_scope,
+                &indices,
+                &segments,
+                pre_filter.as_ref(),
+                address_domain,
+                &metrics,
+            )
+            .await;
+            metrics
+                .record_parts_searched(indices.iter().map(|index| index.partition_count()).sum());
             let tokens = Arc::new(tokens);
             let params = Arc::new(params);
             let documents = search_segments(
@@ -6402,6 +6574,7 @@ mod tests {
     use std::time::Duration;
 
     use crate::index::DatasetIndexExt;
+    use arrow::datatypes::{Float32Type, UInt64Type};
     use arrow_array::cast::AsArray;
     use arrow_array::types::Int32Type;
     use arrow_array::{
@@ -6420,11 +6593,13 @@ mod tests {
     use datafusion::{execution::TaskContext, physical_plan::ExecutionPlan};
     use futures::{FutureExt, TryStreamExt, stream};
     use lance_core::utils::futures::StreamOnDropExt;
+    use lance_core::utils::tempfile::TempStrDir;
     use lance_core::{ROW_ID, utils::address::RowAddress};
     use lance_datafusion::datagen::DatafusionDatagenExt;
     use lance_datafusion::exec::{
         ExecutionStatsCallback, ExecutionSummaryCounts, collect_execution_metrics,
     };
+    use lance_datafusion::utils::INDEX_SEGMENTS_SKIPPED_METRIC;
     use lance_datafusion::utils::{
         INDEX_CACHE_HITS_METRIC, INDEX_CACHE_MISSES_METRIC, PARTITIONS_SEARCHED_METRIC,
     };
@@ -9690,5 +9865,155 @@ mod tests {
         let segments = dataset.load_indices_by_name("text_idx").await.unwrap();
         assert_eq!(segments.len(), 1);
         assert_no_stale_rows(&dataset).await;
+    }
+
+    /// `num_segments` appends, each its own FTS segment, with a `userid`
+    /// BTree so a `userid` range is an index-only prefilter whose rows lie
+    /// in a known subset of the segments.
+    async fn fts_segment_fixture(
+        num_segments: usize,
+        rows_per_segment: usize,
+        stable_row_ids: bool,
+    ) -> (Dataset, TempStrDir) {
+        let make = |start: u64| {
+            lance_datagen::gen_batch()
+                .col(
+                    "text",
+                    lance_datagen::array::cycle_utf8_literals(&[
+                        "hello world",
+                        "lance search",
+                        "hello lance",
+                    ]),
+                )
+                .col(
+                    "userid",
+                    lance_datagen::array::step_custom::<arrow::datatypes::UInt64Type>(start, 1),
+                )
+                .into_reader_rows(RowCount::from(rows_per_segment as u64), BatchCount::from(1))
+        };
+        let dir = TempStrDir::default();
+        let mut dataset = Dataset::write(
+            make(0),
+            dir.as_str(),
+            Some(WriteParams {
+                enable_stable_row_ids: stable_row_ids,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["text"],
+                IndexType::Inverted,
+                None,
+                &InvertedIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+        for segment in 1..num_segments {
+            dataset
+                .append(make((segment * rows_per_segment) as u64), None)
+                .await
+                .unwrap();
+            dataset
+                .optimize_indices(&OptimizeOptions::append())
+                .await
+                .unwrap();
+        }
+        dataset
+            .create_index(
+                &["userid"],
+                IndexType::BTree,
+                None,
+                &lance_index::scalar::ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            dataset
+                .load_indices_by_name("text_idx")
+                .await
+                .unwrap()
+                .len(),
+            num_segments
+        );
+        (dataset, dir)
+    }
+
+    /// Every "hello" hit under `filter` as (row id, score), by row id.
+    async fn fts_rows(
+        dataset: &Dataset,
+        filter: &str,
+        prefilter: bool,
+        stats: Option<&StatsHolder>,
+    ) -> Vec<(u64, f32)> {
+        let mut scanner = dataset.scan();
+        scanner
+            .project(&["userid"])
+            .unwrap()
+            .with_row_id()
+            .full_text_search(FullTextSearchQuery::new("hello".to_string()).limit(Some(10_000)))
+            .unwrap()
+            .filter(filter)
+            .unwrap()
+            .prefilter(prefilter);
+        if let Some(stats) = stats {
+            scanner.scan_stats_callback(stats.get_setter());
+        }
+        let batch = scanner.try_into_batch().await.unwrap();
+        let ids = batch.column_by_name(ROW_ID).unwrap();
+        let ids = ids.as_primitive::<UInt64Type>();
+        let scores = batch.column_by_name(SCORE_COL).unwrap();
+        let scores = scores.as_primitive::<Float32Type>();
+        let mut rows: Vec<(u64, f32)> = (0..batch.num_rows())
+            .map(|i| (ids.value(i), scores.value(i)))
+            .collect();
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        rows
+    }
+
+    /// An index-only prefilter whose rows lie in some segments only lets the
+    /// candidate search of the others be skipped; the corpus statistics and
+    /// therefore the scores are those of the unpruned search, and a block
+    /// list proves nothing.
+    #[rstest]
+    #[tokio::test]
+    async fn prefilter_skips_fts_segments_it_excludes(#[values(false, true)] stable_row_ids: bool) {
+        let (dataset, _dir) = fts_segment_fixture(3, 30, stable_row_ids).await;
+        let mut parts_searched = std::collections::HashMap::new();
+        for (filter, expected_skipped) in [
+            ("userid < 30", 2),
+            ("userid >= 60", 2),
+            ("userid >= 30", 1),
+            ("userid < 1000", 0),
+            ("userid > 1000", 3),
+            ("userid != 5", 0),
+        ] {
+            let stats = StatsHolder::default();
+            let pruned = fts_rows(&dataset, filter, true, Some(&stats)).await;
+            let oracle = fts_rows(&dataset, filter, false, None).await;
+            assert_eq!(pruned, oracle, "{filter}");
+            let counts = stats.consume().all_counts;
+            assert_eq!(
+                counts
+                    .get(INDEX_SEGMENTS_SKIPPED_METRIC)
+                    .copied()
+                    .unwrap_or_default(),
+                expected_skipped,
+                "{filter}"
+            );
+            parts_searched.insert(
+                filter,
+                counts
+                    .get(PARTITIONS_SEARCHED_METRIC)
+                    .copied()
+                    .unwrap_or_default(),
+            );
+        }
+        assert!(parts_searched["userid < 30"] < parts_searched["userid < 1000"]);
+        assert_eq!(parts_searched["userid > 1000"], 0);
     }
 }

@@ -28,6 +28,13 @@ impl<T: Clone> SharedPrerequisite<T> {
             .expect("SharedPrerequisite cached value accessed without call to wait_ready")
     }
 
+    /// The value if the prerequisite has already completed successfully,
+    /// without waiting; `None` while it is still running or if it failed
+    /// (the failure is reported by `wait_ready`).
+    pub fn try_get_ready(&self) -> Option<T> {
+        self.0.try_get().and_then(|value| value.ok())
+    }
+
     /// Asynchronously wait for the output to be ready
     ///
     /// Must be called before `get_ready``
