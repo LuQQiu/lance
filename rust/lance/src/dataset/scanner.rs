@@ -4347,7 +4347,7 @@ impl Scanner {
                         & target_fragments;
                     let mut exec =
                         ScalarIndexExec::new(self.dataset.clone(), index_query, result_format)
-                            .with_fragment_scope(fragment_scope);
+                            .with_loading_scope(fragment_scope);
                     if let Some(segment_uuids) = self
                         .scalar_index_selection
                         .as_ref()
@@ -8768,7 +8768,7 @@ impl Scanner {
                     exec = exec.with_segment_uuids(segment_uuids);
                 }
                 if missing_frags.is_empty() && !relevant_frags.is_empty() {
-                    exec = exec.with_fragment_scope(
+                    exec = exec.with_loading_scope(
                         relevant_frags
                             .iter()
                             .map(|fragment| fragment.id as u32)

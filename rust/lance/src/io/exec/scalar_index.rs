@@ -53,7 +53,7 @@ use lance_index::{
 };
 use lance_select::{
     IndexExprResult, NullableIndexExprResult, NullableRowAddrMask, NullableRowAddrSet, RowAddrMask,
-    RowAddrSelection, RowAddrTreeMap, RowSetOps, result::IndexExprResultWireFormat,
+    RowAddrTreeMap, RowSetOps, result::IndexExprResultWireFormat,
 };
 use lance_table::format::Fragment;
 use roaring::RoaringBitmap;
@@ -148,89 +148,37 @@ async fn translate_addr_set_to_row_ids(
     Ok(NullableRowAddrSet::new(selected, nulls))
 }
 
-/// Drop every row outside `scope` from both bounds of `result`.
+/// Intersect both bounds of `result` with the live rows of the `scope`
+/// fragments of `dataset`'s snapshot, which `scope` must be a subset of.
 ///
-/// Confinement is an intersection with the rows of the scoped fragments, applied to the
-/// lower and the upper bound alike, so an exact result stays exact and the bounds of an
-/// inexact one keep their order. Fragments in `scope` that the snapshot does not have are
-/// ignored; when the scope holds every fragment there is nothing to do.
-///
-/// Row addresses name their fragment in the high 32 bits, so address-domain masks are
-/// confined by fragment key: an allow list keeps only scoped keys, a block list gains a
-/// whole-fragment entry per excluded fragment. Row-id masks have no such key, so the scope
-/// is first translated to row ids through the row-id sequences of the smaller side (the
-/// scoped fragments, or the excluded ones); the translation yields ranges and the sequences
-/// are cached, but it does cost one sequence per fragment on that side.
+/// The universe is a positive allow list built from the scoped fragments
+/// alone: in the address domain the row range of each fragment less its
+/// deletions ([`DatasetPreFilter::do_create_restricted_deletion_mask`]),
+/// under stable row ids the live row ids of each fragment
+/// ([`DatasetPreFilter::do_create_deletion_mask_row_id`]). Intersecting
+/// drops everything the masks say about other fragments, fragments the
+/// snapshot no longer has, and deleted rows; an allow list is narrowed and
+/// a block list becomes the universe less the blocked rows. An exact result
+/// stays exact; the bounds of an inexact one keep their order.
 pub(crate) async fn confine_to_fragments(
     result: IndexExprResult,
-    dataset: &Dataset,
+    dataset: &Arc<Dataset>,
     scope: &RoaringBitmap,
 ) -> Result<IndexExprResult> {
-    let all: RoaringBitmap = dataset
-        .fragments()
-        .iter()
-        .map(|fragment| fragment.id as u32)
-        .collect();
-    let inside = &all & scope;
-    let outside = &all - scope;
-    if outside.is_empty() {
-        return Ok(result);
-    }
-    let confine: Box<dyn Fn(RowAddrMask) -> RowAddrMask + Send> = if !dataset
-        .manifest
-        .uses_stable_row_ids()
-    {
-        Box::new(move |mask| match mask {
-            RowAddrMask::AllowList(mut allow) => {
-                allow.retain_fragments_in(&inside);
-                RowAddrMask::AllowList(allow)
-            }
-            RowAddrMask::BlockList(mut block) => {
-                for fragment in outside.iter() {
-                    block.insert_fragment(fragment);
-                }
-                let blocks_everything = all
-                    .iter()
-                    .all(|fragment| matches!(block.get(&fragment), Some(RowAddrSelection::Full)));
-                if blocks_everything {
-                    RowAddrMask::allow_nothing()
-                } else {
-                    RowAddrMask::BlockList(block)
-                }
-            }
-        })
-    } else if inside.len() <= outside.len() {
-        let inside_ids = row_ids_of_fragments(dataset, &inside).await?;
-        Box::new(move |mask| match mask {
-            RowAddrMask::AllowList(allow) => RowAddrMask::AllowList(allow & &inside_ids),
-            RowAddrMask::BlockList(block) => RowAddrMask::AllowList(inside_ids.clone() - &block),
-        })
+    let universe = if dataset.manifest.uses_stable_row_ids() {
+        DatasetPreFilter::do_create_deletion_mask_row_id(dataset.clone(), Some(scope.clone()))
+            .await?
     } else {
-        let outside_ids = row_ids_of_fragments(dataset, &outside).await?;
-        Box::new(move |mask| match mask {
-            RowAddrMask::AllowList(allow) => RowAddrMask::AllowList(allow - &outside_ids),
-            RowAddrMask::BlockList(block) => RowAddrMask::BlockList(block | &outside_ids),
-        })
+        DatasetPreFilter::do_create_restricted_deletion_mask(dataset.clone(), scope.clone()).await?
     };
-    let IndexExprResult { lower, upper, .. } = result.clone();
-    if result.is_exact() {
-        Ok(IndexExprResult::exact(confine(lower)))
+    let confine = |mask: RowAddrMask| mask.intersect(universe.as_ref().clone());
+    let exact = result.is_exact();
+    let IndexExprResult { lower, upper, .. } = result;
+    Ok(if exact {
+        IndexExprResult::exact(confine(lower))
     } else {
-        Ok(IndexExprResult::new(confine(lower), confine(upper)))
-    }
-}
-
-/// The row ids of every row (live or deleted) of `fragments`, as ranges where the
-/// sequences allow it.
-async fn row_ids_of_fragments(
-    dataset: &Dataset,
-    fragments: &RoaringBitmap,
-) -> Result<RowAddrTreeMap> {
-    let mut addrs = RowAddrTreeMap::new();
-    for fragment in fragments.iter() {
-        addrs.insert_fragment(fragment);
-    }
-    translate_addr_treemap_to_row_ids(dataset, &addrs).await
+        IndexExprResult::new(confine(lower), confine(upper))
+    })
 }
 
 /// An execution node that performs a scalar index search
@@ -248,6 +196,10 @@ pub struct ScalarIndexExec {
     metrics: ExecutionPlanMetricsSet,
     result_format: IndexExprResultWireFormat,
     fragment_scope: Option<Arc<RoaringBitmap>>,
+    /// Whether `fragment_scope` also bounds the emitted masks (see
+    /// [`Self::with_fragment_scope`]) or only selects the segments to load
+    /// (see [`Self::with_loading_scope`]).
+    confine_output: bool,
     segment_uuids: Option<Arc<HashSet<uuid::Uuid>>>,
 }
 
@@ -283,32 +235,63 @@ impl ScalarIndexExec {
             metrics: ExecutionPlanMetricsSet::new(),
             result_format,
             fragment_scope: None,
+            confine_output: false,
             segment_uuids: None,
         }
     }
 
-    /// Restrict the node to `fragments`.
+    /// Restrict the node to `fragments`: load only the index segments that
+    /// can intersect them, and emit masks that admit no row outside them.
     ///
-    /// Two things follow. Only the physical index segments that can intersect these
-    /// fragments are loaded, and the emitted masks admit no row outside them: both bounds
-    /// of the result are confined after the complete expression, including any `NOT`, has
-    /// been evaluated, so a complement cannot re-admit rows of excluded fragments. The
-    /// result keeps its exactness, its NULL handling (NULL rows never match, before and
-    /// after confinement) and the form of each bound: an allow list drops the entries of
-    /// other fragments, a block list gains whole-fragment entries for them, neither
-    /// enumerates rows. `fragments_covered` is intersected with the scope as well. An empty
-    /// scope yields an exact, empty allow list. Without a scope the output is unrestricted.
+    /// Both bounds of the result are intersected, after the complete
+    /// expression (including any `NOT`) has been evaluated, with the live
+    /// rows of the scoped fragments of this node's dataset snapshot. That
+    /// positive set is the whole universe of the output: rows of other
+    /// fragments, of fragments the snapshot no longer has, and rows deleted
+    /// in the scoped fragments are all outside it. Exactness is kept, as is
+    /// the NULL handling (a NULL row never matches, before or after), and
+    /// `fragments_covered` is intersected with the scope too. Both bounds
+    /// come out as allow lists. An empty scope, or one naming only fragments
+    /// the snapshot lacks, yields an exact empty allow list; without a scope
+    /// the output is unrestricted and the node behaves as before.
     ///
-    /// The scope names fragments of this node's dataset snapshot. With stable row ids the
-    /// masks carry row ids rather than addresses, so the scope is translated through the
-    /// row-id sequences of either the scoped fragments or the remaining ones, whichever
-    /// are fewer; the sequences come from the dataset's metadata cache and translate as
-    /// ranges, not as individual rows.
+    /// Cost: the universe is built once per execution from the scoped
+    /// fragments only, never from the rest of the table. In the address
+    /// domain it is one row range per scoped fragment (plus its deletion
+    /// vector, when it has one); under stable row ids the masks carry row
+    /// ids, so it is each scoped fragment's row-id sequence, as ranges where
+    /// the sequence is contiguous and as bitmaps where it has holes, read
+    /// through the dataset's metadata cache. The consumer remains responsible
+    /// for any data-level recheck the result asks for.
     ///
-    /// The consumer remains responsible for the deletion mask and any data-level recheck
-    /// the result asks for.
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # use lance::Dataset;
+    /// # use lance::io::exec::scalar_index::ScalarIndexExec;
+    /// # use lance_index::scalar::expression::ScalarIndexExpr;
+    /// # use lance_select::result::IndexExprResultWireFormat;
+    /// # use roaring::RoaringBitmap;
+    /// # fn plan(dataset: Arc<Dataset>, expr: ScalarIndexExpr) -> ScalarIndexExec {
+    /// // Only fragments 3 and 7 may appear in the emitted masks, whatever
+    /// // the expression says about the others.
+    /// ScalarIndexExec::new(dataset, expr, IndexExprResultWireFormat::default())
+    ///     .with_fragment_scope(RoaringBitmap::from_iter([3u32, 7]))
+    /// # }
+    /// ```
     pub fn with_fragment_scope(mut self, fragments: RoaringBitmap) -> Self {
         self.fragment_scope = Some(Arc::new(fragments));
+        self.confine_output = true;
+        self
+    }
+
+    /// Restrict which physical scalar index segments are loaded, and nothing
+    /// else: the result mask may still name rows of other fragments. For a
+    /// consumer that applies the exact fragment scope itself (the filtered
+    /// read does) this avoids building the output universe of
+    /// [`Self::with_fragment_scope`].
+    pub(crate) fn with_loading_scope(mut self, fragments: RoaringBitmap) -> Self {
+        self.fragment_scope = Some(Arc::new(fragments));
+        self.confine_output = false;
         self
     }
 
@@ -369,6 +352,7 @@ impl ScalarIndexExec {
         plan_metrics: ExecutionPlanMetricsSet,
         result_format: IndexExprResultWireFormat,
         fragment_scope: Option<Arc<RoaringBitmap>>,
+        confine_output: bool,
         segment_uuids: Option<Arc<HashSet<uuid::Uuid>>>,
     ) -> Result<RecordBatch> {
         let metrics = IndexMetrics::new(&plan_metrics, 0);
@@ -415,8 +399,8 @@ impl ScalarIndexExec {
             }
         };
         let query_result = match fragment_scope.as_deref() {
-            Some(fragments) if !fragments.is_empty() => {
-                confine_to_fragments(query_result, dataset.as_ref(), fragments).await?
+            Some(fragments) if confine_output && !fragments.is_empty() => {
+                confine_to_fragments(query_result, &dataset, fragments).await?
             }
             _ => query_result,
         };
@@ -506,6 +490,7 @@ impl ExecutionPlan for ScalarIndexExec {
             self.metrics.clone(),
             self.result_format,
             self.fragment_scope.clone(),
+            self.confine_output,
             self.segment_uuids.clone(),
         );
         let stream = futures::stream::iter(vec![batch_fut])
@@ -1437,7 +1422,7 @@ mod tests {
         },
     };
     use lance_select::{
-        RowAddrSelection, RowAddrTreeMap, RowSetOps,
+        RowAddrTreeMap, RowSetOps,
         result::{IndexExprResult, IndexExprResultWireFormat},
     };
     use roaring::RoaringBitmap;
@@ -2037,32 +2022,39 @@ mod tests {
         }
 
         // Form: the allow list of `ordered < 47` over fragment 4 names only that
-        // fragment; the block list of its complement over fragments 3..5 names the
-        // other seven fragments whole and keeps the scoped ones partial.
+        // fragment; its complement over fragments 3..5 is an allow list too,
+        // holding exactly the scoped rows that are not below 47, and neither
+        // admits an address of a fragment the snapshot never had.
+        let foreign: u64 = RowAddress::new_from_parts(99, 0).into();
         let (result, _) = run_scoped(&dataset, below("ordered", u(47)), Some(&scope([4]))).await;
         let allow = result.lower.allow_list().unwrap();
         assert!(allow.iter().all(|(fragment, _)| *fragment == 4));
         assert_eq!(allow.len(), Some(7));
+        assert!(!result.lower.selected(foreign));
         let (result, _) = run_scoped(
             &dataset,
             not(below("ordered", u(47))),
             Some(&scope([3, 4, 5])),
         )
         .await;
-        let block = result.lower.block_list().unwrap();
-        for fragment in [0, 1, 2, 6, 7, 8, 9] {
-            assert_eq!(block.get(&fragment), Some(&RowAddrSelection::Full));
-        }
-        assert!(matches!(block.get(&3), Some(RowAddrSelection::Partial(_))));
-        assert!(matches!(block.get(&4), Some(RowAddrSelection::Partial(_))));
-        assert!(block.get(&5).is_none());
-        // Without a scope the complement admits every other fragment.
+        let allow = result.lower.allow_list().unwrap();
+        assert!(
+            allow.get(&3).is_none(),
+            "every row of fragment 3 is below 47"
+        );
+        assert_eq!(allow.get_fragment_bitmap(4).unwrap().len(), 3);
+        assert!(allow.get(&5).is_some());
+        assert_eq!(allow.len(), Some(13));
+        assert!(!result.lower.selected(foreign) && !result.upper.selected(foreign));
+        // Without a scope the complement admits every other fragment, and
+        // addresses outside the snapshot as well: the node is unchanged there.
         let (result, _) = run_scoped(&dataset, not(below("ordered", u(47))), None).await;
         assert!(
             result
                 .lower
                 .selected(RowAddress::new_from_parts(9, 5).into())
         );
+        assert!(result.lower.selected(foreign));
         // An empty scope is an exact, empty allow list.
         let (result, _) =
             run_scoped(&dataset, not(below("ordered", u(47))), Some(&scope([]))).await;
@@ -2218,7 +2210,42 @@ mod tests {
                 .lower
                 .selected(RowAddress::new_from_parts(1, 0).into())
         );
-        assert!(result.lower.block_list().is_some());
+        assert!(result.lower.allow_list().is_some());
+    }
+
+    /// A fragment withdrawn from the snapshot (deleted whole) still has its
+    /// rows in the index until a remap; the output universe is the scoped
+    /// fragments of the snapshot, so those rows never appear, not even when
+    /// the scope names every remaining fragment. Without a scope the node is
+    /// unchanged and still names them.
+    #[tokio::test]
+    async fn fragment_scope_excludes_withdrawn_fragments() {
+        let TestFixture {
+            dataset,
+            _tmp_dir_guard,
+        } = test_fixture().await;
+        let mut dataset = Arc::try_unwrap(dataset).unwrap();
+        dataset.delete("ordered < 10").await.unwrap();
+        let remaining: Vec<u32> = dataset.fragments().iter().map(|f| f.id as u32).collect();
+        assert_eq!(remaining, (1..10).collect::<Vec<_>>());
+        let dataset = Arc::new(dataset);
+        let rows = rows_of(&dataset, &["ordered"]).await;
+        let withdrawn: u64 = RowAddress::new_from_parts(0, 7).into();
+        let u = |v: u64| ScalarValue::UInt64(Some(v));
+        let lt5 = |row: &[Option<i64>]| row[0].map(|x| x < 5);
+        for scope in [Some(scope([1, 2])), Some(scope(remaining.iter().copied()))] {
+            let (result, _) =
+                run_scoped(&dataset, not(below("ordered", u(5))), scope.as_ref()).await;
+            check_confined(&result, &rows, scope.as_ref(), &|r| not3(lt5(r)));
+            assert!(!result.lower.selected(withdrawn), "{scope:?}");
+            assert!(
+                result
+                    .lower
+                    .selected(RowAddress::new_from_parts(1, 0).into())
+            );
+        }
+        let (result, _) = run_scoped(&dataset, not(below("ordered", u(5))), None).await;
+        assert!(result.lower.selected(withdrawn));
     }
 
     /// Stable row ids: masks carry row ids, so the scope is translated through the
@@ -2292,16 +2319,14 @@ mod tests {
             ],
         )
         .await;
-        // Block form survives the translated confinement on the large side.
-        let (result, _) = run_scoped(
-            &dataset,
-            not(below("id", i(12))),
-            Some(&scope([0, 1, 2, 3, 4])),
-        )
-        .await;
-        assert!(result.lower.block_list().is_some());
-        let (result, _) = run_scoped(&dataset, not(below("id", i(12))), Some(&scope([2]))).await;
-        assert!(result.lower.allow_list().is_some());
+        // Complements come out as allow lists of translated row ids, whatever
+        // the scope's size, and never name a row id outside the snapshot.
+        for fragments in [vec![0, 1, 2, 3, 4], vec![2]] {
+            let (result, _) =
+                run_scoped(&dataset, not(below("id", i(12))), Some(&scope(fragments))).await;
+            assert!(result.lower.allow_list().is_some());
+            assert!(!result.lower.selected(10_000));
+        }
 
         let mut dataset = Arc::try_unwrap(dataset).unwrap();
         dataset.delete("id % 4 = 0").await.unwrap();
@@ -2327,6 +2352,15 @@ mod tests {
             ],
         )
         .await;
+        // Row ids of the deleted rows (id % 4 = 0, stable ids equal the ids
+        // here) are gone from every sequence and so from every scoped result.
+        for fragments in [vec![fragments[0]], fragments.clone()] {
+            let (result, _) =
+                run_scoped(&dataset, not(below("id", i(12))), Some(&scope(fragments))).await;
+            for deleted in [12u64, 16, 20, 24, 28] {
+                assert!(!result.lower.selected(deleted));
+            }
+        }
     }
 
     /// Two index segments with disjoint coverage: a scope inside one, the other,

@@ -174,7 +174,7 @@ impl DatasetPreFilter {
 
     /// Keep the live address domain explicit: a staged index can physically
     /// retain rows whose fragments were pruned from its committed coverage.
-    async fn do_create_restricted_deletion_mask(
+    pub(crate) async fn do_create_restricted_deletion_mask(
         dataset: Arc<Dataset>,
         fragments: RoaringBitmap,
     ) -> Result<Arc<RowAddrMask>> {
@@ -206,7 +206,7 @@ impl DatasetPreFilter {
     }
 
     #[instrument(level = "debug", skip_all)]
-    pub(super) async fn do_create_deletion_mask_row_id(
+    pub(crate) async fn do_create_deletion_mask_row_id(
         dataset: Arc<Dataset>,
         restrict_to: Option<RoaringBitmap>,
     ) -> Result<Arc<RowAddrMask>> {
