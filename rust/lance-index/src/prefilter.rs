@@ -58,14 +58,17 @@ pub trait PreFilter: Send + Sync {
     /// This method must be called after `wait_for_ready`
     fn mask(&self) -> Arc<RowAddrMask>;
 
-    /// The mask if it is already available, without waiting.
+    /// Whether the loaded filter proves that no row at all can pass it.
     ///
-    /// Searches that can skip whole index segments once the filter is known
-    /// ask this before starting work; `None` means the filter is still
-    /// loading (or the implementation cannot tell) and the search proceeds
-    /// as if nothing were known yet.
-    fn ready_mask(&self) -> Option<Arc<RowAddrMask>> {
-        None
+    /// This is the opposite end of the scale from [`Self::is_empty`], which
+    /// says the filter restricts nothing. It is true only once the mask is
+    /// known to be an empty allow list, so it must be read after
+    /// `wait_for_ready`; before that, and for a block list of any size, it
+    /// is false. Index searches use it to skip candidate scoring for a
+    /// segment whose own mask selects nothing, so implementations answer
+    /// from their stored mask without scanning it.
+    fn selects_nothing(&self) -> bool {
+        false
     }
 
     /// Check whether a slice of row ids should be included in a query.
@@ -92,10 +95,6 @@ impl PreFilter for NoFilter {
 
     fn mask(&self) -> Arc<RowAddrMask> {
         Arc::new(RowAddrMask::all_rows())
-    }
-
-    fn ready_mask(&self) -> Option<Arc<RowAddrMask>> {
-        Some(self.mask())
     }
 
     fn filter_row_ids<'a>(&self, row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64> {

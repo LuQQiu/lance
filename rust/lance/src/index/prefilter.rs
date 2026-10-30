@@ -401,28 +401,10 @@ impl DatasetPreFilter {
     }
 }
 
-impl DatasetPreFilter {
-    /// The final mask from prerequisites that are known to be ready.
-    fn combine_ready_masks(&self) -> RowAddrMask {
-        let mut combined = RowAddrMask::default();
-        if let Some(filtered_ids) = &self.filtered_ids {
-            combined = combined & filtered_ids.get_ready().as_ref().clone();
-        }
-        if let Some(deleted_ids) = &self.deleted_ids {
-            combined = combined & (*deleted_ids.get_ready()).clone();
-        }
-        if let Some(deleted) = &self.deleted_fragments {
-            let mut block_list = RowAddrTreeMap::new();
-            for frag_id in deleted.iter() {
-                block_list.insert_fragment(frag_id);
-            }
-            combined = combined & RowAddrMask::from_block(block_list);
-        }
-        if let Some(overlay_block) = &self.overlay_block {
-            combined = combined & overlay_block.clone();
-        }
-        combined
-    }
+/// Whether `mask` is known to pass no row: an empty allow list. Block lists
+/// never prove this, whatever they hold.
+pub(crate) fn mask_selects_nothing(mask: &RowAddrMask) -> bool {
+    matches!(mask, RowAddrMask::AllowList(rows) if rows.is_empty())
 }
 
 /// Whether a prefilter `mask` can select any row of one index segment.
@@ -467,7 +449,26 @@ impl PreFilter for DatasetPreFilter {
             deleted_ids.wait_ready().await?;
         }
         let final_mask = self.final_mask.lock().unwrap();
-        final_mask.get_or_init(|| Arc::new(self.combine_ready_masks()));
+        final_mask.get_or_init(|| {
+            let mut combined = RowAddrMask::default();
+            if let Some(filtered_ids) = &self.filtered_ids {
+                combined = combined & filtered_ids.get_ready().as_ref().clone();
+            }
+            if let Some(deleted_ids) = &self.deleted_ids {
+                combined = combined & (*deleted_ids.get_ready()).clone();
+            }
+            if let Some(deleted) = &self.deleted_fragments {
+                let mut block_list = RowAddrTreeMap::new();
+                for frag_id in deleted.iter() {
+                    block_list.insert_fragment(frag_id);
+                }
+                combined = combined & RowAddrMask::from_block(block_list);
+            }
+            if let Some(overlay_block) = &self.overlay_block {
+                combined = combined & overlay_block.clone();
+            }
+            Arc::new(combined)
+        });
 
         Ok(())
     }
@@ -489,27 +490,12 @@ impl PreFilter for DatasetPreFilter {
             .clone()
     }
 
-    fn ready_mask(&self) -> Option<Arc<RowAddrMask>> {
-        let final_mask = self.final_mask.lock().unwrap();
-        if let Some(mask) = final_mask.get() {
-            return Some(mask.clone());
-        }
-        let filtered_ready = self
-            .filtered_ids
-            .as_ref()
-            .is_none_or(|ids| ids.try_get_ready().is_some());
-        let deleted_ready = self
-            .deleted_ids
-            .as_ref()
-            .is_none_or(|ids| ids.try_get_ready().is_some());
-        if !filtered_ready || !deleted_ready {
-            return None;
-        }
-        Some(
-            final_mask
-                .get_or_init(|| Arc::new(self.combine_ready_masks()))
-                .clone(),
-        )
+    fn selects_nothing(&self) -> bool {
+        self.final_mask
+            .lock()
+            .unwrap()
+            .get()
+            .is_some_and(|mask| mask_selects_nothing(mask))
     }
 
     /// Check whether a slice of row ids should be included in a query.
@@ -527,6 +513,22 @@ impl PreFilter for DatasetPreFilter {
 #[cfg(test)]
 mod test {
     use lance_select::RowSetOps;
+
+    /// Only an empty allow list selects nothing; a block list, even of
+    /// every row the caller knows about, never proves it.
+    #[test]
+    fn selects_nothing_needs_an_empty_allow_list() {
+        use super::mask_selects_nothing;
+        use lance_select::{RowAddrMask, RowAddrTreeMap};
+        let mut rows = RowAddrTreeMap::new();
+        rows.insert_fragment(0);
+        assert!(mask_selects_nothing(&RowAddrMask::allow_nothing()));
+        assert!(!mask_selects_nothing(&RowAddrMask::from_allowed(
+            rows.clone()
+        )));
+        assert!(!mask_selects_nothing(&RowAddrMask::from_block(rows)));
+        assert!(!mask_selects_nothing(&RowAddrMask::all_rows()));
+    }
 
     /// Emptiness is proven only from the mask and a known row set or, in
     /// the address domain, known coverage; unknown coverage, a row-id mask

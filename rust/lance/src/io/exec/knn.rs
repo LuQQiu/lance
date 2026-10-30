@@ -49,8 +49,7 @@ use lance_core::{
 };
 use lance_datafusion::utils::{
     DELTAS_SEARCHED_METRIC, ExecutionPlanMetricsSetExt, FIND_PARTITIONS_ELAPSED_METRIC,
-    INDEX_SEGMENTS_SKIPPED_LATE_METRIC, INDEX_SEGMENTS_SKIPPED_METRIC, PARTITIONS_RANKED_METRIC,
-    PARTITIONS_SEARCHED_METRIC,
+    INDEX_SEGMENTS_SKIPPED_METRIC, PARTITIONS_RANKED_METRIC, PARTITIONS_SEARCHED_METRIC,
 };
 use lance_index::metrics::{IndexTimer, IndexTiming, MetricsCollector};
 use lance_index::prefilter::PreFilter;
@@ -71,7 +70,7 @@ use uuid::Uuid;
 
 use crate::dataset::Dataset;
 use crate::index::DatasetIndexInternalExt;
-use crate::index::prefilter::{DatasetPreFilter, FilterLoader, prefilter_may_match_segment};
+use crate::index::prefilter::{DatasetPreFilter, FilterLoader, mask_selects_nothing};
 use crate::index::vector::utils::{get_vector_type, validate_distance_type_for};
 use crate::session::index_caches::SegmentOwnershipMaskKey;
 use crate::{Error, Result};
@@ -117,7 +116,6 @@ pub struct AnnIndexMetrics {
     index_metrics: IndexMetrics,
     partitions_searched: Count,
     segments_skipped: Count,
-    segments_skipped_late: Count,
     baseline_metrics: BaselineMetrics,
 }
 
@@ -127,7 +125,6 @@ impl AnnIndexMetrics {
             index_metrics: IndexMetrics::new(metrics, partition),
             partitions_searched: metrics.new_count(PARTITIONS_SEARCHED_METRIC, partition),
             segments_skipped: metrics.new_count(INDEX_SEGMENTS_SKIPPED_METRIC, partition),
-            segments_skipped_late: metrics.new_count(INDEX_SEGMENTS_SKIPPED_LATE_METRIC, partition),
             baseline_metrics: BaselineMetrics::new(metrics, partition),
         }
     }
@@ -1802,16 +1799,12 @@ impl PreFilter for SegmentPreFilter {
         false
     }
 
-    fn ready_mask(&self) -> Option<Arc<RowAddrMask>> {
-        let base = self.base.ready_mask()?;
-        let mut final_mask = self.final_mask.lock().unwrap();
-        Some(
-            final_mask
-                .get_or_insert_with(|| {
-                    Arc::new(base.as_ref().clone() & self.ownership_mask.as_ref().clone())
-                })
-                .clone(),
-        )
+    fn selects_nothing(&self) -> bool {
+        self.final_mask
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|mask| mask_selects_nothing(mask))
     }
 
     fn needs_partition_row_ids(&self) -> bool {
@@ -1838,20 +1831,6 @@ impl PreFilter for SegmentPreFilter {
 
 /// The cached [`SegmentOwnershipMaskKey`] entry of `index` at the dataset's
 /// version; `None` when the segment needs no restriction.
-/// Whether an already available prefilter proves that a delta covering
-/// `coverage` holds no selectable row. A prefilter that is still loading
-/// proves nothing here: the delta's early search then starts as usual and
-/// the late search asks again once the prefilter is complete.
-fn prefilter_excludes_delta_now(
-    prefilter: &dyn PreFilter,
-    coverage: Option<&RoaringBitmap>,
-    address_domain: bool,
-) -> bool {
-    prefilter
-        .ready_mask()
-        .is_some_and(|mask| !prefilter_may_match_segment(&mask, None, coverage, address_domain))
-}
-
 async fn segment_ownership_mask(
     dataset: &Arc<Dataset>,
     index: &IndexMetadata,
@@ -2021,21 +2000,6 @@ impl ANNIvfSubIndexExec {
             .boxed()
     }
 
-    /// The stream of a delta the prefilter excludes: no partition is
-    /// probed, but the delta still reaches the early-search barrier so its
-    /// siblings' late search is not stranded.
-    fn skipped_delta(
-        state: Arc<ANNIvfEarlySearchResults>,
-    ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
-        stream::once(async move {
-            state.wait_for_minimum_to_finish().await;
-        })
-        .filter_map(|()| async { None::<DataFusionResult<RecordBatch>> })
-    }
-
-    /// `coverage` is the delta's fragment bitmap; with `address_domain` it
-    /// lets the late search drop a delta the prefilter, ready by then, has
-    /// proven empty.
     #[allow(clippy::too_many_arguments)]
     fn late_search(
         index: Arc<dyn VectorIndex>,
@@ -2048,8 +2012,6 @@ impl ANNIvfSubIndexExec {
         state: Arc<ANNIvfEarlySearchResults>,
         target_partitions: usize,
         seg_mask: Option<Arc<RowAddrMask>>,
-        coverage: Option<RoaringBitmap>,
-        address_domain: bool,
     ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
         let stream = futures::stream::once(async move {
             let max_nprobes = query
@@ -2061,18 +2023,15 @@ impl ANNIvfSubIndexExec {
             // Every delta must reach the barrier, even if it has no partitions left
             // to search, so that siblings waiting for the initial search can proceed.
             let found_so_far = state.wait_for_minimum_to_finish().await;
-            // The prefilter is complete by now; a delta it excludes has nothing
-            // left to find, whatever the probe budget says.
+            // The prefilter is complete by now. A delta whose own mask selects
+            // nothing had its initial partitions loaded but not scored, and has
+            // nothing left to find whatever the probe budget says; this is where
+            // it is counted, once.
             if let Err(err) = prefilter.wait_for_ready().await {
                 return stream::once(async move { Err(DataFusionError::from(err)) }).boxed();
             }
-            if !prefilter_may_match_segment(
-                &prefilter.mask(),
-                None,
-                coverage.as_ref(),
-                address_domain,
-            ) {
-                metrics.segments_skipped_late.add(1);
+            if prefilter.selects_nothing() {
+                metrics.segments_skipped.add(1);
                 return futures::stream::empty().boxed();
             }
             if max_nprobes <= min_nprobes {
@@ -2498,21 +2457,6 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                             pre_filter.clone(),
                         )
                         .await?;
-                        // A prefilter that is already known proves, before the
-                        // index is opened or any partition is read, whether this
-                        // delta can hold a selectable row. While it is still
-                        // loading the early search starts as before and the late
-                        // search asks again at the barrier, where it is complete.
-                        let coverage = index_metadata.fragment_bitmap.clone();
-                        let address_domain = !ds.manifest.uses_stable_row_ids();
-                        if prefilter_excludes_delta_now(
-                            segment_pre_filter.as_ref(),
-                            coverage.as_ref(),
-                            address_domain,
-                        ) {
-                            metrics.segments_skipped.add(1);
-                            return DataFusionResult::Ok(Self::skipped_delta(state).boxed());
-                        }
                         let raw_index = {
                             let _open_timer = IndexTimer::new(&metrics.index_metrics, IndexTiming::IndexOpen);
                             ds.open_vector_index(&column, &index_uuid, &metrics.index_metrics).await?
@@ -2558,8 +2502,6 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                             state,
                             target_partitions,
                             seg_mask,
-                            coverage,
-                            address_domain,
                         );
                         DataFusionResult::Ok(early_search.chain(late_search).boxed())
                     }
@@ -4451,8 +4393,6 @@ mod tests {
             state.clone(),
             usize::MAX,
             None,
-            None,
-            true,
         )
         .try_collect::<Vec<_>>()
         .await
@@ -4575,8 +4515,6 @@ mod tests {
             state.clone(),
             usize::MAX,
             Some(seg_mask),
-            None,
-            true,
         )
         .try_collect::<Vec<_>>()
         .await
@@ -4656,8 +4594,6 @@ mod tests {
             state.clone(),
             usize::MAX,
             Some(seg_mask),
-            None,
-            true,
         )
         .try_collect::<Vec<_>>()
         .await
@@ -4691,8 +4627,6 @@ mod tests {
             state.clone(),
             usize::MAX,
             None,
-            None,
-            true,
         )
         .try_collect::<Vec<_>>();
 
@@ -4712,8 +4646,6 @@ mod tests {
             state,
             usize::MAX,
             None,
-            None,
-            true,
         )
         .try_collect::<Vec<_>>();
 
@@ -5628,28 +5560,24 @@ mod tests {
         assert_eq!(results.num_rows(), 0);
 
         let stats = stats_holder.consume();
-        // The prefilter excludes every delta. A delta whose prefilter was
-        // already available at its start did no initial search at all; the
-        // others ran their initial probes and skipped the late search at
-        // the barrier. Either way every delta is accounted for exactly once.
-        let early = stats
-            .all_counts
-            .get(INDEX_SEGMENTS_SKIPPED_METRIC)
-            .copied()
-            .unwrap_or_default();
-        let late = stats
-            .all_counts
-            .get(INDEX_SEGMENTS_SKIPPED_LATE_METRIC)
-            .copied()
-            .unwrap_or_default();
-        assert_eq!(early + late, num_deltas);
+        // The prefilter excludes every delta: each runs its initial probes
+        // (loaded, scored as nothing), is counted once at the barrier and
+        // probes no further.
+        assert_eq!(
+            stats
+                .all_counts
+                .get(INDEX_SEGMENTS_SKIPPED_METRIC)
+                .copied()
+                .unwrap_or_default(),
+            num_deltas
+        );
         assert_eq!(
             stats
                 .all_counts
                 .get(PARTITIONS_SEARCHED_METRIC)
                 .copied()
                 .unwrap_or_default(),
-            initial_nprobes * (num_deltas - early)
+            initial_nprobes * num_deltas
         );
         assert_find_partitions_elapsed_recorded(&stats);
     }
@@ -5741,28 +5669,24 @@ mod tests {
 
         let stats = stats_holder.consume();
 
-        // Only the first delta holds rows below 20. The others are skipped
-        // before their index opens when the prefilter is already available,
-        // or after their minimum probes at the barrier; the first delta
-        // searches its minimum probes and then stops early.
-        let early = stats
-            .all_counts
-            .get(INDEX_SEGMENTS_SKIPPED_METRIC)
-            .copied()
-            .unwrap_or_default();
-        let late = stats
-            .all_counts
-            .get(INDEX_SEGMENTS_SKIPPED_LATE_METRIC)
-            .copied()
-            .unwrap_or_default();
-        assert_eq!(early + late, num_deltas - 1);
+        // Only the first delta holds rows below 20. Every delta runs its
+        // minimum probes; the others are counted as skipped at the barrier
+        // and the first stops early with its results.
+        assert_eq!(
+            stats
+                .all_counts
+                .get(INDEX_SEGMENTS_SKIPPED_METRIC)
+                .copied()
+                .unwrap_or_default(),
+            num_deltas - 1
+        );
         assert_eq!(
             stats
                 .all_counts
                 .get(PARTITIONS_SEARCHED_METRIC)
                 .copied()
                 .unwrap_or_default(),
-            initial_nprobes * (num_deltas - early)
+            initial_nprobes * num_deltas
         );
         assert_find_partitions_elapsed_recorded(&stats);
         assert_eq!(results.num_rows(), 20);
@@ -5870,8 +5794,8 @@ mod tests {
             self.0.clone()
         }
 
-        fn ready_mask(&self) -> Option<Arc<RowAddrMask>> {
-            Some(self.0.clone())
+        fn selects_nothing(&self) -> bool {
+            mask_selects_nothing(&self.0)
         }
 
         fn filter_row_ids<'a>(&self, row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64> {
@@ -5879,76 +5803,80 @@ mod tests {
         }
     }
 
-    /// A prefilter whose mask is known only after `wait_for_ready`.
-    struct DelayedPreFilter(Arc<RowAddrMask>);
-
-    #[async_trait::async_trait]
-    impl PreFilter for DelayedPreFilter {
-        async fn wait_for_ready(&self) -> Result<()> {
-            Ok(())
+    /// A segment's prefilter selects nothing only once its own mask is
+    /// ready and is an empty allow list: a base filter that keeps a row of
+    /// another fragment, intersected with the segment's ownership, proves
+    /// it; a segment that owns the selected fragment does not. Before
+    /// readiness nothing is claimed.
+    #[tokio::test]
+    async fn segment_prefilter_selects_nothing_from_its_ready_mask() {
+        let (dataset, _dir) = delta_fixture(1, 10, false).await;
+        let dataset = Arc::new(dataset);
+        let indices = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        struct MaskLoader(RowAddrMask);
+        #[async_trait::async_trait]
+        impl FilterLoader for MaskLoader {
+            async fn load(self: Box<Self>) -> Result<RowAddrMask> {
+                Ok(self.0)
+            }
         }
-
-        fn is_empty(&self) -> bool {
-            false
-        }
-
-        fn mask(&self) -> Arc<RowAddrMask> {
-            self.0.clone()
-        }
-
-        fn filter_row_ids<'a>(&self, row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64> {
-            self.0.selected_indices(row_ids)
-        }
+        let owning = |fragments: &[u32]| {
+            let mut owned = RowAddrTreeMap::new();
+            for fragment in fragments {
+                owned.insert_fragment(*fragment);
+            }
+            Arc::new(RowAddrMask::from_allowed(owned))
+        };
+        let base = |mask: RowAddrMask| {
+            Arc::new(DatasetPreFilter::new(
+                dataset.clone(),
+                &indices,
+                Some(Box::new(MaskLoader(mask)) as Box<dyn FilterLoader>),
+            ))
+        };
+        let mut first_row = RowAddrTreeMap::new();
+        first_row.insert(0);
+        let base_allow = base(RowAddrMask::from_allowed(first_row));
+        let other = SegmentPreFilter::new(base_allow.clone(), owning(&[1]));
+        assert!(
+            !other.selects_nothing(),
+            "nothing is known before readiness"
+        );
+        other.wait_for_ready().await.unwrap();
+        assert!(other.selects_nothing());
+        assert!(!base_allow.selects_nothing(), "the base filter keeps a row");
+        let owner = SegmentPreFilter::new(base_allow, owning(&[0]));
+        owner.wait_for_ready().await.unwrap();
+        assert!(!owner.selects_nothing());
+        let empty = base(RowAddrMask::allow_nothing());
+        assert!(
+            !empty.selects_nothing(),
+            "nothing is known before readiness"
+        );
+        empty.wait_for_ready().await.unwrap();
+        assert!(empty.selects_nothing());
     }
 
-    /// The pre-open skip fires only for a prefilter that is already
-    /// available and excludes the delta's coverage; a delayed prefilter, a
-    /// selectable fragment, unknown coverage or a row-id mask all let the
-    /// delta start its index work.
-    #[test]
-    fn pre_open_skip_needs_an_available_excluding_prefilter() {
-        let mut allow = lance_select::RowAddrTreeMap::new();
-        allow.insert_fragment(3);
-        let mask = Arc::new(RowAddrMask::from_allowed(allow));
-        let ready = FixedPreFilter(mask.clone());
-        let delayed = DelayedPreFilter(mask);
-        let others = RoaringBitmap::from_iter([0u32, 1]);
-        let mixed = RoaringBitmap::from_iter([1u32, 3]);
-        assert!(prefilter_excludes_delta_now(&ready, Some(&others), true));
-        assert!(!prefilter_excludes_delta_now(&delayed, Some(&others), true));
-        assert!(!prefilter_excludes_delta_now(&ready, Some(&mixed), true));
-        assert!(!prefilter_excludes_delta_now(&ready, None, true));
-        assert!(!prefilter_excludes_delta_now(&ready, Some(&others), false));
-        let empty = FixedPreFilter(Arc::new(RowAddrMask::allow_nothing()));
-        assert!(prefilter_excludes_delta_now(&empty, None, false));
-        let block = FixedPreFilter(Arc::new(RowAddrMask::all_rows()));
-        assert!(!prefilter_excludes_delta_now(&block, Some(&others), true));
-    }
-
-    /// The late search drops a delta whose coverage the prefilter cannot
-    /// select from, after passing the barrier; coverage is ignored for
-    /// row-id masks, and a delta with a selectable fragment is searched.
+    /// After the barrier, a delta whose prefilter selects nothing is
+    /// counted and probes no partition; a delta with a selectable row keeps
+    /// searching past its minimum probes.
     #[tokio::test]
     async fn late_search_skips_a_delta_the_prefilter_excludes() {
         let (index, _prepared, searched_partitions, _threads) =
             prepared_index(vec![21, 22, 23, 24]);
-        let mut allow = lance_select::RowAddrTreeMap::new();
-        allow.insert_fragment(3);
-        let prefilter: Arc<dyn PreFilter> =
-            Arc::new(FixedPreFilter(Arc::new(RowAddrMask::from_allowed(allow))));
         let partitions = Arc::new(UInt32Array::from(vec![0, 1, 2, 3]));
         let q_c_dists = Arc::new(Float32Array::from(vec![0.1, 0.2, 0.3, 0.4]));
         let mut query = base_query();
         query.k = 4;
         query.minimum_nprobes = 1;
         query.maximum_nprobes = Some(4);
-        let run = |coverage: Option<RoaringBitmap>, address_domain: bool| {
+        let run = |mask: RowAddrMask| {
             let index = index.clone();
             let query = query.clone();
             let partitions = partitions.clone();
             let q_c_dists = q_c_dists.clone();
-            let prefilter = prefilter.clone();
             async move {
+                let prefilter: Arc<dyn PreFilter> = Arc::new(FixedPreFilter(Arc::new(mask)));
                 let metrics = prepared_metrics();
                 let state = Arc::new(ANNIvfEarlySearchResults::new(1, query.k));
                 let late = ANNIvfSubIndexExec::late_search(
@@ -5962,25 +5890,24 @@ mod tests {
                     state,
                     usize::MAX,
                     None,
-                    coverage,
-                    address_domain,
                 )
                 .try_collect::<Vec<_>>()
                 .await
                 .unwrap();
-                (late.len(), metrics.segments_skipped_late.value())
+                (late.len(), metrics.segments_skipped.value())
             }
         };
-        let (batches, skipped) = run(Some(RoaringBitmap::from_iter([0u32, 1])), true).await;
+        let (batches, skipped) = run(RowAddrMask::allow_nothing()).await;
         assert_eq!((batches, skipped), (0, 1));
         assert!(searched_partitions.lock().unwrap().is_empty());
-        let (_, skipped) = run(Some(RoaringBitmap::from_iter([1u32, 3])), true).await;
+        let mut allow = RowAddrTreeMap::new();
+        allow.insert(22);
+        let (_, skipped) = run(RowAddrMask::from_allowed(allow)).await;
         assert_eq!(skipped, 0);
-        let probed = searched_partitions.lock().unwrap().len();
-        assert!(probed > 0, "a selectable fragment keeps the delta searched");
-        let (_, skipped) = run(Some(RoaringBitmap::from_iter([0u32, 1])), false).await;
-        assert_eq!(skipped, 0, "row-id masks prove nothing by fragment key");
-        assert!(searched_partitions.lock().unwrap().len() > probed);
+        assert!(
+            !searched_partitions.lock().unwrap().is_empty(),
+            "a selectable row keeps the delta searched"
+        );
     }
 
     /// `num_deltas` appends, each its own IVF_FLAT delta of two partitions,
@@ -6089,8 +6016,8 @@ mod tests {
     }
 
     /// An index-only prefilter whose rows lie in some deltas only lets the
-    /// others be skipped, early or at the barrier, with the rows and
-    /// distances of the exhaustive flat search; a block list proves nothing.
+    /// others skip their candidate search, with the rows and distances of
+    /// the exhaustive flat search; a block list proves nothing.
     #[rstest]
     #[tokio::test]
     async fn prefilter_skips_deltas_it_excludes(#[values(false, true)] stable_row_ids: bool) {
@@ -6127,25 +6054,16 @@ mod tests {
                     "{filter}"
                 );
             }
-            // Skipped before the index open when the prefilter was already
-            // available, otherwise at the barrier: together they are exact.
+            // Counted once per delta at the barrier, whenever the prefilter
+            // became ready; the count does not depend on timing.
             let counts = stats.consume().all_counts;
-            let early = counts
-                .get(INDEX_SEGMENTS_SKIPPED_METRIC)
-                .copied()
-                .unwrap_or_default();
-            let late = counts
-                .get(INDEX_SEGMENTS_SKIPPED_LATE_METRIC)
-                .copied()
-                .unwrap_or_default();
-            assert_eq!(early + late, expected_skipped, "{filter}");
-            let searched = counts
-                .get(PARTITIONS_SEARCHED_METRIC)
-                .copied()
-                .unwrap_or_default();
-            assert!(
-                searched <= 2 * (4 - early),
-                "{filter}: a delta skipped early probes nothing ({searched} partitions)"
+            assert_eq!(
+                counts
+                    .get(INDEX_SEGMENTS_SKIPPED_METRIC)
+                    .copied()
+                    .unwrap_or_default(),
+                expected_skipped,
+                "{filter}"
             );
         }
         // After a delete and a compaction the deltas' coverage is remapped to
@@ -6181,18 +6099,15 @@ mod tests {
                 flat.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
                 "after compaction, {filter}"
             );
-            let counts = stats.consume().all_counts;
-            let early = counts
+            let skipped = stats
+                .consume()
+                .all_counts
                 .get(INDEX_SEGMENTS_SKIPPED_METRIC)
                 .copied()
                 .unwrap_or_default();
-            let late = counts
-                .get(INDEX_SEGMENTS_SKIPPED_LATE_METRIC)
-                .copied()
-                .unwrap_or_default();
-            assert!(early + late <= deltas, "after compaction, {filter}");
+            assert!(skipped <= deltas, "after compaction, {filter}");
             if filter == "userid > 1000" {
-                assert_eq!(early + late, deltas, "after compaction, {filter}");
+                assert_eq!(skipped, deltas, "after compaction, {filter}");
             }
         }
     }
