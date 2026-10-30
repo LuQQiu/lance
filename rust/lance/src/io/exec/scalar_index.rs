@@ -252,9 +252,9 @@ impl ScalarIndexExec {
     /// the predicate's own NULL semantics (an `IS NULL` leaf still selects
     /// the null-valued rows of the scope, a NULL comparison still selects
     /// nothing), and `fragments_covered` is intersected with the scope too.
-    /// The scanner's own callers keep loading-only selection
-    /// ([`Self::with_loading_scope`]); this contract is for callers that
-    /// consume the raw masks. Both bounds
+    /// The scanner's own callers keep loading-only selection through a
+    /// crate-private setter; this contract is for callers that consume the
+    /// raw masks. Both bounds
     /// come out as allow lists. An empty scope, or one naming only fragments
     /// the snapshot lacks, yields an exact empty allow list; without a scope
     /// the output is unrestricted and the node behaves as before.
