@@ -53,7 +53,7 @@ use lance_index::{
 };
 use lance_select::{
     IndexExprResult, NullableIndexExprResult, NullableRowAddrMask, NullableRowAddrSet, RowAddrMask,
-    RowAddrTreeMap, RowSetOps, result::IndexExprResultWireFormat,
+    RowAddrSelection, RowAddrTreeMap, RowSetOps, result::IndexExprResultWireFormat,
 };
 use lance_table::format::Fragment;
 use roaring::RoaringBitmap;
@@ -148,6 +148,91 @@ async fn translate_addr_set_to_row_ids(
     Ok(NullableRowAddrSet::new(selected, nulls))
 }
 
+/// Drop every row outside `scope` from both bounds of `result`.
+///
+/// Confinement is an intersection with the rows of the scoped fragments, applied to the
+/// lower and the upper bound alike, so an exact result stays exact and the bounds of an
+/// inexact one keep their order. Fragments in `scope` that the snapshot does not have are
+/// ignored; when the scope holds every fragment there is nothing to do.
+///
+/// Row addresses name their fragment in the high 32 bits, so address-domain masks are
+/// confined by fragment key: an allow list keeps only scoped keys, a block list gains a
+/// whole-fragment entry per excluded fragment. Row-id masks have no such key, so the scope
+/// is first translated to row ids through the row-id sequences of the smaller side (the
+/// scoped fragments, or the excluded ones); the translation yields ranges and the sequences
+/// are cached, but it does cost one sequence per fragment on that side.
+pub(crate) async fn confine_to_fragments(
+    result: IndexExprResult,
+    dataset: &Dataset,
+    scope: &RoaringBitmap,
+) -> Result<IndexExprResult> {
+    let all: RoaringBitmap = dataset
+        .fragments()
+        .iter()
+        .map(|fragment| fragment.id as u32)
+        .collect();
+    let inside = &all & scope;
+    let outside = &all - scope;
+    if outside.is_empty() {
+        return Ok(result);
+    }
+    let confine: Box<dyn Fn(RowAddrMask) -> RowAddrMask + Send> = if !dataset
+        .manifest
+        .uses_stable_row_ids()
+    {
+        Box::new(move |mask| match mask {
+            RowAddrMask::AllowList(mut allow) => {
+                allow.retain_fragments_in(&inside);
+                RowAddrMask::AllowList(allow)
+            }
+            RowAddrMask::BlockList(mut block) => {
+                for fragment in outside.iter() {
+                    block.insert_fragment(fragment);
+                }
+                let blocks_everything = all
+                    .iter()
+                    .all(|fragment| matches!(block.get(&fragment), Some(RowAddrSelection::Full)));
+                if blocks_everything {
+                    RowAddrMask::allow_nothing()
+                } else {
+                    RowAddrMask::BlockList(block)
+                }
+            }
+        })
+    } else if inside.len() <= outside.len() {
+        let inside_ids = row_ids_of_fragments(dataset, &inside).await?;
+        Box::new(move |mask| match mask {
+            RowAddrMask::AllowList(allow) => RowAddrMask::AllowList(allow & &inside_ids),
+            RowAddrMask::BlockList(block) => RowAddrMask::AllowList(inside_ids.clone() - &block),
+        })
+    } else {
+        let outside_ids = row_ids_of_fragments(dataset, &outside).await?;
+        Box::new(move |mask| match mask {
+            RowAddrMask::AllowList(allow) => RowAddrMask::AllowList(allow - &outside_ids),
+            RowAddrMask::BlockList(block) => RowAddrMask::BlockList(block | &outside_ids),
+        })
+    };
+    let IndexExprResult { lower, upper, .. } = result.clone();
+    if result.is_exact() {
+        Ok(IndexExprResult::exact(confine(lower)))
+    } else {
+        Ok(IndexExprResult::new(confine(lower), confine(upper)))
+    }
+}
+
+/// The row ids of every row (live or deleted) of `fragments`, as ranges where the
+/// sequences allow it.
+async fn row_ids_of_fragments(
+    dataset: &Dataset,
+    fragments: &RoaringBitmap,
+) -> Result<RowAddrTreeMap> {
+    let mut addrs = RowAddrTreeMap::new();
+    for fragment in fragments.iter() {
+        addrs.insert_fragment(fragment);
+    }
+    translate_addr_treemap_to_row_ids(dataset, &addrs).await
+}
+
 /// An execution node that performs a scalar index search
 ///
 /// This does not actually scan any data.  We only look through the index to determine
@@ -202,11 +287,27 @@ impl ScalarIndexExec {
         }
     }
 
-    /// Restrict which physical scalar index segments are loaded.
+    /// Restrict the node to `fragments`.
     ///
-    /// This does not restrict the result mask. The consumer remains responsible for applying
-    /// the exact fragment scope, deletion mask, and any required data-level recheck.
-    pub(crate) fn with_fragment_scope(mut self, fragments: RoaringBitmap) -> Self {
+    /// Two things follow. Only the physical index segments that can intersect these
+    /// fragments are loaded, and the emitted masks admit no row outside them: both bounds
+    /// of the result are confined after the complete expression, including any `NOT`, has
+    /// been evaluated, so a complement cannot re-admit rows of excluded fragments. The
+    /// result keeps its exactness, its NULL handling (NULL rows never match, before and
+    /// after confinement) and the form of each bound: an allow list drops the entries of
+    /// other fragments, a block list gains whole-fragment entries for them, neither
+    /// enumerates rows. `fragments_covered` is intersected with the scope as well. An empty
+    /// scope yields an exact, empty allow list. Without a scope the output is unrestricted.
+    ///
+    /// The scope names fragments of this node's dataset snapshot. With stable row ids the
+    /// masks carry row ids rather than addresses, so the scope is translated through the
+    /// row-id sequences of either the scoped fragments or the remaining ones, whichever
+    /// are fewer; the sequences come from the dataset's metadata cache and translate as
+    /// ranges, not as individual rows.
+    ///
+    /// The consumer remains responsible for the deletion mask and any data-level recheck
+    /// the result asks for.
+    pub fn with_fragment_scope(mut self, fragments: RoaringBitmap) -> Self {
         self.fragment_scope = Some(Arc::new(fragments));
         self
     }
@@ -271,6 +372,16 @@ impl ScalarIndexExec {
         segment_uuids: Option<Arc<HashSet<uuid::Uuid>>>,
     ) -> Result<RecordBatch> {
         let metrics = IndexMetrics::new(&plan_metrics, 0);
+        // A scope naming fragments the snapshot does not have is the scope of
+        // the ones it does have; none at all is an empty scope.
+        let fragment_scope = fragment_scope.map(|scope| {
+            let snapshot: RoaringBitmap = dataset
+                .fragments()
+                .iter()
+                .map(|fragment| fragment.id as u32)
+                .collect();
+            Arc::new(scope.as_ref() & snapshot)
+        });
         let query_result = {
             let search_time = plan_metrics.new_time(SCALAR_INDEX_SEARCH_TIME_METRIC, 0);
             let _timer = search_time.timer();
@@ -302,6 +413,12 @@ impl ScalarIndexExec {
                 }
                 (None, None) => expr.evaluate(dataset.as_ref(), &metrics).await?,
             }
+        };
+        let query_result = match fragment_scope.as_deref() {
+            Some(fragments) if !fragments.is_empty() => {
+                confine_to_fragments(query_result, dataset.as_ref(), fragments).await?
+            }
+            _ => query_result,
         };
         Self::record_match_bounds(&query_result, &plan_metrics);
         let mut fragments_covered_by_result =
@@ -1290,7 +1407,7 @@ mod tests {
     use crate::index::DatasetIndexExt;
     use arrow::datatypes::UInt64Type;
     use arrow::record_batch::RecordBatchIterator;
-    use arrow_array::{ArrayRef, Int32Array, RecordBatch, UInt64Array};
+    use arrow_array::{Array, ArrayRef, Int32Array, RecordBatch, UInt64Array, cast::AsArray};
     use arrow_schema::Schema;
     use datafusion::{
         error::DataFusionError,
@@ -1319,11 +1436,18 @@ mod tests {
             expression::{ScalarIndexExpr, ScalarIndexSearch},
         },
     };
-    use lance_select::{RowAddrTreeMap, RowSetOps, result::IndexExprResultWireFormat};
+    use lance_select::{
+        RowAddrSelection, RowAddrTreeMap, RowSetOps,
+        result::{IndexExprResult, IndexExprResultWireFormat},
+    };
+    use roaring::RoaringBitmap;
 
     use crate::{
         Dataset,
-        dataset::WriteParams,
+        dataset::{
+            WriteParams,
+            optimize::{CompactionOptions, compact_files},
+        },
         io::exec::scalar_index::MaterializeIndexExec,
         utils::test::{DatagenExt, FragmentCount, FragmentRowCount, NoContextTestFixture},
     };
@@ -1702,5 +1826,570 @@ mod tests {
         let plan =
             MaterializeIndexExec::new(arc_dasaset.clone(), query, arc_dasaset.fragments().clone());
         plan.execute(0, Arc::new(TaskContext::default())).unwrap();
+    }
+
+    /// Every row of `dataset`: row id, row address and `columns` as i64 (NULL as None).
+    async fn rows_of(
+        dataset: &Dataset,
+        columns: &[&str],
+    ) -> Vec<(u64, RowAddress, Vec<Option<i64>>)> {
+        let batch = dataset
+            .scan()
+            .project(columns)
+            .unwrap()
+            .with_row_id()
+            .with_row_address()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let values: Vec<_> = columns
+            .iter()
+            .map(|column| {
+                arrow::compute::cast(
+                    batch.column_by_name(column).unwrap(),
+                    &arrow_schema::DataType::Int64,
+                )
+                .unwrap()
+            })
+            .collect();
+        let ids = batch.column_by_name("_rowid").unwrap();
+        let ids = ids.as_primitive::<UInt64Type>();
+        let addrs = batch.column_by_name("_rowaddr").unwrap();
+        let addrs = addrs.as_primitive::<UInt64Type>();
+        (0..batch.num_rows())
+            .map(|i| {
+                let row = values
+                    .iter()
+                    .map(|array| {
+                        let array = array.as_primitive::<arrow::datatypes::Int64Type>();
+                        array.is_valid(i).then(|| array.value(i))
+                    })
+                    .collect();
+                (ids.value(i), RowAddress::from(addrs.value(i)), row)
+            })
+            .collect()
+    }
+
+    async fn run_scoped(
+        dataset: &Arc<Dataset>,
+        expr: ScalarIndexExpr,
+        scope: Option<&RoaringBitmap>,
+    ) -> (IndexExprResult, RoaringBitmap) {
+        let mut plan =
+            ScalarIndexExec::new(dataset.clone(), expr, IndexExprResultWireFormat::default());
+        if let Some(scope) = scope {
+            plan = plan.with_fragment_scope(scope.clone());
+        }
+        let batches = plan
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        IndexExprResult::deserialize(&batches[0]).unwrap()
+    }
+
+    /// Check `result` row by row against `pred` (SQL three-valued: `None` is NULL)
+    /// and `scope`: no row outside the scope may be admitted by either bound, an
+    /// exact result must select exactly the in-scope matches, and an inexact one
+    /// must keep every in-scope match in its upper bound and only in-scope matches
+    /// in its lower bound. Returns the number of in-scope matches.
+    fn check_confined(
+        result: &IndexExprResult,
+        rows: &[(u64, RowAddress, Vec<Option<i64>>)],
+        scope: Option<&RoaringBitmap>,
+        pred: &dyn Fn(&[Option<i64>]) -> Option<bool>,
+    ) -> usize {
+        let mut in_scope_matches = 0;
+        for (row_id, addr, values) in rows {
+            let in_scope = scope.is_none_or(|scope| scope.contains(addr.fragment_id()));
+            let matches = pred(values) == Some(true);
+            let context = format!("row id {row_id} at {addr:?} with {values:?}");
+            if result.is_exact() {
+                assert_eq!(
+                    result.lower.selected(*row_id),
+                    matches && in_scope,
+                    "{context}"
+                );
+            } else {
+                if matches && in_scope {
+                    assert!(result.upper.selected(*row_id), "{context}");
+                }
+                if result.lower.selected(*row_id) {
+                    assert!(matches && in_scope, "{context}");
+                }
+            }
+            if !in_scope {
+                assert!(
+                    !result.upper.selected(*row_id) && !result.lower.selected(*row_id),
+                    "{context}"
+                );
+            }
+            in_scope_matches += usize::from(matches && in_scope);
+        }
+        in_scope_matches
+    }
+
+    fn search(column: &str, index_type: &str, query: SargableQuery) -> ScalarIndexExpr {
+        ScalarIndexExpr::Query(ScalarIndexSearch {
+            column: column.to_string(),
+            index_name: format!("{column}_idx"),
+            index_type: index_type.to_string(),
+            query: Arc::new(query),
+            needs_recheck: false,
+            fragment_bitmap: None,
+        })
+    }
+
+    fn below(column: &str, value: ScalarValue) -> ScalarIndexExpr {
+        search(
+            column,
+            "BTree",
+            SargableQuery::Range(Bound::Unbounded, Bound::Excluded(value)),
+        )
+    }
+
+    fn not(expr: ScalarIndexExpr) -> ScalarIndexExpr {
+        ScalarIndexExpr::Not(Box::new(expr))
+    }
+
+    fn and(lhs: ScalarIndexExpr, rhs: ScalarIndexExpr) -> ScalarIndexExpr {
+        ScalarIndexExpr::And(Box::new(lhs), Box::new(rhs))
+    }
+
+    fn or(lhs: ScalarIndexExpr, rhs: ScalarIndexExpr) -> ScalarIndexExpr {
+        ScalarIndexExpr::Or(Box::new(lhs), Box::new(rhs))
+    }
+
+    fn not3(p: Option<bool>) -> Option<bool> {
+        p.map(|p| !p)
+    }
+
+    fn and3(p: Option<bool>, q: Option<bool>) -> Option<bool> {
+        match (p, q) {
+            (Some(false), _) | (_, Some(false)) => Some(false),
+            (Some(true), Some(true)) => Some(true),
+            _ => None,
+        }
+    }
+
+    fn or3(p: Option<bool>, q: Option<bool>) -> Option<bool> {
+        match (p, q) {
+            (Some(true), _) | (_, Some(true)) => Some(true),
+            (Some(false), Some(false)) => Some(false),
+            _ => None,
+        }
+    }
+
+    /// A three-valued predicate over one row's column values.
+    type Pred = Box<dyn Fn(&[Option<i64>]) -> Option<bool>>;
+
+    fn scope(fragments: impl IntoIterator<Item = u32>) -> RoaringBitmap {
+        fragments.into_iter().collect()
+    }
+
+    /// The scope confines the complete expression: a complement evaluated over
+    /// the scoped segments must not re-admit rows of other fragments, and every
+    /// bound keeps its form without enumerating rows.
+    #[tokio::test]
+    async fn fragment_scope_confines_the_complete_expression() {
+        let TestFixture {
+            dataset,
+            _tmp_dir_guard,
+        } = test_fixture().await;
+        let rows = rows_of(&dataset, &["ordered"]).await;
+        let u = |v: u64| ScalarValue::UInt64(Some(v));
+        let lt = |v: u64| move |row: &[Option<i64>]| row[0].map(|x| x < v as i64);
+        let cases: Vec<(ScalarIndexExpr, Pred)> = vec![
+            (below("ordered", u(47)), Box::new(lt(47))),
+            (
+                not(below("ordered", u(47))),
+                Box::new(move |r| not3(lt(47)(r))),
+            ),
+            (
+                and(not(below("ordered", u(47))), below("ordered", u(60))),
+                Box::new(move |r| and3(not3(lt(47)(r)), lt(60)(r))),
+            ),
+            (
+                or(below("ordered", u(15)), not(below("ordered", u(80)))),
+                Box::new(move |r| or3(lt(15)(r), not3(lt(80)(r)))),
+            ),
+        ];
+        let scopes = [
+            None,
+            Some(scope([2, 3])),
+            Some(scope([4])),
+            Some(scope([7])),
+            Some(scope(0..10)),
+            Some(scope([3, 4, 5])),
+            // A fragment the snapshot does not have: nothing is in scope.
+            Some(scope([12])),
+        ];
+        for (expr, pred) in &cases {
+            for scope in &scopes {
+                let (result, covered) = run_scoped(&dataset, expr.clone(), scope.as_ref()).await;
+                assert!(result.is_exact(), "{expr}");
+                check_confined(&result, &rows, scope.as_ref(), pred.as_ref());
+                if let Some(scope) = scope {
+                    assert!(covered.is_subset(scope), "{expr} covered {covered:?}");
+                }
+            }
+        }
+
+        // Form: the allow list of `ordered < 47` over fragment 4 names only that
+        // fragment; the block list of its complement over fragments 3..5 names the
+        // other seven fragments whole and keeps the scoped ones partial.
+        let (result, _) = run_scoped(&dataset, below("ordered", u(47)), Some(&scope([4]))).await;
+        let allow = result.lower.allow_list().unwrap();
+        assert!(allow.iter().all(|(fragment, _)| *fragment == 4));
+        assert_eq!(allow.len(), Some(7));
+        let (result, _) = run_scoped(
+            &dataset,
+            not(below("ordered", u(47))),
+            Some(&scope([3, 4, 5])),
+        )
+        .await;
+        let block = result.lower.block_list().unwrap();
+        for fragment in [0, 1, 2, 6, 7, 8, 9] {
+            assert_eq!(block.get(&fragment), Some(&RowAddrSelection::Full));
+        }
+        assert!(matches!(block.get(&3), Some(RowAddrSelection::Partial(_))));
+        assert!(matches!(block.get(&4), Some(RowAddrSelection::Partial(_))));
+        assert!(block.get(&5).is_none());
+        // Without a scope the complement admits every other fragment.
+        let (result, _) = run_scoped(&dataset, not(below("ordered", u(47))), None).await;
+        assert!(
+            result
+                .lower
+                .selected(RowAddress::new_from_parts(9, 5).into())
+        );
+        // An empty scope is an exact, empty allow list.
+        let (result, _) =
+            run_scoped(&dataset, not(below("ordered", u(47))), Some(&scope([]))).await;
+        assert!(result.is_exact());
+        assert!(
+            result
+                .lower
+                .allow_list()
+                .is_some_and(|allow| allow.is_empty())
+        );
+    }
+
+    /// Inexact results are confined on both bounds and stay inexact.
+    #[tokio::test]
+    async fn fragment_scope_confines_inexact_results() {
+        let TestFixture {
+            dataset,
+            _tmp_dir_guard,
+        } = test_fixture().await;
+        let mut dataset = Arc::try_unwrap(dataset).unwrap();
+        dataset
+            .create_index(
+                &["ordered"],
+                IndexType::ZoneMap,
+                Some("ordered_zm".to_string()),
+                &ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::ZoneMap),
+                true,
+            )
+            .await
+            .unwrap();
+        let dataset = Arc::new(dataset);
+        let rows = rows_of(&dataset, &["ordered"]).await;
+        let zone_below = |v: u64| {
+            ScalarIndexExpr::Query(ScalarIndexSearch {
+                column: "ordered".to_string(),
+                index_name: "ordered_zm".to_string(),
+                index_type: "ZoneMap".to_string(),
+                query: Arc::new(SargableQuery::Range(
+                    Bound::Unbounded,
+                    Bound::Excluded(ScalarValue::UInt64(Some(v))),
+                )),
+                needs_recheck: true,
+                fragment_bitmap: None,
+            })
+        };
+        let lt47 = |row: &[Option<i64>]| row[0].map(|x| x < 47);
+        for scope in [None, Some(scope([4, 5])), Some(scope([8]))] {
+            let (result, _) = run_scoped(&dataset, zone_below(47), scope.as_ref()).await;
+            check_confined(&result, &rows, scope.as_ref(), &lt47);
+            let (result, _) = run_scoped(&dataset, not(zone_below(47)), scope.as_ref()).await;
+            check_confined(&result, &rows, scope.as_ref(), &|r| not3(lt47(r)));
+        }
+        // Over fragments 4 and 5 the candidate set is fragment 4 whole (its zone
+        // starts below 47; fragment 5's does not), the lower bound stays empty.
+        let (result, _) = run_scoped(&dataset, zone_below(47), Some(&scope([4, 5]))).await;
+        assert!(!result.is_exact());
+        assert!(
+            result
+                .lower
+                .allow_list()
+                .is_some_and(|allow| allow.is_empty())
+        );
+        assert_eq!(result.upper.allow_list().unwrap().len(), Some(10));
+        // A scope the candidates miss entirely: neither bound admits a row.
+        let (result, _) = run_scoped(&dataset, zone_below(47), Some(&scope([8]))).await;
+        assert!(
+            result
+                .lower
+                .allow_list()
+                .is_some_and(|allow| allow.is_empty())
+        );
+        for (row_id, _, _) in &rows {
+            assert!(!result.upper.selected(*row_id));
+        }
+    }
+
+    /// Two indexes under a negation with NULL operands: NULL rows never match,
+    /// in or out of scope, and the complement stays inside the scope.
+    #[tokio::test]
+    async fn fragment_scope_confines_multi_index_negation_with_nulls() {
+        let test_dir = TempStrDir::default();
+        let a = Int32Array::from_iter((0..40).map(|i| (i % 5 != 0).then_some(i % 7)));
+        let b = Int32Array::from_iter((0..40).map(|i| (i % 13 != 0).then_some(i % 11)));
+        let batch = RecordBatch::try_from_iter(vec![
+            ("a", Arc::new(a) as ArrayRef),
+            ("b", Arc::new(b) as ArrayRef),
+        ])
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        let mut dataset = Dataset::write(
+            reader,
+            test_dir.as_str(),
+            Some(WriteParams {
+                max_rows_per_file: 10,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        for column in ["a", "b"] {
+            dataset
+                .create_index(
+                    &[column],
+                    IndexType::BTree,
+                    None,
+                    &ScalarIndexParams::default(),
+                    true,
+                )
+                .await
+                .unwrap();
+        }
+        let dataset = Arc::new(dataset);
+        assert_eq!(dataset.fragments().len(), 4);
+        let rows = rows_of(&dataset, &["a", "b"]).await;
+        let eq = |column: &str, v: i32| {
+            search(
+                column,
+                "BTree",
+                SargableQuery::Equals(ScalarValue::Int32(Some(v))),
+            )
+        };
+        let eq3 = |x: Option<i64>, v: i64| x.map(|x| x == v);
+        let cases: Vec<(ScalarIndexExpr, Pred)> = vec![
+            (
+                not(or(eq("a", 5), eq("b", 7))),
+                Box::new(move |r| not3(or3(eq3(r[0], 5), eq3(r[1], 7)))),
+            ),
+            (
+                and(not(eq("a", 5)), eq("b", 7)),
+                Box::new(move |r| and3(not3(eq3(r[0], 5)), eq3(r[1], 7))),
+            ),
+            (
+                or(eq("a", 5), not(eq("b", 7))),
+                Box::new(move |r| or3(eq3(r[0], 5), not3(eq3(r[1], 7)))),
+            ),
+        ];
+        for (expr, pred) in &cases {
+            for scope in [None, Some(scope([1])), Some(scope([0, 2])), Some(scope([]))] {
+                let (result, _) = run_scoped(&dataset, expr.clone(), scope.as_ref()).await;
+                assert!(result.is_exact(), "{expr}");
+                let matches = check_confined(&result, &rows, scope.as_ref(), pred.as_ref());
+                if scope.as_ref().is_none_or(|scope| !scope.is_empty()) {
+                    assert!(matches > 0, "{expr} with {scope:?} should keep some rows");
+                }
+            }
+        }
+        // A NULL operand in scope: `a` is NULL at row 10 (fragment 1) and `b` is
+        // 10 there, so NOT (a = 5 OR b = 7) is NULL and the row is not selected.
+        let (result, _) =
+            run_scoped(&dataset, not(or(eq("a", 5), eq("b", 7))), Some(&scope([1]))).await;
+        assert!(
+            !result
+                .lower
+                .selected(RowAddress::new_from_parts(1, 0).into())
+        );
+        assert!(result.lower.block_list().is_some());
+    }
+
+    /// Stable row ids: masks carry row ids, so the scope is translated through the
+    /// row-id sequences of whichever side is smaller; after a delete and a
+    /// compaction the scope names the new fragments while the ids stay.
+    #[tokio::test]
+    async fn fragment_scope_confines_stable_row_id_results() {
+        let test_dir = TempStrDir::default();
+        let batch = RecordBatch::try_from_iter(vec![(
+            "id",
+            Arc::new(Int32Array::from((0..30).collect::<Vec<_>>())) as ArrayRef,
+        )])
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        let mut dataset = Dataset::write(
+            reader,
+            test_dir.as_str(),
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                max_rows_per_file: 5,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                None,
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(dataset.fragments().len(), 6);
+        let i = |v: i32| ScalarValue::Int32(Some(v));
+        let lt = |v: i64| move |row: &[Option<i64>]| row[0].map(|x| x < v);
+        let cases: Vec<(ScalarIndexExpr, Pred)> = vec![
+            (below("id", i(12)), Box::new(lt(12))),
+            (not(below("id", i(12))), Box::new(move |r| not3(lt(12)(r)))),
+            (
+                or(below("id", i(4)), not(below("id", i(26)))),
+                Box::new(move |r| or3(lt(4)(r), not3(lt(26)(r)))),
+            ),
+        ];
+        let check_all = |dataset: Arc<Dataset>, scopes: Vec<Option<RoaringBitmap>>| {
+            let cases = &cases;
+            async move {
+                let rows = rows_of(&dataset, &["id"]).await;
+                // Row ids and addresses differ for every fragment but the first.
+                assert!(rows.iter().any(|(id, addr, _)| *id != u64::from(*addr)));
+                for (expr, pred) in cases {
+                    for scope in &scopes {
+                        let (result, _) = run_scoped(&dataset, expr.clone(), scope.as_ref()).await;
+                        assert!(result.is_exact(), "{expr}");
+                        check_confined(&result, &rows, scope.as_ref(), pred.as_ref());
+                    }
+                }
+            }
+        };
+        let dataset = Arc::new(dataset);
+        check_all(
+            dataset.clone(),
+            vec![
+                None,
+                // Fewer fragments inside than outside, and the reverse.
+                Some(scope([1, 2])),
+                Some(scope([0, 1, 2, 3, 4])),
+                Some(scope([])),
+            ],
+        )
+        .await;
+        // Block form survives the translated confinement on the large side.
+        let (result, _) = run_scoped(
+            &dataset,
+            not(below("id", i(12))),
+            Some(&scope([0, 1, 2, 3, 4])),
+        )
+        .await;
+        assert!(result.lower.block_list().is_some());
+        let (result, _) = run_scoped(&dataset, not(below("id", i(12))), Some(&scope([2]))).await;
+        assert!(result.lower.allow_list().is_some());
+
+        let mut dataset = Arc::try_unwrap(dataset).unwrap();
+        dataset.delete("id % 4 = 0").await.unwrap();
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 10,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let fragments: Vec<u32> = dataset.fragments().iter().map(|f| f.id as u32).collect();
+        assert!(fragments.iter().all(|id| *id >= 6), "{fragments:?}");
+        let dataset = Arc::new(dataset);
+        check_all(
+            dataset.clone(),
+            vec![
+                None,
+                Some(scope([fragments[0]])),
+                Some(scope(fragments[1..].iter().copied())),
+            ],
+        )
+        .await;
+    }
+
+    /// Two index segments with disjoint coverage: a scope inside one, the other,
+    /// or both, is honoured by the loader and by the emitted masks.
+    #[tokio::test]
+    async fn fragment_scope_spans_index_segments() {
+        let TestFixture {
+            dataset,
+            _tmp_dir_guard,
+        } = test_fixture().await;
+        let mut dataset = Arc::try_unwrap(dataset).unwrap();
+        let more = gen_batch()
+            .col(
+                "ordered",
+                lance_datagen::array::step_custom::<UInt64Type>(100, 1),
+            )
+            .into_reader_rows(
+                lance_datagen::RowCount::from(100),
+                lance_datagen::BatchCount::from(1),
+            );
+        dataset
+            .append(
+                more,
+                Some(WriteParams {
+                    max_rows_per_file: 10,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        dataset
+            .optimize_indices(&lance_index::optimize::OptimizeOptions::append())
+            .await
+            .unwrap();
+        let segments = dataset
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|index| index.name == "ordered_idx")
+            .count();
+        assert_eq!(segments, 2);
+        assert_eq!(dataset.fragments().len(), 20);
+        let dataset = Arc::new(dataset);
+        let rows = rows_of(&dataset, &["ordered"]).await;
+        let u = |v: u64| ScalarValue::UInt64(Some(v));
+        let lt150 = |row: &[Option<i64>]| row[0].map(|x| x < 150);
+        for scope in [
+            None,
+            Some(scope([5, 15])),
+            Some(scope([15])),
+            Some(scope([5])),
+            Some(scope(10..20)),
+        ] {
+            let (result, covered) =
+                run_scoped(&dataset, below("ordered", u(150)), scope.as_ref()).await;
+            check_confined(&result, &rows, scope.as_ref(), &lt150);
+            let (result, _) =
+                run_scoped(&dataset, not(below("ordered", u(150))), scope.as_ref()).await;
+            check_confined(&result, &rows, scope.as_ref(), &|r| not3(lt150(r)));
+            if let Some(scope) = scope {
+                assert_eq!(covered, scope);
+            }
+        }
     }
 }
