@@ -684,7 +684,7 @@ impl RowAddrTreeMap {
     /// Keep only the fragments in `fragments`; no intermediate set is built.
     ///
     /// ```
-    /// use lance_select::RowAddrTreeMap;
+    /// use lance_select::{RowAddrTreeMap, RowSetOps};
     /// use roaring::RoaringBitmap;
     ///
     /// let mut rows = RowAddrTreeMap::new();
